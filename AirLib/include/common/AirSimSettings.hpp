@@ -862,7 +862,7 @@ namespace airlib
             Settings rc_json;
             if (settings_json.getChild("RC", rc_json)) {
                 rc_setting.remote_control_id = rc_json.getInt("RemoteControlID",
-                                                              simmode_name == kSimModeTypeMultirotor ? 0 : -1);
+                                                              simmode_name == kSimModeTypeMultirotor || simmode_name == kSimModeTypeMultiAgent ? 0 : -1);
                 rc_setting.allow_api_when_disconnected = rc_json.getBool("AllowAPIWhenDisconnected",
                                                                          rc_setting.allow_api_when_disconnected);
             }
@@ -1850,6 +1850,8 @@ namespace airlib
                                        const std::string& simmode_name)
 
         {
+            
+            std::string vehicle_type = Utils::toLower(settings_json.getString("VehicleType", ""));
             // NOTE: Increase type if number of sensors goes above 8
             uint8_t present_sensors_bitmask = 0;
 
@@ -1865,7 +1867,7 @@ namespace airlib
                     auto sensor_type = Utils::toEnum<SensorBase::SensorType>(child.getInt("SensorType", 0));
                     auto enabled = child.getBool("Enabled", false);
 
-                    if (simmode_name == kSimModeTypeMultirotor  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
+                    if ( vehicle_type == kVehicleTypeSimpleFlight || vehicle_tpe == kVehicleTypePX4 || vehicle_type == kVehicleTypeArduCopterSolo || vehicle_type == kVehicleTypeArduCopter  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
                         throw std::invalid_argument(std::string("GPULiDAR sensor from MultiRotor vehicle as this combination is not supported. Please remove or disable."));
                     }else{
                         sensors[key] = createSensorSetting(sensor_type, key, enabled);
