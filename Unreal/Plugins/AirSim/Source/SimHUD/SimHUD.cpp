@@ -308,6 +308,10 @@ void ASimHUD::createSimMode()
         simmode_ = this->GetWorld()->SpawnActor<ASimModeComputerVision>(FVector::ZeroVector,
                                                                         FRotator::ZeroRotator,
                                                                         simmode_spawn_params);
+    else if (simmode_name == AirSimSettings::kSimModeTypeMultiAgent)
+        simmode_ = this->GetWorld()->SpawnActor<ASimModeWorldMultiAgent>(FVector::ZeroVector,
+                                                                      FRotator::ZeroRotator,
+                                                                      simmode_spawn_params);
     else {
         UAirBlueprintLib::ShowMessage(EAppMsgType::Ok, std::string("SimMode is not valid: ") + simmode_name, "Error");
         UAirBlueprintLib::LogMessageString("SimMode is not valid: ", simmode_name, LogDebugLevel::Failure);
