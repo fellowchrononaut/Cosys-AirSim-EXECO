@@ -1370,7 +1370,7 @@ void ASimModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
     world_sim_api_.reset();
     api_provider_.reset();
     //api_server_.reset();
-    api_server_.clear();
+    api_servers_.clear();
     global_ned_transform_.reset();
 
     CameraDirector = nullptr;
