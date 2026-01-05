@@ -2,7 +2,7 @@
 #include "UObject/ConstructorHelpers.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Misc/FileHelper.h"
-
+#include "Vehicles/Multirotor/SimModeWorldMultiAgent.h"
 #include "Vehicles/Multirotor/SimModeWorldMultiRotor.h"
 #include "Vehicles/Car/SimModeCar.h"
 #include "Vehicles/SkidSteer/SimModeSkidVehicle.h"
