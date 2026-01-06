@@ -2273,14 +2273,14 @@ void ASimModeBase::drawDistanceSensorDebugPoints()
     }
 }
 
-void ASimModeBase::addPawntoMap(APawn* pawn, const std::string& vehicle_type) const
+void ASimModeBase::addPawnToMap(APawn* pawn, const std::string& vehicle_type) const
 {
     pawn_to_vehicle_.insert(std::pair<APawn*, const std::string>(pawn, vehicle_type));
 }
 
 std::string ASimModeBase::getVehicleType(APawn* pawn) const
 {
-    std::map<APawn*, const std::string>::const_iterator it = pawn_to_vehicle_.find(pawn);
+    std::map<APawn*, std::string>::const_iterator it = pawn_to_vehicle_.find(pawn);
     if (it != pawn_to_vehicle_.end()) {
         return it->second;
     }

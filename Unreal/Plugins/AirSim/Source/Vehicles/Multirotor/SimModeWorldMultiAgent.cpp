@@ -319,6 +319,7 @@ std::unique_ptr<PawnSimApi> ASimModeWorldMultiAgent::createVehicleSimApi(
     }
     else if (vehicle_type == AirSimSettings::kVehicleTypePioneer ||
              vehicle_type == AirSimSettings::kVehicleTypeCPHusky) {
+        auto vehicle_pawn = static_cast<TSkidPawn*>(pawn_sim_api_params.pawn);
         auto vehicle_sim_api = std::unique_ptr<PawnSimApi>(new SkidVehiclePawnSimApi(pawn_sim_api_params, vehicle_pawn->getKeyBoardControls()));
         vehicle_sim_api->initialize();
         return vehicle_sim_api;

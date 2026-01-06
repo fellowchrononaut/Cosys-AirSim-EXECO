@@ -267,7 +267,7 @@ protected: //optional overrides
     void initializeCameraDirector(const FTransform& camera_transform, float follow_distance);
     void checkVehicleReady(); //checks if vehicle is available to use
     virtual void updateDebugReport(msr::airlib::StateReporterWrapper& debug_reporter);
-    virtual void initializeExternalCameras();
+    //virtual void initializeExternalCameras(); --> To be implemented at some point
     void addPawnToMap(APawn* pawn, const std::string& vehicle_type) const;
     std::string getVehicleType(APawn* pawn) const;
     virtual void updateInstanceSegmentationAnnotation();
