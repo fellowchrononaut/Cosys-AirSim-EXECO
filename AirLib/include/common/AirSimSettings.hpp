@@ -1064,7 +1064,7 @@ namespace airlib
 
             loadCameraSettings(settings_json, vehicle_setting->cameras, camera_defaults);
             loadVehicleLightSettings(settings_json, vehicle_setting->lights);
-            loadSensorSettings(settings_json, "Sensors", vehicle_setting->sensors, sensor_defaults, simmode_name);
+            loadSensorSettings(settings_json, "Sensors", vehicle_setting->sensors, sensor_defaults);
 
             return vehicle_setting;
         }
@@ -1846,8 +1846,7 @@ namespace airlib
         // creates and intializes sensor settings from json
         static void loadSensorSettings(const Settings& settings_json, const std::string& collectionName,
                                        std::map<std::string, std::shared_ptr<SensorSetting>>& sensors,
-                                       std::map<std::string, std::shared_ptr<SensorSetting>>& sensor_defaults,
-                                       const std::string& simmode_name)
+                                       std::map<std::string, std::shared_ptr<SensorSetting>>& sensor_defaults)
 
         {
             
@@ -1867,7 +1866,7 @@ namespace airlib
                     auto sensor_type = Utils::toEnum<SensorBase::SensorType>(child.getInt("SensorType", 0));
                     auto enabled = child.getBool("Enabled", false);
 
-                    if ( vehicle_type == kVehicleTypeSimpleFlight || vehicle_tpe == kVehicleTypePX4 || vehicle_type == kVehicleTypeArduCopterSolo || vehicle_type == kVehicleTypeArduCopter  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
+                    if ( vehicle_type == kVehicleTypeSimpleFlight || vehicle_type == kVehicleTypePX4 || vehicle_type == kVehicleTypeArduCopterSolo || vehicle_type == kVehicleTypeArduCopter  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
                         throw std::invalid_argument(std::string("GPULiDAR sensor from MultiRotor vehicle as this combination is not supported. Please remove or disable."));
                     }else{
                         sensors[key] = createSensorSetting(sensor_type, key, enabled);
@@ -1913,7 +1912,7 @@ namespace airlib
         {
             msr::airlib::Settings sensors_child;
             if (settings_json.getChild("DefaultSensors", sensors_child))
-                loadSensorSettings(settings_json, "DefaultSensors", sensors, sensors, simmode_name);
+                loadSensorSettings(settings_json, "DefaultSensors", sensors, sensors);
             else
                 createDefaultSensorSettings(simmode_name, sensors);
         }
