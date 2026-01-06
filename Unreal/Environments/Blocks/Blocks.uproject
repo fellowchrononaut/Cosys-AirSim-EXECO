@@ -22,5 +22,8 @@
 			"Name": "ChaosVehiclesPlugin",
 			"Enabled": true
 		}
+	],
+	"AdditionalPluginDirectories": [
+		"../../Plugins"
 	]
 }

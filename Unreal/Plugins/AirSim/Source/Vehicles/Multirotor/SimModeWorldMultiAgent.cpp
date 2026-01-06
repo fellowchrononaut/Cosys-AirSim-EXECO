@@ -93,14 +93,14 @@ void ASimModeWorldMultiAgent::setupClockSpeed()
 // #endif
 // }
 
-std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> ASimModeWorldAgent::createApiServer() const
+std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> ASimModeWorldMultiAgent::createApiServer() const
 {
     std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> api_servers;
 #ifdef AIRLIB_NO_RPC
     api_servers.push_back(ASimModeBase::createApiServer());
     return api_servers;
 #else
-    unit16_t port_drone = 41451;
+    uint16_t port_drone = 41451;
 
     api_servers.push_back(std::make_unique<msr::airlib::MultirotorRpcLibServer>(
         getApiProvider(), getSettings().api_server_address, port_drone));
@@ -137,7 +137,7 @@ void ASimModeWorldMultiAgent::getExistingVehiclePawns(TArray<AActor*>& pawns) co
         pawns.Add(cpawn);
         if (getSettings().simmode_name == "MultiAgent") {
             APawn* vehicle_pawn = static_cast<APawn*>(cpawn);
-            addPawnToMap(vehicle_pawn, AirSimSettings::kVehicleTypeCar);
+            addPawnToMap(vehicle_pawn, AirSimSettings::kVehicleTypePhysXCar);
         }
     }
 
@@ -287,7 +287,7 @@ void ASimModeWorldMultiAgent::initializeVehiclePawn(APawn* pawn)
     }
     else if (vehicle_type == AirSimSettings::kVehicleTypePioneer ||
              vehicle_type == AirSimSettings::kVehicleTypeCPHusky) {
-        static_cast<TSkidPawn*>(pawn)->initializeForBeginPlay();
+        static_cast<TSkidPawn*>(pawn)->initializeForBeginPlay(getSettings().engine_sound);
     }
     else if (vehicle_type == AirSimSettings::kVehicleTypeComputerVision) {
         static_cast<TCVPawn*>(pawn)->initializeForBeginPlay();

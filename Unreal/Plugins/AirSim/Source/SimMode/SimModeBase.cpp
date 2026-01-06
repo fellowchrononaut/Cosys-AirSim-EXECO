@@ -1506,7 +1506,7 @@ void ASimModeBase::setExtForce(const msr::airlib::Vector3r& ext_force) const
 //     return nullptr;
 // }/
 
-std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> ASimModeBase::createApiServers() const
+std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> ASimModeBase::createApiServer() const
 {
     //this will be the case when compilation with RPCLIB is disabled or simmode doesn't support APIs
     return {};
