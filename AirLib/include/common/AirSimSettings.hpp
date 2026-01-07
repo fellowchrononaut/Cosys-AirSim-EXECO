@@ -1866,7 +1866,7 @@ namespace airlib
                     auto sensor_type = Utils::toEnum<SensorBase::SensorType>(child.getInt("SensorType", 0));
                     auto enabled = child.getBool("Enabled", false);
 
-                    if ( vehicle_type == kVehicleTypeSimpleFlight || vehicle_type == kVehicleTypePX4 || vehicle_type == kVehicleTypeArduCopterSolo || vehicle_type == kVehicleTypeArduCopter  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
+                    if ( (vehicle_type == kVehicleTypeSimpleFlight || vehicle_type == kVehicleTypePX4 || vehicle_type == kVehicleTypeArduCopterSolo || vehicle_type == kVehicleTypeArduCopter)  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
                         throw std::invalid_argument(std::string("GPULiDAR sensor from MultiRotor vehicle as this combination is not supported. Please remove or disable."));
                     }else{
                         sensors[key] = createSensorSetting(sensor_type, key, enabled);
