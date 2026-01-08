@@ -9,9 +9,9 @@
 #include "GameFramework/PlayerController.h"
 
 #include "AirBlueprintLib.h"
-#include "vehicles/Car/CarPawnSimApi.h"
-#include "vehicles/SkidSteer/SkidVehiclePawnSimApi.h"
-#include "vehicles/ComputerVision/ComputerVisionPawnSimApi.h"
+#include "Vehicles/Car/CarPawnSimApi.h"
+#include "Vehicles/SkidSteer/SkidVehiclePawnSimApi.h"
+#include "Vehicles/ComputerVision/ComputerVisionPawnSimApi.h"
 #include "vehicles/multirotor/api/MultirotorApiBase.hpp"
 #include "MultirotorPawnSimApi.h"
 #include "physics/PhysicsBody.hpp"
