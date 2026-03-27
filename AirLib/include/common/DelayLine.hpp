@@ -7,6 +7,7 @@
 #include "common/Common.hpp"
 #include "UpdatableObject.hpp"
 #include <list>
+#include <mutex>
 
 namespace msr
 {
@@ -48,6 +49,7 @@ namespace airlib
 
         virtual void update(float delta = 0) override
         {
+            std::lock_guard<std::mutex> lock(list_mutex_);
             UpdatableObject::update(delta);
 
             if (!times_.empty() &&
@@ -73,6 +75,7 @@ namespace airlib
 
         void push_back(const T& val, TTimePoint time_offset = 0)
         {
+            std::lock_guard<std::mutex> lock(list_mutex_);
             values_.push_back(val);
             times_.push_back(clock()->nowNanos() + time_offset);
         }
@@ -87,6 +90,7 @@ namespace airlib
 
         T last_value_;
         TTimePoint last_time_;
+        std::mutex list_mutex_;
     };
 }
 } //namespace

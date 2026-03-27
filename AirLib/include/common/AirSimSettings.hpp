@@ -46,6 +46,7 @@ namespace airlib
         static constexpr char const* kSimModeTypeCar = "Car";
         static constexpr char const* kSimModeTypeSkidVehicle = "SkidVehicle";
         static constexpr char const* kSimModeTypeComputerVision = "ComputerVision";
+        static constexpr char const* kSimModeTypeMultiAgent = "MultiAgent";
 
         struct SubwindowSetting
         {
@@ -797,7 +798,7 @@ namespace airlib
 
             physics_engine_name = settings_json.getString("PhysicsEngineName", "");
             if (physics_engine_name == "") {
-                if (simmode_name == kSimModeTypeMultirotor)
+                if (simmode_name == kSimModeTypeMultirotor || simmode_name == kSimModeTypeMultiAgent)
                     physics_engine_name = "FastPhysicsEngine";
                 else
                     physics_engine_name = "PhysX"; //this value is only informational for now
@@ -861,7 +862,7 @@ namespace airlib
             Settings rc_json;
             if (settings_json.getChild("RC", rc_json)) {
                 rc_setting.remote_control_id = rc_json.getInt("RemoteControlID",
-                                                              simmode_name == kSimModeTypeMultirotor ? 0 : -1);
+                                                              simmode_name == kSimModeTypeMultirotor || simmode_name == kSimModeTypeMultiAgent ? 0 : -1);
                 rc_setting.allow_api_when_disconnected = rc_json.getBool("AllowAPIWhenDisconnected",
                                                                          rc_setting.allow_api_when_disconnected);
             }
@@ -1063,7 +1064,7 @@ namespace airlib
 
             loadCameraSettings(settings_json, vehicle_setting->cameras, camera_defaults);
             loadVehicleLightSettings(settings_json, vehicle_setting->lights);
-            loadSensorSettings(settings_json, "Sensors", vehicle_setting->sensors, sensor_defaults, simmode_name);
+            loadSensorSettings(settings_json, "Sensors", vehicle_setting->sensors, sensor_defaults);
 
             return vehicle_setting;
         }
@@ -1208,6 +1209,18 @@ namespace airlib
                 auto cv_setting = std::unique_ptr<VehicleSetting>(new VehicleSetting("ComputerVision", kVehicleTypeComputerVision));
                 cv_setting->sensors = sensor_defaults;
                 vehicles[cv_setting->vehicle_name] = std::move(cv_setting);
+            }
+            else if (simmode_name == kSimModeTypeMultiAgent) {
+                // create simple flight as default multirotor
+                auto simple_flight_setting = std::unique_ptr<VehicleSetting>(new VehicleSetting("SimpleFlight",
+                                                                                                kVehicleTypeSimpleFlight));
+                simple_flight_setting->rc.remote_control_id = 0;
+                simple_flight_setting->sensors = sensor_defaults;
+                vehicles[simple_flight_setting->vehicle_name] = std::move(simple_flight_setting);
+
+                auto cphusky_car_setting = std::unique_ptr<VehicleSetting>(new VehicleSetting("CPHusky", kVehicleTypeCPHusky));
+                cphusky_car_setting->sensors = sensor_defaults;
+                vehicles[cphusky_car_setting->vehicle_name] = std::move(cphusky_car_setting);
             }
             else {
                 throw std::invalid_argument(Utils::stringf(
@@ -1724,7 +1737,7 @@ namespace airlib
             if (std::isnan(camera_director.follow_distance)) {
                 if (simmode_name == kSimModeTypeCar)
                     camera_director.follow_distance = -8;
-                else if(simmode_name == kSimModeTypeSkidVehicle)
+                else if(simmode_name == kSimModeTypeSkidVehicle || simmode_name == kSimModeTypeMultiAgent)
 				    camera_director.follow_distance = -2;
                 else
                     camera_director.follow_distance = -3;
@@ -1734,7 +1747,7 @@ namespace airlib
             if (std::isnan(camera_director.position.y()))
                 camera_director.position.y() = 0;
             if (std::isnan(camera_director.position.z())) {
-                if (simmode_name == kSimModeTypeCar)
+                if (simmode_name == kSimModeTypeCar || simmode_name == kSimModeTypeMultiAgent)
                     camera_director.position.z() = -3;
                 else
                     camera_director.position.z() = -2;
@@ -1750,7 +1763,7 @@ namespace airlib
                 clock_type = "ScalableClock";
 
                 //override if multirotor simmode with simple_flight
-                if (simmode_name == kSimModeTypeMultirotor) {
+                if (simmode_name == kSimModeTypeMultirotor || simmode_name == kSimModeTypeMultiAgent) {
                     //TODO: this won't work if simple_flight and PX4 is combined together!
 
                     //for multirotors we select steppable fixed interval clock unless we have
@@ -1833,10 +1846,11 @@ namespace airlib
         // creates and intializes sensor settings from json
         static void loadSensorSettings(const Settings& settings_json, const std::string& collectionName,
                                        std::map<std::string, std::shared_ptr<SensorSetting>>& sensors,
-                                       std::map<std::string, std::shared_ptr<SensorSetting>>& sensor_defaults,
-                                       const std::string& simmode_name)
+                                       std::map<std::string, std::shared_ptr<SensorSetting>>& sensor_defaults)
 
         {
+            
+            std::string vehicle_type = Utils::toLower(settings_json.getString("VehicleType", ""));
             // NOTE: Increase type if number of sensors goes above 8
             uint8_t present_sensors_bitmask = 0;
 
@@ -1852,7 +1866,7 @@ namespace airlib
                     auto sensor_type = Utils::toEnum<SensorBase::SensorType>(child.getInt("SensorType", 0));
                     auto enabled = child.getBool("Enabled", false);
 
-                    if (simmode_name == kSimModeTypeMultirotor  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
+                    if ( (vehicle_type == kVehicleTypeSimpleFlight || vehicle_type == kVehicleTypePX4 || vehicle_type == kVehicleTypeArduCopterSolo || vehicle_type == kVehicleTypeArduCopter)  && sensor_type == SensorBase::SensorType::GPULidar && enabled) {
                         throw std::invalid_argument(std::string("GPULiDAR sensor from MultiRotor vehicle as this combination is not supported. Please remove or disable."));
                     }else{
                         sensors[key] = createSensorSetting(sensor_type, key, enabled);
@@ -1877,7 +1891,7 @@ namespace airlib
         static void createDefaultSensorSettings(const std::string& simmode_name,
                                                 std::map<std::string, std::shared_ptr<SensorSetting>>& sensors)
         {
-            if (simmode_name == kSimModeTypeMultirotor) {
+            if (simmode_name == kSimModeTypeMultirotor || simmode_name == kSimModeTypeMultiAgent) {
                 sensors["imu"] = createSensorSetting(SensorBase::SensorType::Imu, "imu", true);
                 sensors["magnetometer"] = createSensorSetting(SensorBase::SensorType::Magnetometer, "magnetometer", true);
                 sensors["gps"] = createSensorSetting(SensorBase::SensorType::Gps, "gps", true);
@@ -1898,7 +1912,7 @@ namespace airlib
         {
             msr::airlib::Settings sensors_child;
             if (settings_json.getChild("DefaultSensors", sensors_child))
-                loadSensorSettings(settings_json, "DefaultSensors", sensors, sensors, simmode_name);
+                loadSensorSettings(settings_json, "DefaultSensors", sensors, sensors);
             else
                 createDefaultSensorSettings(simmode_name, sensors);
         }

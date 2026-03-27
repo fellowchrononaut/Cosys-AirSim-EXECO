@@ -2,7 +2,7 @@
 #include "UObject/ConstructorHelpers.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Misc/FileHelper.h"
-
+#include "Vehicles/Multirotor/SimModeWorldMultiAgent.h"
 #include "Vehicles/Multirotor/SimModeWorldMultiRotor.h"
 #include "Vehicles/Car/SimModeCar.h"
 #include "Vehicles/SkidSteer/SimModeSkidVehicle.h"
@@ -265,9 +265,18 @@ std::vector<ASimHUD::AirSimSettings::SubwindowSetting>& ASimHUD::getSubWindowSet
 std::string ASimHUD::getSimModeFromUser()
 {
     if (EAppReturnType::No == UAirBlueprintLib::ShowMessage(EAppMsgType::YesNo,
-                                                            "Would you like to use car/skid-vehicle simulation? Choose no to use quadrotor simulation.",
-                                                            "Choose Vehicle")) {
-        return AirSimSettings::kSimModeTypeMultirotor;
+                                                            "Would you like to use car/skid-vehicle simulation? Choose no to use quadrotor/Multi-Agent simulation.",
+                                                            "Choose Simulation Category")) {
+        if (EAppReturnType::No == UAirBlueprintLib::ShowMessage(EAppMsgType::YesNo,
+                                                                "Would you like to use quadrotor simulation? Choose no to use Multi-Agent simulation.",
+                                                                "Choose Vehicle")) 
+        {
+            return AirSimSettings::kSimModeTypeMultiAgent;
+        } 
+        
+        else
+            return AirSimSettings::kSimModeTypeMultirotor;
+                                                            
     }
     else
         if (EAppReturnType::No == UAirBlueprintLib::ShowMessage(EAppMsgType::YesNo,
@@ -308,6 +317,10 @@ void ASimHUD::createSimMode()
         simmode_ = this->GetWorld()->SpawnActor<ASimModeComputerVision>(FVector::ZeroVector,
                                                                         FRotator::ZeroRotator,
                                                                         simmode_spawn_params);
+    else if (simmode_name == AirSimSettings::kSimModeTypeMultiAgent)
+        simmode_ = this->GetWorld()->SpawnActor<ASimModeWorldMultiAgent>(FVector::ZeroVector,
+                                                                      FRotator::ZeroRotator,
+                                                                      simmode_spawn_params);
     else {
         UAirBlueprintLib::ShowMessage(EAppMsgType::Ok, std::string("SimMode is not valid: ") + simmode_name, "Error");
         UAirBlueprintLib::LogMessageString("SimMode is not valid: ", simmode_name, LogDebugLevel::Failure);
