@@ -10,6 +10,7 @@
 			"LoadingPhase": "Default",
 			"AdditionalDependencies": [
 				"AirSim"
+
 			]
 		}
 	],
@@ -20,6 +21,10 @@
 		},
 		{
 			"Name": "ChaosVehiclesPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "GaussianSplattingForUnrealEngine",
 			"Enabled": true
 		}
 	],
