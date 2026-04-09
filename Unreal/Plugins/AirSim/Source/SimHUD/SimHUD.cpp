@@ -2,6 +2,8 @@
 #include "UObject/ConstructorHelpers.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Misc/FileHelper.h"
+#include "DesktopPlatformModule.h"
+#include "IDesktopPlatform.h"
 #include "Vehicles/Multirotor/SimModeWorldMultiAgent.h"
 #include "Vehicles/Multirotor/SimModeWorldMultiRotor.h"
 #include "Vehicles/Car/SimModeCar.h"
@@ -373,10 +375,49 @@ FString ASimHUD::getLaunchPath(const std::string& filename)
 
 bool ASimHUD::getSettingsText(std::string& settingsText)
 {
-    return (getSettingsTextFromCommandLine(settingsText) ||
+    // Command line always takes priority — skip dialog if -settings= was passed
+    if (getSettingsTextFromCommandLine(settingsText))
+        return true;
+
+    return (getSettingsTextFromFileDialog(settingsText) ||
             readSettingsTextFromFile(FString(msr::airlib::Settings::getExecutableFullPath("settings.json").c_str()), settingsText) ||
             readSettingsTextFromFile(getLaunchPath("settings.json"), settingsText) ||
             readSettingsTextFromFile(FString(msr::airlib::Settings::Settings::getUserDirectoryFullPath("settings.json").c_str()), settingsText));
+}
+
+bool ASimHUD::getSettingsTextFromFileDialog(std::string& settingsText)
+{
+    if (EAppReturnType::No == UAirBlueprintLib::ShowMessage(EAppMsgType::YesNo,
+        "Would you like to specify a custom settings.json file?\n\nChoose 'No' to use the default search paths.",
+        "Load Settings"))
+    {
+        return false;
+    }
+
+    IDesktopPlatform* desktopPlatform = FDesktopPlatformModule::Get();
+    if (!desktopPlatform)
+    {
+        UAirBlueprintLib::LogMessageString("File dialog unavailable in this build configuration.", "", LogDebugLevel::Failure);
+        return false;
+    }
+
+    TArray<FString> selectedFiles;
+    const FString defaultPath = FString(msr::airlib::Settings::getUserDirectoryFullPath("").c_str());
+
+    const bool bOpened = desktopPlatform->OpenFileDialog(
+        nullptr,
+        TEXT("Select settings.json"),
+        defaultPath,
+        TEXT("settings.json"),
+        TEXT("JSON Files (*.json)|*.json|All Files (*.*)|*.*"),
+        EFileDialogFlags::None,
+        selectedFiles
+    );
+
+    if (bOpened && selectedFiles.Num() > 0)
+        return readSettingsTextFromFile(selectedFiles[0], settingsText);
+
+    return false;
 }
 
 // Attempts to parse the settings file path or the settings text from the command line

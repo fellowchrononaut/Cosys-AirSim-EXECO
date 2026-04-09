@@ -58,6 +58,7 @@ private:
 
     bool getSettingsText(std::string& settingsText);
     bool getSettingsTextFromCommandLine(std::string& settingsText);
+    bool getSettingsTextFromFileDialog(std::string& settingsText);
     bool readSettingsTextFromFile(const FString& fileName, std::string& settingsText);
     std::string getSimModeFromUser();
 
