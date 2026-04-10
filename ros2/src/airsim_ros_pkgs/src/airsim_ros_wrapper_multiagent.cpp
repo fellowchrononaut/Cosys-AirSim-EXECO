@@ -388,6 +388,8 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
             cv->computer_vision_state_pub_ = nh_->create_publisher<airsim_interfaces::msg::ComputerVisionState>(topic_prefix + "/computervision_state", 10);
         }
 
+        //Per Vehicle Image request vector
+        std::vector<ImageRequest> current_image_request_vec;
         // Cameras
         for (auto& curr_camera_elem : vehicle_setting->cameras) {
             auto& camera_setting   = curr_camera_elem.second;
@@ -395,8 +397,6 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
 
             set_nans_to_zeros_in_pose(*vehicle_setting, camera_setting);
             append_static_camera_tf(vehicle_ros.get(), curr_camera_name, camera_setting);
-
-            std::vector<ImageRequest> current_image_request_vec;
 
             for (const auto& curr_capture_elem : camera_setting.capture_settings) {
                 auto& capture_setting = curr_capture_elem.second;
@@ -427,8 +427,10 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
                     }
                 }
             }
-            airsim_img_request_vehicle_name_pair_vec_.push_back({ current_image_request_vec, curr_vehicle_name, vmode });
         }
+
+        // Full list of image requests for the vehicle pushed ONCE
+        airsim_img_request_vehicle_name_pair_vec_.push_back({ current_image_request_vec, curr_vehicle_name, vmode });
 
         // Sensors
         for (auto& curr_sensor_map : vehicle_setting->sensors) {
