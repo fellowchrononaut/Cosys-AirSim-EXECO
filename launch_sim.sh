@@ -21,7 +21,7 @@ QGC_BINARY="/home/ecosense360/Execo/QGroundControl/QGroundControl-v5.0-x86_64.Ap
 ROS2_WS_DOCKER="/root/Cosys-AirSim-EXECO/ros2"
 PX4_DIR_DOCKER="/root/PX4/PX4-Autopilot"
 
-DELAY_UNREAL=10    # wait before ROS2 starts  (Unreal needs to be up)
+DELAY_UNREAL=20    # wait before ROS2 starts  (Unreal needs to be up)
 DELAY_ROS=12       # wait before PX4 starts   (ROS2 needs to be up)
 DELAY_PX4=8        # wait before QGC starts   (PX4 needs to be up)
 # ── END CONFIG ──────────────────────────────────────────────
