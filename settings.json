@@ -1,0 +1,187 @@
+{
+	"SettingsVersion": 2.0,
+	"SimMode": "MultiAgent",
+    "ClockType": "SteppableClock",
+	"ClockSpeed": 1,
+	"Vehicles": {
+	  "Car2": {
+		"VehicleType": "PX4Multirotor",
+                "UseSerial": false,
+                "LockStep": true,
+                "UseTcp": true,
+                "TcpPort": 4560,
+                "ControlPortLocal": 14540,
+                "ControlPortRemote": 14580,
+                "DefaultVehicleState": "Armed",
+		"X": 0, "Y": 0, "Z": 0,
+		"AllowAPIAlways": false,
+        "RC": {
+            "RemoteControlID": 0,      
+            "AllowAPIWhenDisconnected": false
+		},
+		"Cameras": {
+				"camera_left": {
+				  "CaptureSettings": [
+				    {
+				      "PublishToRos": 1,
+				      "ImageType": 0,
+				      "Width": 640,
+				      "Height": 480,
+				      "FOV_Degrees": 90,
+				      "#DepthOfFieldFstop": 2.8,
+				      "#DepthOfFieldFocalDistance": 200.0, 
+				      "#DepthOfFieldFocalRegion": 200.0,
+				      "TargetGamma": 1.5,
+					  "Compress": true
+				    }
+				  ],
+				  "X": 0.25, "Y": -0.10, "Z": -0.25,
+				  "Pitch": 0,"Roll": 0, "Yaw": 0
+				},
+				"camera_right": {
+				  "CaptureSettings": [
+				    {
+				      "PublishToRos": 1,
+				      "ImageType": 0,
+				      "Width": 640,
+				      "Height": 480,
+				      "FOV_Degrees": 90,
+				      "#DepthOfFieldFstop": 2.8,
+				      "#DepthOfFieldFocalDistance": 200.0, 
+				      "#DepthOfFieldFocalRegion": 200.0,
+				      "TargetGamma": 1.5,
+					  "Compress": true
+				    }
+				  ],
+				  "X": 0.25, "Y": 0.10, "Z": -0.25,
+				  "Pitch": 0,"Roll": 0, "Yaw": 0
+				}
+
+			},
+		"Sensors": {
+			"Barometer":{
+                        "SensorType": 1,
+                        "Enabled": true,
+                        "PressureFactorSigma": 0.0001825
+                    },
+            "IMU": {
+          "SensorType": 2,
+          "Enabled": true,
+		  "X": 0.25, "Y": 0, "Z": -0.25,
+					"GenerateNoise": true,
+					"AngularRandomWalk": 0.3,
+        	"GyroBiasStabilityTau": 500,
+        	"GyroBiasStability": 4.6,
+        	"VelocityRandomWalk": 0.24,
+        	"AccelBiasStabilityTau": 800,
+        	"AccelBiasStability": 36
+			},
+			"GPULidar": {
+					"SensorType": 6,
+					"Enabled" : true,
+          "NumberOfChannels": 64,
+          "RotationsPerSecond": 5,
+          "PointsPerSecond": 600000,
+          "X": 0, "Y": 0, "Z": -0.25,
+          "Roll": 0, "Pitch": 0, "Yaw" : 0,
+          "VerticalFOVUpper": -15,
+          "VerticalFOVLower": 15,
+          "HorizontalFOVStart": -180,
+          "HorizontalFOVEnd": 180,
+          "DrawDebugPoints": false
+
+			}
+		},
+        "Parameters": {
+                    "NAV_RCL_ACT": 0,
+                    "NAV_DLL_ACT": 0,
+                    "COM_OBL_ACT": 1,
+                    "LPE_LAT": 47.641468,
+                    "LPE_LON": -122.140165
+                }
+
+	  },
+	  "Car1": {
+		"VehicleType": "CPHusky",
+		"X": 0, "Y": 2, "Z": 0,
+		"AllowAPIAlways": false,
+        "RC": {
+            "RemoteControlID": -1,      
+            "AllowAPIWhenDisconnected": false
+		},
+		"Cameras": {
+				"camera_left": {
+				  "CaptureSettings": [
+				    {
+				      "PublishToRos": 1,
+				      "ImageType": 0,
+				      "Width": 640,
+				      "Height": 480,
+				      "FOV_Degrees": 90,
+				      "#DepthOfFieldFstop": 2.8,
+				      "#DepthOfFieldFocalDistance": 200.0, 
+				      "#DepthOfFieldFocalRegion": 200.0,
+				      "TargetGamma": 1.5,
+					  "Compress": true
+				    }
+				  ],
+				  "X": 0.25, "Y": -0.10, "Z": -0.25,
+				  "Pitch": 0.0,"Roll": 0, "Yaw": 0
+				},
+				"camera_right": {
+				  "CaptureSettings": [
+				    {
+				      "PublishToRos": 1,
+				      "ImageType": 0,
+				      "Width": 640,
+				      "Height": 480,
+				      "FOV_Degrees": 90,
+				      "#DepthOfFieldFstop": 2.8,
+				      "#DepthOfFieldFocalDistance": 200.0, 
+				      "#DepthOfFieldFocalRegion": 200.0,
+				      "TargetGamma": 1.5,
+					  "Compress": true
+				    }
+				  ],
+				  "X": 0.25, "Y": 0.10, "Z": -0.25,
+				  "Pitch": 0.0,"Roll": 0, "Yaw": 0
+				}
+
+			},
+		"Sensors": {
+			"IMU": {
+                    "SensorType": 2,
+                    "Enabled": true,
+					"GenerateNoise": true,
+					"AngularRandomWalk": 0.3,
+        			"GyroBiasStabilityTau": 500,
+        			"GyroBiasStability": 4.6,
+        			"VelocityRandomWalk": 0.24,
+        			"AccelBiasStabilityTau": 800,
+        			"AccelBiasStability": 36
+			},
+			"GPULidar": {
+					"SensorType": 6,
+					"Enabled" : true,
+                    "NumberOfChannels": 64,
+                    "RotationsPerSecond": 20,
+                    "PointsPerSecond": 300000,
+                    "X": 0, "Y": 0, "Z": -1,
+                    "Roll": 0, "Pitch": 0, "Yaw" : 0,
+                    "VerticalFOVUpper": -15,
+                    "VerticalFOVLower": 15,
+                    "HorizontalFOVStart": -180,
+                    "HorizontalFOVEnd": 180,
+                    "DrawDebugPoints": false
+
+			}
+		}
+	  }   
+	},
+	"SubWindows": [
+    {"WindowID": 0, "CameraName": "camera_left", "ImageType": 0, "VehicleName": "Car1", "Visible": false},
+    {"WindowID": 2, "CameraName": "camera_left", "ImageType": 0, "VehicleName": "Car2", "Visible": false}
+  	]
+	
+}
+  
