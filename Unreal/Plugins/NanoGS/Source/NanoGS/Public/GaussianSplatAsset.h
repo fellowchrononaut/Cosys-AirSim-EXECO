@@ -12,6 +12,7 @@
 // Forward declaration
 class UGaussianSplatAsset;
 class FGaussianSplatRenderData;
+class UTexture2D;
 
 // Delegate fired when asset data changes (e.g., Nanite enabled/disabled)
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnGaussianSplatAssetChanged, UGaussianSplatAsset*);

@@ -6,6 +6,8 @@
 #include "GaussianSplatRenderData.h"
 #include "GaussianSplatViewExtension.h"
 #include "Engine/Texture2D.h"
+#include "Rendering/Texture2DResource.h"
+#include "TextureResource.h"
 #include "RHICommandList.h"
 #include "RenderGraphBuilder.h"
 #include "SceneView.h"
