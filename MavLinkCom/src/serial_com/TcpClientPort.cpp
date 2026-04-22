@@ -138,11 +138,19 @@ public:
         return 0;
     }
 
-    void accept(const std::string& localHost, int localPort)
+    void accept(const std::string& localHost, int localPort, bool* cancel_flag = nullptr)
     {
         accept_sock = socket(AF_INET, SOCK_STREAM, 0);
 
         resolveAddress(localHost, localPort, localaddr);
+
+        // Allow immediate reuse of the port after a previous connection closes (avoids EADDRINUSE on restart).
+        int reuse = 1;
+#ifdef _WIN32
+        ::setsockopt(accept_sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#else
+        ::setsockopt(accept_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
 
         // bind socket to local address.
         socklen_t addrlen = sizeof(sockaddr_in);
@@ -161,16 +169,49 @@ public:
             throw std::runtime_error(msg);
         }
 
-        // accept 1
-        sock = ::accept(accept_sock, reinterpret_cast<sockaddr*>(&remoteaddr), &addrlen);
-        if (sock == INVALID_SOCKET) {
+        // 1-second timeout so the loop below can poll cancel_flag instead of blocking forever.
+#ifdef _WIN32
+        DWORD timeout_ms = 1000;
+        ::setsockopt(accept_sock, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        ::setsockopt(accept_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+        while (true) {
+            // Only check cancel_flag here — closed_ starts true on a fresh socket and is
+            // not meaningful until after a successful accept or a concurrent close() error.
+            if (cancel_flag != nullptr && *cancel_flag) {
+                throw std::runtime_error("TcpClientPort accept cancelled");
+            }
+
+            sock = ::accept(accept_sock, reinterpret_cast<sockaddr*>(&remoteaddr), &addrlen);
+            if (sock != INVALID_SOCKET) {
+                break;
+            }
+
             int hr = GetSocketError();
+#ifdef _WIN32
+            if (hr == WSAETIMEDOUT || hr == WSAEINTR) {
+                continue;
+            }
+#else
+            if (hr == EAGAIN || hr == EWOULDBLOCK || hr == EINTR) {
+                continue;
+            }
+#endif
+            // Real error — check if caused by a concurrent close() before throwing.
+            if (closed_ || (cancel_flag != nullptr && *cancel_flag)) {
+                throw std::runtime_error("TcpClientPort accept cancelled");
+            }
             auto msg = Utils::stringf("TcpClientPort accept failed with error: %d\n", hr);
             throw std::runtime_error(msg);
         }
 
 #ifdef _WIN32
-        // don't need to accept any more, so we can close this one.
         ::closesocket(accept_sock);
 #else
         int fd = static_cast<int>(accept_sock);
@@ -349,9 +390,9 @@ void TcpClientPort::connect(const std::string& localHost, int localPort, const s
     impl_->connect(localHost, localPort, remoteHost, remotePort);
 }
 
-void TcpClientPort::accept(const std::string& localHost, int localPort)
+void TcpClientPort::accept(const std::string& localHost, int localPort, bool* cancel_flag)
 {
-    impl_->accept(localHost, localPort);
+    impl_->accept(localHost, localPort, cancel_flag);
 }
 
 int TcpClientPort::write(const uint8_t* ptr, int count)
