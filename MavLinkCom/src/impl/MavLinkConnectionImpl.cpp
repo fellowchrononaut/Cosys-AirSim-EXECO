@@ -92,8 +92,13 @@ std::string MavLinkConnectionImpl::acceptTcp(std::shared_ptr<MavLinkConnection> 
     close();
     std::shared_ptr<TcpClientPort> socket = std::make_shared<TcpClientPort>();
 
+    // Reset closed: the internal close() above set it true as a reset step.
+    // External disconnect() will set it true again to cancel the accept below.
+    closed = false;
+
     port = socket; // this is so that a call to close() can cancel this blocking accept call.
-    socket->accept(localAddr, listeningPort);
+
+    socket->accept(localAddr, listeningPort, &closed);
 
     std::string remote = socket->remoteAddress();
 

@@ -18,7 +18,8 @@ public:
     void connect(const std::string& localHost, int localPort, const std::string& remoteHost, int remotePort);
 
     // start listening on the local adapter, and accept one connection request from a remote machine.
-    void accept(const std::string& localHost, int localPort);
+    // cancel_flag: if non-null, accept polls every second and throws if *cancel_flag becomes true.
+    void accept(const std::string& localHost, int localPort, bool* cancel_flag = nullptr);
 
     // write the given bytes to the port, return number of bytes written or -1 if error.
     int write(const uint8_t* ptr, int count);
