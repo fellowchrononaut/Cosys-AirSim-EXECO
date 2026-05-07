@@ -61,11 +61,13 @@ D_RQT=$((DELAY_UNREAL + DELAY_ROS + 3))
 # ── Build the tmux layout ────────────────────────────────────
 #
 #  Layout (2 rows x 3 cols):
-#  ┌─────────────────┬─────────────────┬─────────────────┐
-#  │  [1] Unreal     │  [2] ROS2 node  │  [3] Monitor    │
-#  ├─────────────────┼─────────────────┼─────────────────┤
-#  │  [4] rqt        │  [5] PX4 SITL   │  [6] QGC        │
-#  └─────────────────┴─────────────────┴─────────────────┘
+#  ┌─────────────────┬─────────────────┐
+#  │  [1] Unreal     │  [4] rqt        │
+#  ├─────────────────┼─────────────────┤
+#  │  [2] ROS2 node  │  [5] PX4 SITL   │
+#  ├─────────────────┼─────────────────┤
+#  │  [3] Monitor    │  [6] QGC        │
+#  └─────────────────┴─────────────────┘
 
 # Create session with pane 1
 tmux new-session -d -s "$SESSION" -x "220" -y "50"
@@ -78,10 +80,9 @@ tmux split-window -h -t "$SESSION:0.1"
 
 # ── Row 2 ────────────────────────────────────────────────────
 # Split each top pane horizontally to create the bottom row
-tmux split-window -v -t "$SESSION:0.0"   # pane 4 (below pane 1)
-tmux split-window -v -t "$SESSION:0.2"   # pane 5 (below pane 2) — note pane indices shift
-tmux split-window -v -t "$SESSION:0.4"   # pane 6 (below pane 3)
-
+tmux split-window -v -t "$SESSION:0.0"   # pane 4 
+tmux split-window -v -t "$SESSION:0.2"   # pane 5 
+tmux split-window -v -t "$SESSION:0.4"   # pane 6
 # Even out the column widths
 tmux select-layout -t "$SESSION" tiled
 
