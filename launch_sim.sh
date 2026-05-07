@@ -11,7 +11,7 @@
 # ============================================================
 
 # ── CONFIG ──────────────────────────────────────────────────
-DOCKER_CONTAINER="ros2_sadvio"
+DOCKER_CONTAINER="execo_ros2"
 ROS_DISTRO="humble"
 SESSION="airsim"
 
