@@ -30,7 +30,8 @@ public class NanoGS : ModuleRules
 				"RenderCore",
 				"RHI",
 				"Renderer",
-				"Projects"
+				"Projects",
+				"DeveloperSettings"   // UNanoGSLightingSettings (Project Settings page)
 			}
 		);
 

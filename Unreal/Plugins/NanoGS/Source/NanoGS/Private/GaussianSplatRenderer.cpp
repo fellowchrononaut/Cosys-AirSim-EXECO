@@ -545,8 +545,12 @@ void FGaussianSplatRenderer::DrawSplats(
 		return;
 	}
 
+	// Legacy per-proxy path: no depth MRT, so use the default (OUTPUT_DEPTH=0) permutation.
+	FGaussianSplatPS::FPermutationDomain PSPermutation;
+	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(false);
+
 	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
 	{
@@ -1168,7 +1172,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	FGaussianGlobalAccumulator* GlobalAccumulator,
 	FBufferRHIRef IndexBuffer,
 	int32 TotalSplatCount,
-	int32 DebugMode)
+	int32 DebugMode,
+	bool bOutputDepth)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal);
 
@@ -1177,8 +1182,12 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 		return;
 	}
 
+	// Select the pixel-shader permutation: with depth output (3 RTs) only when lighting needs it.
+	FGaussianSplatPS::FPermutationDomain PSPermutation;
+	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(bOutputDepth);
+
 	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
 	{
@@ -1202,14 +1211,23 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
 		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
 	>::GetRHI();
-	// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
-	// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
-	GraphicsPSOInit.BlendState = TStaticBlendState<
-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
-	>::GetRHI();
+	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement,
+	// and (when bOutputDepth) RT2 (RG32F depth accumulation) premultiplied like RT0.
+	if (bOutputDepth)
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
+			CW_RG,   BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT2 depth accum
+		>::GetRHI();
+	}
+	else
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero                 // RT1 velocity
+		>::GetRHI();
+	}
 	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
 	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
 	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
@@ -1602,7 +1620,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	const FSceneView& View,
 	FGaussianGlobalAccumulator* GlobalAccumulator,
 	FBufferRHIRef IndexBuffer,
-	int32 DebugMode)
+	int32 DebugMode,
+	bool bOutputDepth)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect);
 
@@ -1611,8 +1630,12 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 		return;
 	}
 
+	// Select the pixel-shader permutation: with depth output (3 RTs) only when lighting needs it.
+	FGaussianSplatPS::FPermutationDomain PSPermutation;
+	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(bOutputDepth);
+
 	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
 	{
@@ -1636,14 +1659,24 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
 		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
 	>::GetRHI();
-	// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
-	// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
-	GraphicsPSOInit.BlendState = TStaticBlendState<
-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
-	>::GetRHI();
+	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement,
+	// and (when bOutputDepth) RT2 (RG32F depth accumulation) premultiplied like RT0 so it composites
+	// to sum(viewZ*alpha*T) / sum(alpha*T). CW_RGBA on RT0 tracks accumulated alpha for the composite.
+	if (bOutputDepth)
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
+			CW_RG,   BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT2 depth accum
+		>::GetRHI();
+	}
+	else
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero                 // RT1 velocity
+		>::GetRHI();
+	}
 	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
 	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
 	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
@@ -1912,7 +1945,9 @@ int32 FGaussianSplatRenderer::DispatchClusterCulling(
 void FGaussianSplatRenderer::CompositeToSceneColor(
 	FRHICommandListImmediate& RHICmdList,
 	const FSceneView& View,
-	FTextureRHIRef IntermediateTexture)
+	FTextureRHIRef IntermediateTexture,
+	FTextureRHIRef DepthAccumTexture,
+	const FGaussianSceneLighting& Lighting)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatComposite);
 
@@ -1953,6 +1988,50 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	FGaussianSplatCompositePS::FParameters PSParameters;
 	PSParameters.IntermediateTexture = IntermediateTexture;
 	PSParameters.IntermediateSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+	// Screen-space lighting parameters.
+	// DepthAccumTexture (RG32F) holds alpha-weighted view-space depth. If it's null (lighting
+	// disabled / no depth pass this frame), bind IntermediateTexture as a harmless stand-in and
+	// force LightingBlend = 0 so the shader skips the lighting branch entirely.
+	const bool bHasDepth = DepthAccumTexture.IsValid();
+	PSParameters.DepthAccumTexture = bHasDepth ? DepthAccumTexture : IntermediateTexture;
+	PSParameters.DepthAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.InvViewMatrix   = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
+	{
+		// FocalLength in pixels, matching CalcViewData (M00/M11 are jitter-independent).
+		const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
+		PSParameters.FocalLength = FVector2f(
+			(float)(ProjMatrix.M[0][0] * ViewRect.Width()  * 0.5),
+			(float)(ProjMatrix.M[1][1] * ViewRect.Height() * 0.5));
+	}
+	PSParameters.ScreenSize      = FVector2f((float)ViewRect.Width(), (float)ViewRect.Height());
+	PSParameters.ViewRectMin     = FVector2f((float)ViewRect.Min.X, (float)ViewRect.Min.Y);
+	PSParameters.CameraWorldPos  = FVector3f(View.ViewMatrices.GetViewOrigin());
+	PSParameters.NumLights           = (uint32)Lighting.NumLights;
+	PSParameters.AmbientColor        = Lighting.AmbientColor;
+	PSParameters.LightingBlend       = bHasDepth ? Lighting.LightingBlend : 0.f;
+	PSParameters.LightIntensityScale = Lighting.IntensityScale;
+	PSParameters.NormalSmoothRadius  = (uint32)Lighting.NormalSmoothRadius;
+	PSParameters.NormalSmoothFrac    = Lighting.NormalSmoothFrac;
+	PSParameters.NormalSampleStep    = (uint32)Lighting.NormalSampleStep;
+
+	// Fill flattened light arrays; zero-init all 16 slots first
+	for (int32 i = 0; i < FGaussianSceneLighting::MaxLights; ++i)
+	{
+		PSParameters.LightPositionInvRadius[i] = FVector4f(0, 0, 0, 0);
+		PSParameters.LightColorType[i]         = FVector4f(0, 0, 0, 0);
+		PSParameters.LightDirectionCosOuter[i] = FVector4f(0, 0, -1, -1);
+		PSParameters.LightCosInner[i]          = FVector4f(1, 0, 0, 0);
+	}
+	for (int32 i = 0; i < Lighting.NumLights; ++i)
+	{
+		const FGaussianLight& L = Lighting.Lights[i];
+		PSParameters.LightPositionInvRadius[i] = FVector4f(L.Position, L.InvRadius);
+		PSParameters.LightColorType[i]         = FVector4f(L.Color, L.Type);
+		PSParameters.LightDirectionCosOuter[i] = FVector4f(L.Direction, L.CosOuter);
+		PSParameters.LightCosInner[i]          = FVector4f(L.CosInner, L.Intensity, 0.f, 0.f);
+	}
+
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 
 	// Draw full-screen triangle (3 vertices, no index buffer)

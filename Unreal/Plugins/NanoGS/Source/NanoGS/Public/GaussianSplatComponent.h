@@ -77,6 +77,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splatting|Performance")
 	bool bEnableFrustumCulling = true;
 
+	/** Blend factor for scene directional lighting (0 = unlit/original, 1 = fully lit).
+	 *  Requires gs.LightingBlend console variable to also be > 0, or set it directly there. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gaussian Splatting|Lighting", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float LightingBlend = 0.0f;
+
 	/** Projected error threshold for LOD selection (resolution-independent, like Nanite).
 	 *  Lower values = more conservative (keep detail longer, less LOD savings)
 	 *  Higher values = more aggressive (switch to LOD sooner, better performance)

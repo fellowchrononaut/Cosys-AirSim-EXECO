@@ -203,6 +203,12 @@ class FGaussianSplatPS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FGaussianSplatPS);
 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatPS, FGlobalShader);
 
+	// When set, the pixel shader writes an extra MRT (SV_Target2) accumulating alpha-weighted
+	// view-space depth for screen-space lighting. Off by default so the raster pipeline is
+	// unchanged (2 RTs) when lighting is disabled.
+	class FOutputDepth : SHADER_PERMUTATION_BOOL("OUTPUT_DEPTH");
+	using FPermutationDomain = TShaderPermutationDomain<FOutputDepth>;
+
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		// Velocity calculation: transform translated world position to previous clip space
 		// NOTE: Uses UN-JITTERED matrix to ensure stable velocity when camera is static
@@ -240,6 +246,7 @@ class FGaussianSplatCompositeVS : public FGlobalShader
  * Pixel shader for the sRGB→linear composite pass
  * Reads the intermediate sRGB-blended splat accumulation texture,
  * converts to linear, and outputs for premultiplied alpha blending onto SceneColor.
+ * Also performs screen-space dynamic lighting when LightingBlend > 0.
  */
 class FGaussianSplatCompositePS : public FGlobalShader
 {
@@ -249,11 +256,40 @@ class FGaussianSplatCompositePS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, IntermediateSampler)
+		// Screen-space lighting: alpha-weighted depth accumulation + scene lights.
+		// DepthAccumTexture (RG32F): R = sum(viewZ * alpha * T), G = sum(alpha * T).
+		// Expected view-space depth at a pixel = R / G.
+		SHADER_PARAMETER_TEXTURE(Texture2D, DepthAccumTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, DepthAccumSampler)
+		SHADER_PARAMETER(FMatrix44f, InvViewMatrix)     // view -> world (GetInvViewMatrix)
+		SHADER_PARAMETER(FVector2f,  FocalLength)       // pixels: (ProjM00*W/2, ProjM11*H/2)
+		SHADER_PARAMETER(FVector2f,  ScreenSize)        // ViewRect extent (pixels)
+		SHADER_PARAMETER(FVector2f,  ViewRectMin)       // ViewRect.Min for SV_Position -> view ray
+		SHADER_PARAMETER(FVector3f,  CameraWorldPos)
+		// Flattened light array (MAX_LIGHTS = 16, kept in sync with FGaussianSceneLighting::MaxLights)
+		SHADER_PARAMETER_ARRAY(FVector4f, LightPositionInvRadius, [16]) // xyz=pos, w=1/radius
+		SHADER_PARAMETER_ARRAY(FVector4f, LightColorType,         [16]) // rgb=tint, w=type
+		SHADER_PARAMETER_ARRAY(FVector4f, LightDirectionCosOuter, [16]) // xyz=dir, w=cosOuter
+		SHADER_PARAMETER_ARRAY(FVector4f, LightCosInner,          [16]) // x=cosInner, y=intensity (zw pad)
+		SHADER_PARAMETER(uint32,    NumLights)
+		SHADER_PARAMETER(FVector3f, AmbientColor)
+		SHADER_PARAMETER(float,     LightingBlend)
+		SHADER_PARAMETER(float,     LightIntensityScale) // global sensitivity for per-light intensity
+		// Bilateral depth smoothing for normal reconstruction (removes per-splat scatter)
+		SHADER_PARAMETER(uint32,    NormalSmoothRadius)  // kernel radius in pixels; 0 = off
+		SHADER_PARAMETER(float,     NormalSmoothFrac)    // depth-similarity sigma as fraction of view depth
+		SHADER_PARAMETER(uint32,    NormalSampleStep)    // central-difference baseline (pixels) for the normal
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
 		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("MAX_LIGHTS"), 16);
 	}
 };
 

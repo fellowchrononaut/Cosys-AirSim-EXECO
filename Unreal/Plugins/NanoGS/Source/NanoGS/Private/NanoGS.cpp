@@ -15,13 +15,19 @@
 #include "RenderGraphUtils.h"
 #include "SceneView.h"
 #include "ScreenPass.h"
+#include "ScenePrivate.h"
+#include "LightSceneProxy.h"    // FLightSceneProxy full definition (GetLightType, GetRadius, etc.)
+#include "SceneManagement.h"    // FLightRenderParameters (SpotAngles for spot cone reconstruction)
+#include "NanoGSLightingSettings.h" // Project Settings page that drives the gs.* lighting CVars
 
 #define LOCTEXT_NAMESPACE "FNanoGSModule"
 
-// Pass 2 parameter struct: declares IntermediateTexture as an RDG-tracked shader resource
-// so that RDG inserts the proper RTV→SRV barrier between Pass 1 (write) and Pass 2 (read).
+// Pass 2 parameter struct: declares IntermediateTexture and DepthAccumTexture as RDG-tracked
+// shader resource inputs so that RDG inserts the required RTV→SRV barriers between Pass 1
+// (which writes both as render targets) and this pass (which reads both as shader resources).
 BEGIN_SHADER_PARAMETER_STRUCT(FGaussianCompositePassParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, IntermediateTexture)
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthAccumTexture)   // read-after-write barrier for depth accum
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
@@ -66,8 +72,188 @@ TAutoConsoleVariable<int32> CVarDebugForceLODLevel(
 	TEXT("Use with gs.ShowClusterBounds 2 to visualize which LOD level is being rendered."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<float> CVarGSLightingBlend(
+	TEXT("gs.LightingBlend"),
+	0.0f,
+	TEXT("Blend factor for scene directional lighting on Gaussian splats.\n")
+	TEXT(" 0: Unlit (original appearance, default)\n")
+	TEXT(" 1: Fully lit by the dominant directional light\n")
+	TEXT("Intermediate values blend between the two."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<float> CVarGSAmbientIntensity(
+	TEXT("gs.AmbientIntensity"),
+	0.1f,
+	TEXT("Ambient light intensity added to shadowed side of splats when gs.LightingBlend > 0."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<float> CVarGSLightIntensityScale(
+	TEXT("gs.LightIntensityScale"),
+	0.1f,
+	TEXT("Global sensitivity mapping a scene light's intensity to its effect on splats.\n")
+	TEXT("Per-light response = 1 - exp(-intensity * this scale), so it never blows out (asymptotes to 1).\n")
+	TEXT("Local-light intensity is in ~candela (UE unit factor divided out); directional in ~lux.\n")
+	TEXT("Raise to make lights reach full brightness at lower intensities; lower to soften. Default 0.1."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<int32> CVarGSNormalSmoothRadius(
+	TEXT("gs.NormalSmoothRadius"),
+	2,
+	TEXT("Bilateral depth-smoothing kernel radius (pixels) for screen-space normal reconstruction.\n")
+	TEXT("Removes the per-splat depth scatter that makes lit surfaces look like a noisy SfM mesh.\n")
+	TEXT("0 = off (raw, noisy). Higher = smoother normals but softer detail and more cost. Default 2."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<float> CVarGSNormalSmoothFrac(
+	TEXT("gs.NormalSmoothDepthSigma"),
+	0.02f,
+	TEXT("Bilateral depth-similarity sigma as a fraction of view-space depth (edge preservation).\n")
+	TEXT("Smaller = preserves silhouettes/creases more (less cross-surface bleed); larger = smoother.\n")
+	TEXT("Default 0.02 (2%% of depth)."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<int32> CVarGSNormalSampleStep(
+	TEXT("gs.NormalSampleStep"),
+	3,
+	TEXT("Central-difference baseline (pixels) for screen-space normal reconstruction.\n")
+	TEXT("The normal is the surface slope between samples this far apart, so a wider step averages\n")
+	TEXT("out per-splat depth waviness into the overall surface slope (free — no extra taps).\n")
+	TEXT("1 = sharpest/noisiest. Higher = smoother, flatter normals. Default 3."),
+	ECVF_RenderThreadSafe);
+
 // Export for other modules
 int32 GGaussianSplatShowClusterBounds = 0;
+
+static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
+{
+	FGaussianSceneLighting Out;
+	Out.LightingBlend = CVarGSLightingBlend.GetValueOnRenderThread();
+	if (Out.LightingBlend <= 0.f) return Out;   // fast-out, lighting disabled
+
+	const float Amb = CVarGSAmbientIntensity.GetValueOnRenderThread();
+	Out.AmbientColor = FVector3f(Amb, Amb, Amb);
+	Out.IntensityScale = CVarGSLightIntensityScale.GetValueOnRenderThread();
+	Out.NormalSmoothRadius = FMath::Clamp(CVarGSNormalSmoothRadius.GetValueOnRenderThread(), 0, 6);
+	Out.NormalSmoothFrac = FMath::Max(CVarGSNormalSmoothFrac.GetValueOnRenderThread(), 0.f);
+	Out.NormalSampleStep = FMath::Clamp(CVarGSNormalSampleStep.GetValueOnRenderThread(), 1, 16);
+
+	FScene* Scene = SceneView ? static_cast<FScene*>(SceneView->Family->Scene) : nullptr;
+	if (!Scene) return Out;
+
+	// Helpers: separate a light's HDR color into tint (hue, max-component = 1) and
+	// intensity (the discarded brightness). GetColor() bakes intensity into the color,
+	// so its max-component tracks the light's editor Intensity property.
+	auto MaxComp = [](FLinearColor C) -> float {
+		return FMath::Max3(C.R, C.G, C.B);
+	};
+	auto NormalizeTint = [&](FLinearColor C) -> FVector3f {
+		float M = MaxComp(C);
+		return (M > 0.f) ? FVector3f(C.R/M, C.G/M, C.B/M) : FVector3f(1,1,1);
+	};
+
+	// Slot 0: dominant directional light
+	if (Scene->SimpleDirectionalLight && Scene->SimpleDirectionalLight->Proxy)
+	{
+		const FLightSceneProxy* P = Scene->SimpleDirectionalLight->Proxy;
+		const FLinearColor C = P->GetColor();
+		FGaussianLight& L = Out.Lights[Out.NumLights++];
+		L.Type      = 0.f;
+		// GetDirection() returns the direction the light travels (away from source).
+		// Store as-is; the shader negates it to get the "toward light" vector.
+		L.Direction = FVector3f(P->GetDirection());
+		L.Color     = NormalizeTint(C);
+		L.Intensity = MaxComp(C);
+		L.InvRadius = 0.f;  // no distance falloff for directional
+	}
+
+	// Local lights: iterate Scene->Lights (TSparseArray<FLightSceneInfoCompact>)
+	// Each compact entry has LightSceneInfo->Proxy.
+	// Gather candidates, score by proximity to camera, take top (MaxLights - NumLights).
+	struct FLightCandidate
+	{
+		FGaussianLight Light;
+		float Score;  // higher = more important; used for sorting
+	};
+	TArray<FLightCandidate, TInlineAllocator<32>> Candidates;
+
+	const FVector CameraOrigin = SceneView->ViewMatrices.GetViewOrigin();
+	const int32 SlotsLeft = FGaussianSceneLighting::MaxLights - Out.NumLights;
+
+	for (const FLightSceneInfoCompact& Compact : Scene->Lights)
+	{
+		if (!Compact.LightSceneInfo || !Compact.LightSceneInfo->Proxy) continue;
+		const FLightSceneProxy* P = Compact.LightSceneInfo->Proxy;
+
+		const uint8 LT = P->GetLightType();
+
+		// Skip directional (already handled above) and unsupported types
+		if (LT == LightType_Directional) continue;
+		if (LT != LightType_Point && LT != LightType_Spot) continue;
+
+		// GetRadius() returns the attenuation radius (FLT_MAX for directional, never reached)
+		const float Radius = P->GetRadius();
+		if (Radius <= 0.f) continue;
+
+		// Cull: light's sphere must overlap the camera position (conservative)
+		// Use GetOrigin() for world-space light position (FVector)
+		const FVector LightPos = P->GetOrigin();
+		const float DistToCamera = FVector::Dist(LightPos, CameraOrigin);
+		if (DistToCamera > Radius + 1000.f) continue;  // broad-phase cull (1000cm slack)
+
+		const FLinearColor LightColor = P->GetColor();
+		FGaussianLight GL;
+		GL.Position  = FVector3f(LightPos);
+		GL.InvRadius = (Radius > 0.f) ? (1.f / Radius) : 0.f;
+		GL.Color     = NormalizeTint(LightColor);
+		// UE bakes a cm²→m² unit factor (100*100) into local-light GetColor() for candela
+		// intensity (see PointLightComponent.cpp ComputeLightBrightness). Divide it out so the
+		// captured intensity is back in ~candela, comparable to the directional's lux magnitude,
+		// letting a single gs.LightIntensityScale serve both. (Lumens/spot carry an extra
+		// cone/4PI factor that the scale CVar absorbs.)
+		GL.Intensity = MaxComp(LightColor) / (100.f * 100.f);
+
+		if (LT == LightType_Spot)
+		{
+			GL.Type = 2.f;
+			// GetDirection() is the forward axis of the spot cone
+			GL.Direction = FVector3f(P->GetDirection());
+			// GetOuterConeAngle() returns the outer half-angle in radians (from FSpotLightSceneProxy)
+			// Use GetLightShaderParameters to access SpotAngles: X=CosOuter, Y=InvCosConeDifference
+			FLightRenderParameters LRP;
+			P->GetLightShaderParameters(LRP);
+			// SpotAngles.X = CosOuterCone
+			// SpotAngles.Y = 1 / (CosInner - CosOuter)  =>  CosInner = CosOuter + 1/Y
+			const float CosOuter = LRP.SpotAngles.X;
+			const float CosInner = (LRP.SpotAngles.Y > 0.f)
+				? CosOuter + (1.f / LRP.SpotAngles.Y)
+				: CosOuter;
+			GL.CosOuter = CosOuter;
+			GL.CosInner = FMath::Clamp(CosInner, CosOuter, 1.f);
+		}
+		else  // LightType_Point
+		{
+			GL.Type     = 1.f;
+			GL.Direction = FVector3f(0,0,-1);  // unused for point
+			GL.CosOuter = -1.f;                // no cone
+			GL.CosInner =  1.f;
+		}
+
+		// Score: brighter (larger radius) and closer = higher priority
+		const float Score = Radius / FMath::Max(DistToCamera, 1.f);
+		Candidates.Add({GL, Score});
+	}
+
+	// Sort candidates descending by score, take top SlotsLeft
+	Candidates.Sort([](const FLightCandidate& A, const FLightCandidate& B){ return A.Score > B.Score; });
+
+	const int32 NumToAdd = FMath::Min(Candidates.Num(), SlotsLeft);
+	for (int32 i = 0; i < NumToAdd; ++i)
+	{
+		Out.Lights[Out.NumLights++] = Candidates[i].Light;
+	}
+
+	return Out;
+}
 
 // Helper to get the renderer module
 static IRendererModule& GetRendererModuleRef()
@@ -97,6 +283,13 @@ void FNanoGSModule::StartupModule()
 
 void FNanoGSModule::OnPostEngineInit()
 {
+	// Apply the persisted NanoGS Lighting project settings to the gs.* CVars now that the module
+	// (and its CVars) are fully registered. This makes the Project Settings page authoritative at launch.
+	if (const UNanoGSLightingSettings* Settings = GetDefault<UNanoGSLightingSettings>())
+	{
+		Settings->ApplyToCVars();
+	}
+
 	// Skip view extension creation during cooking/commandlet — GEngine is null in those contexts
 	if (IsRunningCommandlet() || !GEngine)
 	{
@@ -158,6 +351,17 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 	int32 DebugMode = CVarShowClusterBounds.GetValueOnRenderThread();
 
+	// Gather scene lights up front (render-thread access to Scene->Lights). Needed before Pass 1
+	// so we can decide whether to allocate + write the depth-accumulation MRT this frame.
+	FGaussianSceneLighting SceneLighting = GatherSceneLighting(SceneView);
+
+	// Output the alpha-weighted depth MRT only when lighting actually needs it. RT2 requires RT1
+	// (velocity) to be bound contiguously, so we also require VelocityTexture. Debug viz disables it.
+	const bool bOutputDepth = (SceneLighting.LightingBlend > 0.f)
+	                       && (SceneLighting.NumLights > 0)
+	                       && (VelocityTexture != nullptr)
+	                       && (DebugMode == 0);
+
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
 	// to produce correct colors. After compositing, we convert sRGB→linear for SceneColor.
@@ -168,6 +372,19 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
 	FRDGTexture* IntermediateTexture = GraphBuilder.CreateTexture(IntermediateDesc, TEXT("GaussianSplatIntermediateRT"));
 
+	// Alpha-weighted view-space depth accumulation target (RG32F: viewZ*alpha, alpha).
+	// Only allocated when lighting needs it; FP32 for precision at city-scale depths.
+	FRDGTexture* DepthAccumTexture = nullptr;
+	if (bOutputDepth)
+	{
+		FRDGTextureDesc DepthAccumDesc = FRDGTextureDesc::Create2D(
+			ColorTexture->Desc.Extent,
+			PF_G32R32F,
+			FClearValueBinding(FLinearColor(0, 0, 0, 0)),
+			TexCreate_RenderTargetable | TexCreate_ShaderResource);
+		DepthAccumTexture = GraphBuilder.CreateTexture(DepthAccumDesc, TEXT("GaussianSplatDepthAccumRT"));
+	}
+
 	// Pass 1: Render splats to intermediate RT (sRGB blending)
 	FRenderTargetParameters* Pass1Parameters = GraphBuilder.AllocParameters<FRenderTargetParameters>();
 	Pass1Parameters->RenderTargets[0] = FRenderTargetBinding(IntermediateTexture, ERenderTargetLoadAction::EClear);
@@ -175,6 +392,11 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	if (VelocityTexture)
 	{
 		Pass1Parameters->RenderTargets[1] = FRenderTargetBinding(VelocityTexture, ERenderTargetLoadAction::ELoad);
+	}
+	// RT2: depth accumulation (requires RT1 bound, guaranteed by bOutputDepth)
+	if (bOutputDepth)
+	{
+		Pass1Parameters->RenderTargets[2] = FRenderTargetBinding(DepthAccumTexture, ERenderTargetLoadAction::EClear);
 	}
 	if (DepthTexture)
 	{
@@ -321,7 +543,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			ERDGPassFlags::Raster,
 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, DebugMode, MaxRenderBudget](FRHICommandListImmediate& RHICmdList)
+			 CurrentDebugForceLODLevel, DebugMode, MaxRenderBudget, bOutputDepth](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
@@ -526,7 +748,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 					// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
 					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
-						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
+						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, bOutputDepth);
 				}
 				else
 				{
@@ -611,35 +833,40 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					// Single draw call for ALL proxies (capped to render budget)
 					FGaussianSplatRenderer::DrawSplatsGlobal(
 						RHICmdList, *SceneView, RawAccumulator,
-						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode);
+						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode, bOutputDepth);
 				}
 			}
 		);
 
-		// Pass 2: Composite intermediate sRGB RT onto SceneColor (sRGB → linear conversion)
-		// Use FGaussianCompositePassParameters to declare IntermediateTexture as an RDG-tracked
-		// shader resource input. This ensures RDG inserts the required RTV→SRV resource barrier
-		// between Pass 1 (which writes IntermediateTexture as a render target) and this pass
-		// (which reads it as a shader resource). Without this, the GPU may read stale/partial
-		// data from IntermediateTexture, producing rectangular block artifacts.
+		// Pass 2: Composite intermediate sRGB RT onto SceneColor (sRGB → linear conversion +
+		// optional screen-space lighting from the alpha-weighted depth accumulation).
+		// SceneLighting was gathered above (before Pass 1). FGaussianCompositePassParameters
+		// declares IntermediateTexture and DepthAccumTexture as RDG-tracked inputs so RDG inserts
+		// the required RTV→SRV barriers between Pass 1 and this pass.
 		ERenderTargetLoadAction CompositeColorLoadAction = (DebugMode > 0) ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad;
 		FGaussianCompositePassParameters* Pass2Parameters = GraphBuilder.AllocParameters<FGaussianCompositePassParameters>();
 		Pass2Parameters->IntermediateTexture = IntermediateTexture;
+		// Bind the depth-accum texture for the read barrier; fall back to IntermediateTexture as a
+		// harmless stand-in when lighting is off (CompositeToSceneColor forces LightingBlend=0 then).
+		Pass2Parameters->DepthAccumTexture = bOutputDepth ? DepthAccumTexture : IntermediateTexture;
 		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
 
 		GraphBuilder.AddPass(
 			RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
 			Pass2Parameters,
 			ERDGPassFlags::Raster,
-			[SceneView, IntermediateTexture](FRHICommandListImmediate& RHICmdList)
+			[SceneView, IntermediateTexture, DepthAccumTexture, bOutputDepth, SceneLighting](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 
 				FRHITexture* IntermediateRHI = IntermediateTexture->GetRHI();
 				if (!IntermediateRHI) return;
 
+				// Depth-accum RHI texture (null when lighting is off → CompositeToSceneColor skips lighting)
+				FRHITexture* DepthAccumRHI = (bOutputDepth && DepthAccumTexture) ? DepthAccumTexture->GetRHI() : nullptr;
+
 				FGaussianSplatRenderer::CompositeToSceneColor(
-					RHICmdList, *SceneView, IntermediateRHI);
+					RHICmdList, *SceneView, IntermediateRHI, DepthAccumRHI, SceneLighting);
 			}
 		);
 }

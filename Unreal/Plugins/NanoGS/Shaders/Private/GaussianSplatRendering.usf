@@ -104,6 +104,13 @@ struct FPixelOutput
 {
 	float4 Color : SV_Target0;
 	float4 Velocity : SV_Target1;
+#if OUTPUT_DEPTH
+	// Alpha-weighted view-space depth accumulation for screen-space lighting.
+	// RG32F target: .r = viewZ * alpha, .g = alpha. The .a output is the blend factor
+	// (premultiplied "over"), so the buffer composites to .r = sum(viewZ*alpha*T),
+	// .g = sum(alpha*T); expected depth = r/g. Same weights as the color blend.
+	float4 DepthAccum : SV_Target2;
+#endif
 };
 
 // Vertex shader: generate quad from instance data
@@ -226,6 +233,10 @@ FPixelOutput MainPS(FVertexOutput Input)
 		// Output solid color (no premultiplied alpha, no Gaussian)
 		Output.Color = color;
 		Output.Velocity = EncodeVelocityToTexture(Velocity);
+	#if OUTPUT_DEPTH
+		// No meaningful surface depth in debug viz; contribute nothing.
+		Output.DepthAccum = float4(0, 0, 0, 0);
+	#endif
 		return Output;
 	}
 
@@ -260,5 +271,13 @@ FPixelOutput MainPS(FVertexOutput Input)
 	Output.Color = color;
 	// Output velocity for TAA/TSR (Nanite-style encoding)
 	Output.Velocity = EncodeVelocityToTexture(Velocity);
+#if OUTPUT_DEPTH
+	// Accumulate alpha-weighted view-space depth. CenterClipPos.w is the splat center's
+	// linear view-space depth (clip.w under UE projection). color.a is the post-Gaussian
+	// per-fragment alpha (same weight the color blend uses). The .a output drives the
+	// premultiplied "over" blend factor on RT2.
+	float ViewZ = Input.CenterClipPos.w;
+	Output.DepthAccum = float4(ViewZ * color.a, color.a, 0.0, color.a);
+#endif
 	return Output;
 }

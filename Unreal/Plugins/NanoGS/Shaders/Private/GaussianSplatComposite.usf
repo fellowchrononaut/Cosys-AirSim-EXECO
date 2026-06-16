@@ -6,13 +6,38 @@
 // Gaussian splatting trains and evaluates colors in sRGB space. Alpha blending
 // must happen in sRGB space to produce correct results. The splat rendering pass
 // writes sRGB premultiplied-alpha colors to an intermediate render target.
-// This composite pass un-premultiplies, converts sRGB→linear, re-premultiplies,
-// and blends the result onto SceneColor.
+// This composite pass un-premultiplies, converts sRGB→linear, optionally applies
+// screen-space dynamic lighting (depth-reconstructed normals, up to MAX_LIGHTS lights),
+// then applies inverse ACES tonemapping, re-premultiplies, and blends onto SceneColor.
 
 #include "/Engine/Public/Platform.ush"
 
 Texture2D IntermediateTexture;
 SamplerState IntermediateSampler;
+
+// Screen-space lighting parameters (bound when LightingBlend > 0)
+// DepthAccumTexture (RG32F): .r = sum(viewZ*alpha*T), .g = sum(alpha*T).
+// Expected view-space depth = r/g; .g doubles as per-pixel coverage weight.
+Texture2D    DepthAccumTexture;
+SamplerState DepthAccumSampler;
+float4x4 InvViewMatrix;  // view → world (GetInvViewMatrix), row-major UE convention
+float2   FocalLength;    // pixels: (ProjM00*W/2, ProjM11*H/2)
+float2   ScreenSize;     // ViewRect extent in pixels (Width, Height)
+float2   ViewRectMin;    // ViewRect.Min (pixels), for SV_Position → view ray
+float3   CameraWorldPos;
+
+// Flattened light arrays — MAX_LIGHTS is defined by the C++ ModifyCompilationEnvironment
+float4 LightPositionInvRadius[MAX_LIGHTS]; // xyz = world pos,  w = 1/attenuationRadius
+float4 LightColorType[MAX_LIGHTS];         // rgb = tint,       w = type (0=dir,1=point,2=spot)
+float4 LightDirectionCosOuter[MAX_LIGHTS]; // xyz = world dir,  w = cosOuter (spot)
+float4 LightCosInner[MAX_LIGHTS];          // x   = cosInner,   y = intensity,  zw = pad
+uint   NumLights;
+float3 AmbientColor;
+float  LightingBlend;
+float  LightIntensityScale;                // global sensitivity for per-light intensity
+uint   NormalSmoothRadius;                 // bilateral depth-smoothing kernel radius (px); 0 = off
+float  NormalSmoothFrac;                    // depth-similarity sigma as fraction of view depth
+uint   NormalSampleStep;                    // central-difference baseline (px) for the normal
 
 // Attempt to invert UE's ACES filmic tone curve so that display-ready gaussian
 // splat colors survive tone mapping unchanged.  Uses the Narkowicz ACES fit
@@ -35,6 +60,77 @@ float3 InverseACESTonemap(float3 color)
 	float3 C = -color * e;
 
 	return (-B + sqrt(max(B * B - 4.0 * A * C, 0.0))) / (2.0 * A);
+}
+
+// Reconstruct world-space position at a pixel from the alpha-weighted depth accumulation.
+// Returns false if the pixel has no splat coverage (weight ~0). The expected view-space depth
+// (linear) is recovered as r/g, then back-projected through the pinhole model (FocalLength)
+// to a view-space position, and transformed to world via InvViewMatrix.
+// View space: +X right, +Y up, +Z forward; pixel Y increases downward, hence the Y flip.
+// Bilateral-smoothed expected view-space depth at a pixel. Averages neighbouring expected
+// depths weighted by coverage and depth similarity, which suppresses the per-splat depth
+// scatter that otherwise makes reconstructed normals look like a noisy SfM mesh, while the
+// depth-similarity term preserves real silhouettes/creases. Returns false if no coverage.
+bool SmoothViewZ(int2 pixel, out float outZ)
+{
+	float2 daC = DepthAccumTexture.Load(int3(pixel, 0)).rg;
+	outZ = 0.0;
+	if (daC.g <= 1e-6)
+	{
+		return false;  // no coverage here
+	}
+	float zC = daC.r / daC.g;
+
+	int R = (int)NormalSmoothRadius;
+	if (R <= 0)
+	{
+		outZ = zC;
+		return true;
+	}
+
+	float sigma  = max(NormalSmoothFrac * zC, 1e-3);
+	float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+	float wSum = 0.0;
+	float zSum = 0.0;
+	[loop]
+	for (int dy = -R; dy <= R; ++dy)
+	{
+		[loop]
+		for (int dx = -R; dx <= R; ++dx)
+		{
+			float2 da = DepthAccumTexture.Load(int3(pixel + int2(dx, dy), 0)).rg;
+			if (da.g <= 1e-6) continue;
+			float z  = da.r / da.g;
+			float dz = z - zC;
+			float w  = da.g * exp(-dz * dz * inv2s2);  // coverage * depth-similarity
+			wSum += w;
+			zSum += z * w;
+		}
+	}
+	outZ = (wSum > 0.0) ? (zSum / wSum) : zC;
+	return true;
+}
+
+bool ReconstructWorld(int2 pixel, out float3 worldPos)
+{
+	worldPos = float3(0, 0, 0);
+	float viewZ;
+	if (!SmoothViewZ(pixel, viewZ))                        // expected (bilateral-smoothed) depth
+	{
+		return false;  // no coverage here
+	}
+
+	float2 pv = float2(pixel) - ViewRectMin;               // pixel within ViewRect
+	float cx = ScreenSize.x * 0.5;
+	float cy = ScreenSize.y * 0.5;
+
+	float3 viewPos;
+	viewPos.x = (pv.x + 0.5 - cx) * viewZ / FocalLength.x;
+	viewPos.y = (cy - pv.y - 0.5) * viewZ / FocalLength.y;  // flip Y (pixel down → view up)
+	viewPos.z = viewZ;
+
+	worldPos = mul(float4(viewPos, 1.0), InvViewMatrix).xyz; // row-major UE convention
+	return true;
 }
 
 struct FCompositeVSOutput
@@ -69,6 +165,85 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 
 	// Convert sRGB to linear for UE's SceneColor buffer
 	float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
+
+	// Screen-space dynamic lighting — only when enabled and lights are present.
+	// Guard: require all three samples to have splat coverage (ReconstructWorld returns false
+	// on uncovered pixels) so we don't build normals across silhouette edges.
+	if (LightingBlend > 0.0 && NumLights > 0)
+	{
+		int2 P = PixelPos;
+		int  s = max((int)NormalSampleStep, 1);
+		// Central differences over a wide baseline: the normal is the surface slope between
+		// samples s pixels apart, which averages out per-splat depth waviness (free — no extra taps).
+		float3 wL, wR, wD, wU;
+		bool okL = ReconstructWorld(P - int2(s, 0), wL);
+		bool okR = ReconstructWorld(P + int2(s, 0), wR);
+		bool okD = ReconstructWorld(P - int2(0, s), wD);
+		bool okU = ReconstructWorld(P + int2(0, s), wU);
+
+		if (okL && okR && okD && okU)
+		{
+			// Cross product gives a world-space normal (sign is arbitrary — we use abs NdotL)
+			float3 N = normalize(cross(wR - wL, wU - wD));
+
+			// Surface position (for point/spot light vectors + attenuation): average of the
+			// four samples ≈ the center pixel's world position, free of an extra reconstruction.
+			float3 wC = (wL + wR + wD + wU) * 0.25;
+
+			float3 lightSum = AmbientColor;
+
+			[loop]
+			for (uint i = 0; i < NumLights; ++i)
+			{
+				float  type      = LightColorType[i].w;
+				float3 tint      = LightColorType[i].rgb;
+				float  intensity = LightCosInner[i].y;        // light's brightness (max-comp of HDR color)
+				float3 Ldir;     // unit vector from surface toward light source
+				float  atten = 1.0;
+
+				if (type < 0.5)  // directional (type == 0)
+				{
+					// LightDirectionCosOuter.xyz stores the direction the light travels;
+					// negate to get the "toward light" vector for NdotL.
+					Ldir = -normalize(LightDirectionCosOuter[i].xyz);
+				}
+				else             // point (type == 1) or spot (type == 2)
+				{
+					float3 toL = LightPositionInvRadius[i].xyz - wC;
+					float  d   = length(toL);
+					Ldir = toL / max(d, 1e-4);
+
+					// UE-style smooth distance falloff (inverse-square with smooth edge)
+					float invR = LightPositionInvRadius[i].w;
+					float x    = saturate(1.0 - (d * invR) * (d * invR) * (d * invR) * (d * invR));
+					atten = x * x;
+
+					if (type > 1.5)  // spot cone attenuation (type == 2)
+					{
+						// dot of spot forward dir with direction FROM surface TO light = -Ldir
+						float cosA   = dot(normalize(LightDirectionCosOuter[i].xyz), -Ldir);
+						float cosO   = LightDirectionCosOuter[i].w;  // outer cone cosine
+						float cosI   = LightCosInner[i].x;           // inner cone cosine
+						atten *= saturate((cosA - cosO) / max(cosI - cosO, 1e-3));
+					}
+				}
+
+				// Two-sided Lambert: splats have no fixed facing, so use abs(NdotL)
+				float ndl = abs(dot(N, Ldir));
+				// Soft-saturation response: maps [0,inf) intensity -> [0,1) so bright lights
+				// asymptote instead of blowing out ("nothing but the light"). The editor
+				// Intensity slider still modulates, especially in the low/mid range.
+				float resp = 1.0 - exp(-intensity * LightIntensityScale);
+				lightSum += tint * (resp * ndl * atten);
+			}
+
+			// Clamp to avoid HDR blowout
+			lightSum = min(lightSum, 4.0);
+
+			float3 litLinear = linearColor * lightSum;
+			linearColor = lerp(linearColor, litLinear, LightingBlend);
+		}
+	}
 
 	// Apply inverse ACES tone curve so that UE's tone mapper maps us back to
 	// the intended display color.  Without this, the ACES S-curve boosts

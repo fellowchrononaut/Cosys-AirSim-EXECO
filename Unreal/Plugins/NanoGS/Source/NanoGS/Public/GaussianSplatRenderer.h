@@ -7,6 +7,34 @@
 #include "RenderGraphBuilder.h"
 #include "SceneView.h"
 
+// One scene light, flattened for the composite shader. World space.
+struct FGaussianLight
+{
+	FVector3f Position    = FVector3f::ZeroVector; // world; unused for directional
+	float     InvRadius   = 0.f;                   // 1/attenuationRadius; 0 = directional (no falloff)
+	FVector3f Color       = FVector3f::ZeroVector; // tint, normalized to [0,1] max-component
+	float     Type        = 0.f;                   // 0 = directional, 1 = point, 2 = spot
+	FVector3f Direction   = FVector3f(0,0,-1);     // world dir the light travels (dir/spot)
+	float     CosOuter    = -1.f;                  // spot outer cone cosine (<= -1 means "no cone")
+	float     CosInner    = 1.f;                   // spot inner cone cosine (for smooth edge)
+	float     Intensity   = 1.f;                   // brightness (max-component of HDR GetColor()); drives the slider
+};
+
+// Per-frame scene lighting gathered on the render thread.
+struct FGaussianSceneLighting
+{
+	static constexpr int32 MaxLights = 16;
+	FGaussianLight Lights[MaxLights];
+	int32     NumLights      = 0;
+	FVector3f AmbientColor   = FVector3f(0.1f, 0.1f, 0.1f);
+	float     LightingBlend  = 0.f;   // 0 = unlit (original), 1 = fully lit
+	float     IntensityScale = 0.3f;  // global sensitivity: contribution = tint * Intensity * IntensityScale
+	// Bilateral depth smoothing for normal reconstruction (removes per-splat depth scatter)
+	int32     NormalSmoothRadius = 2;     // kernel radius in pixels; 0 = off
+	float     NormalSmoothFrac   = 0.02f; // depth-similarity sigma as fraction of view depth
+	int32     NormalSampleStep   = 3;     // central-difference baseline (pixels) for the normal
+};
+
 class FGaussianSplatSceneProxy;
 class FGaussianSplatGPUResources;
 struct FGaussianGlobalAccumulator;
@@ -196,7 +224,8 @@ public:
 		FGaussianGlobalAccumulator* GlobalAccumulator,
 		FBufferRHIRef IndexBuffer,
 		int32 TotalSplatCount,
-		int32 DebugMode
+		int32 DebugMode,
+		bool bOutputDepth = false   // also write the alpha-weighted depth MRT (RT2) for lighting
 	);
 
 	//----------------------------------------------------------------------
@@ -277,7 +306,8 @@ public:
 		const FSceneView& View,
 		FGaussianGlobalAccumulator* GlobalAccumulator,
 		FBufferRHIRef IndexBuffer,
-		int32 DebugMode
+		int32 DebugMode,
+		bool bOutputDepth = false   // also write the alpha-weighted depth MRT (RT2) for lighting
 	);
 
 	/**
@@ -285,11 +315,14 @@ public:
 	 * Converts from sRGB to linear color space during compositing.
 	 * This ensures gaussian splat alpha blending happens in sRGB space
 	 * (matching 3DGS training) while still integrating with UE's linear pipeline.
+	 * Also applies screen-space dynamic lighting when Lighting.LightingBlend > 0.
 	 */
 	static void CompositeToSceneColor(
 		FRHICommandListImmediate& RHICmdList,
 		const FSceneView& View,
-		FTextureRHIRef IntermediateTexture
+		FTextureRHIRef IntermediateTexture,
+		FTextureRHIRef DepthAccumTexture,           // alpha-weighted depth MRT (RG32F); null = no lighting
+		const FGaussianSceneLighting& Lighting      // gathered scene lights
 	);
 
 private:
