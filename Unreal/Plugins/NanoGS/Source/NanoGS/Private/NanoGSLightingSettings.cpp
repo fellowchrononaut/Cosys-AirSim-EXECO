@@ -31,10 +31,13 @@ namespace
 
 void UNanoGSLightingSettings::ApplyToCVars() const
 {
+	SetCVarInt  (TEXT("gs.LightingGeometryMode"),  (int32)GeometryMode);
 	SetCVarFloat(TEXT("gs.LightingBlend"),         LightingBlend);
 	SetCVarFloat(TEXT("gs.AmbientIntensity"),      AmbientIntensity);
 	SetCVarFloat(TEXT("gs.LightIntensityScale"),   LightIntensityScale);
 	SetCVarFloat(TEXT("gs.LightResponseCeiling"),  LightResponseCeiling);
+	SetCVarFloat(TEXT("gs.RelightRatioMin"),       RelightRatioMin);
+	SetCVarFloat(TEXT("gs.RelightRatioMax"),       RelightRatioMax);
 	SetCVarInt  (TEXT("gs.NormalSampleStep"),      NormalSampleStep);
 	SetCVarInt  (TEXT("gs.NormalSmoothRadius"),    NormalSmoothRadius);
 	SetCVarFloat(TEXT("gs.NormalSmoothDepthSigma"), NormalSmoothDepthSigma);

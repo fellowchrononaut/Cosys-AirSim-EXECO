@@ -11,7 +11,7 @@
 #define SH_C0 0.28209479177387814f
 
 // Per-frame view data structure (must match C++ FGaussianSplatViewData)
-// Total: 64 bytes per splat (with TranslatedWorldPos for velocity, 16-byte aligned)
+// Total: 80 bytes per splat (with TranslatedWorldPos for velocity and SplatNormal, 16-byte aligned)
 struct FGaussianSplatViewData
 {
 	float4 ClipPosition;       // Clip space position (xyz, w)
@@ -23,6 +23,8 @@ struct FGaussianSplatViewData
 	float2 Axis2;              // 2D covariance principal axis 2
 	uint ClusterID;            // Cluster ID for debug visualization
 	uint Padding;              // Padding for 16-byte alignment
+	float3 SplatNormal;        // Analytic per-splat normal (world space, camera-facing), GeometryMode 2
+	float SplatNormalPad;      // Padding for 16-byte alignment
 };
 
 // Chunk info for quantized data (must match C++ FGaussianChunkInfo)
@@ -185,6 +187,24 @@ float3x3 CalcCovariance3D(float4 rotation, float3 scale)
 	cov[2][2] = dot(RS[2], RS[2]);
 
 	return cov;
+}
+
+// Analytic per-splat normal: a trained splat is usually flattened disc-like against the surface
+// it represents, so the LOCAL axis with the smallest scale (the splat's "thin" direction) is an
+// estimate of the local surface normal — no depth reconstruction needed. R's columns are the
+// local axes (see CalcCovariance3D: column j is scaled by scale[j]), so we pick column minIdx.
+// localToWorldRot must be the SAME convention used to transform direction vectors elsewhere in
+// this codebase: dirWorld = mul(dirLocal, localToWorldRot) (see CalcViewData.usf worldPos/viewDir).
+float3 CalcSplatLocalNormal(float4 rotation, float3 scale)
+{
+	float3x3 R = QuatToMatrix(rotation);
+
+	int minIdx = 0;
+	float minScale = scale.x;
+	if (scale.y < minScale) { minScale = scale.y; minIdx = 1; }
+	if (scale.z < minScale) { minScale = scale.z; minIdx = 2; }
+
+	return float3(R[0][minIdx], R[1][minIdx], R[2][minIdx]);
 }
 
 // Project 3D covariance to 2D screen space using EWA splatting formula

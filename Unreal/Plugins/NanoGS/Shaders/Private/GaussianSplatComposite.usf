@@ -36,9 +36,23 @@ float3 AmbientColor;
 float  LightingBlend;
 float  LightIntensityScale;                // global sensitivity for per-light intensity
 float  LightResponseCeiling;                // per-light contribution ceiling (raise past 1 for brighter lights)
+float  RelightRatioMin;                     // clamp floor for the brightness-preserving relight ratio
+float  RelightRatioMax;                     // clamp ceiling for the brightness-preserving relight ratio
 uint   NormalSmoothRadius;                 // bilateral depth-smoothing kernel radius (px); 0 = off
 float  NormalSmoothFrac;                    // depth-similarity sigma as fraction of view depth
 uint   NormalSampleStep;                    // central-difference baseline (px) for the normal
+
+// GeometryMode 1: proxy-mesh CustomDepth (clean geometry, no per-splat depth scatter).
+// DeviceZ values, linearized with the engine's own DeviceZ->linear-view-Z transform.
+Texture2D    CustomDepthTexture;
+SamplerState CustomDepthSampler;
+float4       InvDeviceZToWorldZTransform;
+uint         GeometryMode;                  // 0 = splat depth-accum, 1 = proxy mesh CustomDepth, 2 = per-splat normal
+
+// GeometryMode 2: alpha-weighted per-splat analytic-normal accumulation (RGBA16F).
+// .rgb = sum(splatNormal*alpha*T), .a = sum(alpha*T); normal = normalize(rgb / a).
+Texture2D    NormalAccumTexture;
+SamplerState NormalAccumSampler;
 
 // Attempt to invert UE's ACES filmic tone curve so that display-ready gaussian
 // splat colors survive tone mapping unchanged.  Uses the Narkowicz ACES fit
@@ -112,15 +126,10 @@ bool SmoothViewZ(int2 pixel, out float outZ)
 	return true;
 }
 
-bool ReconstructWorld(int2 pixel, out float3 worldPos)
+// Shared pinhole back-projection: given a linear view-space depth at a pixel, recover the
+// world-space position. Used by both geometry modes — only how viewZ is obtained differs.
+float3 ViewZAndPixelToWorld(int2 pixel, float viewZ)
 {
-	worldPos = float3(0, 0, 0);
-	float viewZ;
-	if (!SmoothViewZ(pixel, viewZ))                        // expected (bilateral-smoothed) depth
-	{
-		return false;  // no coverage here
-	}
-
 	float2 pv = float2(pixel) - ViewRectMin;               // pixel within ViewRect
 	float cx = ScreenSize.x * 0.5;
 	float cy = ScreenSize.y * 0.5;
@@ -130,7 +139,69 @@ bool ReconstructWorld(int2 pixel, out float3 worldPos)
 	viewPos.y = (cy - pv.y - 0.5) * viewZ / FocalLength.y;  // flip Y (pixel down → view up)
 	viewPos.z = viewZ;
 
-	worldPos = mul(float4(viewPos, 1.0), InvViewMatrix).xyz; // row-major UE convention
+	return mul(float4(viewPos, 1.0), InvViewMatrix).xyz;    // row-major UE convention
+}
+
+bool ReconstructWorld(int2 pixel, out float3 worldPos)
+{
+	worldPos = float3(0, 0, 0);
+	float viewZ;
+	if (!SmoothViewZ(pixel, viewZ))                        // expected (bilateral-smoothed) depth
+	{
+		return false;  // no coverage here
+	}
+	worldPos = ViewZAndPixelToWorld(pixel, viewZ);
+	return true;
+}
+
+// Mirrors the engine's ConvertFromDeviceZ() (Common.ush), using the per-frame transform the
+// main view already computed (FSceneView::InvDeviceZToWorldZTransform), since CustomDepth is
+// rendered through the same (possibly TAA/TSR-jittered) projection as the main SceneDepth.
+float ConvertCustomDeviceZToViewZ(float DeviceZ)
+{
+	return DeviceZ * InvDeviceZToWorldZTransform.x + InvDeviceZToWorldZTransform.y
+		+ 1.0 / (DeviceZ * InvDeviceZToWorldZTransform.z - InvDeviceZToWorldZTransform.w);
+}
+
+// GeometryMode 1: reconstruct from the hidden proxy mesh's CustomDepth instead of the splat's
+// own (noisy) depth accumulation. DeviceZ == 0 means no CustomDepth geometry at this pixel
+// (cleared/dummy texture), so we report no coverage exactly like ReconstructWorld does.
+bool ReconstructWorldFromCustomDepth(int2 pixel, out float3 worldPos)
+{
+	worldPos = float3(0, 0, 0);
+	float deviceZ = CustomDepthTexture.Load(int3(pixel, 0)).r;
+	if (deviceZ <= 0.0)
+	{
+		return false;  // no proxy-mesh coverage here
+	}
+	float viewZ = ConvertCustomDeviceZToViewZ(deviceZ);
+	worldPos = ViewZAndPixelToWorld(pixel, viewZ);
+	return true;
+}
+
+// Dispatches to whichever geometry source GeometryMode selects. Both reconstruction paths feed
+// the same downstream normal/lighting code, so callers don't need to know which mode is active.
+bool ReconstructWorldAuto(int2 pixel, out float3 worldPos)
+{
+	if (GeometryMode == 1)
+	{
+		return ReconstructWorldFromCustomDepth(pixel, worldPos);
+	}
+	return ReconstructWorld(pixel, worldPos);
+}
+
+// GeometryMode 2: recover the alpha-weighted average per-splat analytic normal at a pixel.
+// NormalAccumTexture holds sum(splatNormal*alpha*T) in .rgb and sum(alpha*T) in .a (same
+// premultiplied-"over" pattern as DepthAccumTexture). Returns false where there's no coverage.
+bool ReconstructNormalFromAccum(int2 pixel, out float3 normal)
+{
+	normal = float3(0, 0, 1);
+	float4 accum = NormalAccumTexture.Load(int3(pixel, 0));
+	if (accum.a <= 1e-6)
+	{
+		return false;
+	}
+	normal = normalize(accum.rgb / accum.a);
 	return true;
 }
 
@@ -173,25 +244,52 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 	if (LightingBlend > 0.0 && NumLights > 0)
 	{
 		int2 P = PixelPos;
-		int  s = max((int)NormalSampleStep, 1);
-		// Central differences over a wide baseline: the normal is the surface slope between
-		// samples s pixels apart, which averages out per-splat depth waviness (free — no extra taps).
-		float3 wL, wR, wD, wU;
-		bool okL = ReconstructWorld(P - int2(s, 0), wL);
-		bool okR = ReconstructWorld(P + int2(s, 0), wR);
-		bool okD = ReconstructWorld(P - int2(0, s), wD);
-		bool okU = ReconstructWorld(P + int2(0, s), wU);
+		float3 N;
+		float3 wC;
+		bool bHaveGeometry;
 
-		if (okL && okR && okD && okU)
+		if (GeometryMode == 2)
 		{
+			// Per-splat analytic normal: no neighbor sampling needed (each splat already carries
+			// its own normal), so just read the center pixel's accumulated normal directly, and
+			// reuse GeometryMode 0's single-sample position reconstruction (same depth source).
+			float3 wCenter;
+			bHaveGeometry = ReconstructWorld(P, wCenter) && ReconstructNormalFromAccum(P, N);
+			wC = wCenter;
+		}
+		else
+		{
+			int  s = max((int)NormalSampleStep, 1);
+			// Central differences over a wide baseline: the normal is the surface slope between
+			// samples s pixels apart, which averages out per-splat depth waviness (free — no extra taps).
+			float3 wL, wR, wD, wU;
+			bool okL = ReconstructWorldAuto(P - int2(s, 0), wL);
+			bool okR = ReconstructWorldAuto(P + int2(s, 0), wR);
+			bool okD = ReconstructWorldAuto(P - int2(0, s), wD);
+			bool okU = ReconstructWorldAuto(P + int2(0, s), wU);
+			bHaveGeometry = okL && okR && okD && okU;
+
 			// Cross product gives a world-space normal (sign is arbitrary — we use abs NdotL)
-			float3 N = normalize(cross(wR - wL, wU - wD));
+			N = normalize(cross(wR - wL, wU - wD));
 
 			// Surface position (for point/spot light vectors + attenuation): average of the
 			// four samples ≈ the center pixel's world position, free of an extra reconstruction.
-			float3 wC = (wL + wR + wD + wU) * 0.25;
+			wC = (wL + wR + wD + wU) * 0.25;
+		}
 
-			float3 lightSum = AmbientColor;
+		if (bHaveGeometry)
+		{
+
+			// lightSum is the actual, orientation-dependent shading. neutralLight is the same
+			// lights/attenuation/response evaluated with a fixed "average orientation" NdotL stand-in
+			// instead of the real one, giving a baseline brightness this lighting setup would produce
+			// regardless of surface facing. Splat RGB is already a baked, lit appearance (not raw
+			// albedo) — dividing by this baseline before multiplying keeps that baked brightness
+			// mostly intact and only lets through the orientation-driven *variation* (highlight/shadow),
+			// instead of double-shading and darkening every pixel by the absolute light level.
+			float3 lightSum    = AmbientColor;
+			float3 neutralLight = AmbientColor;
+			const float NeutralNdl = 0.5;
 
 			[loop]
 			for (uint i = 0; i < NumLights; ++i)
@@ -237,14 +335,17 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 				// original behavior. The editor Intensity slider still modulates, especially in
 				// the low/mid range.
 				float resp = LightResponseCeiling * (1.0 - exp(-intensity * LightIntensityScale));
-				lightSum += tint * (resp * ndl * atten);
+				lightSum     += tint * (resp * ndl       * atten);
+				neutralLight += tint * (resp * NeutralNdl * atten);
 			}
 
-			// Clamp to avoid HDR blowout; scales with the response ceiling so raising the
-			// ceiling doesn't get silently clipped back down by this safety net.
-			lightSum = min(lightSum, 4.0 * max(LightResponseCeiling, 1.0));
+			// Ratio of actual to neutral shading — isolates the orientation-driven variation from
+			// the absolute light level, then clamps it to a modest range so directional lighting
+			// stays visible without washing out or blacking out the splat's own baked appearance.
+			float3 ratio = lightSum / max(neutralLight, 1e-4);
+			ratio = clamp(ratio, RelightRatioMin, RelightRatioMax);
 
-			float3 litLinear = linearColor * lightSum;
+			float3 litLinear = linearColor * ratio;
 			linearColor = lerp(linearColor, litLinear, LightingBlend);
 		}
 	}

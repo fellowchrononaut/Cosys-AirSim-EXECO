@@ -78,6 +78,8 @@ void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
 	viewData.Axis2 = float2(0, 0);
 	viewData.ClusterID = clusterID;
 	viewData.Padding = lodLevel;
+	viewData.SplatNormal = float3(0, 0, 0);
+	viewData.SplatNormalPad = 0;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 
@@ -123,6 +125,16 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float3x3 cov3D_local = CalcCovariance3D(rotation, scale);
 	float3x3 localToWorldRot = (float3x3)LocalToWorld;
 	float3x3 cov3D_world = mul(transpose(localToWorldRot), mul(cov3D_local, localToWorldRot));
+
+	// Analytic per-splat normal (GeometryMode 2): the splat's thinnest local axis, transformed to
+	// world space and oriented toward the camera so that alpha-weighted accumulation across many
+	// overlapping splats (GaussianSplatRendering.usf) reinforces instead of cancelling out.
+	float3 splatNormal = normalize(mul(CalcSplatLocalNormal(rotation, scale), localToWorldRot));
+	float3 toCamera = CameraPosition - worldPos.xyz;
+	if (dot(splatNormal, toCamera) < 0.0)
+	{
+		splatNormal = -splatNormal;
+	}
 	float3x3 viewMat = (float3x3)WorldToView;
 	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
 
@@ -218,6 +230,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	viewData.Axis2 = axis2;
 	viewData.ClusterID = selectedClusterID;
 	viewData.Padding = selectedLODLevel;
+	viewData.SplatNormal = splatNormal;
+	viewData.SplatNormalPad = 0;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 

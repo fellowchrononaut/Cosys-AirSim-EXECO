@@ -30,10 +30,20 @@ struct FGaussianSceneLighting
 	float     LightingBlend  = 0.f;   // 0 = unlit (original), 1 = fully lit
 	float     IntensityScale = 0.3f;  // global sensitivity: contribution = tint * Intensity * IntensityScale
 	float     ResponseCeiling = 1.f;  // per-light contribution ceiling; raise past 1 for brighter lights
+	float     RelightRatioMin = 0.6f; // clamp floor for the brightness-preserving relight ratio
+	float     RelightRatioMax = 1.6f; // clamp ceiling for the brightness-preserving relight ratio
 	// Bilateral depth smoothing for normal reconstruction (removes per-splat depth scatter)
 	int32     NormalSmoothRadius = 2;     // kernel radius in pixels; 0 = off
 	float     NormalSmoothFrac   = 0.02f; // depth-similarity sigma as fraction of view depth
 	int32     NormalSampleStep   = 3;     // central-difference baseline (pixels) for the normal
+
+	// Geometry source for lighting reconstruction. 0 = screen-space splat depth (default,
+	// noisy but needs no scene setup). 1 = a hidden proxy mesh's CustomDepth (clean geometry,
+	// requires the user to enable "Render CustomDepth Pass" on a co-located mesh).
+	int32     GeometryMode = 0;
+	// Engine's per-frame DeviceZ->linear-view-Z transform (FSceneView::InvDeviceZToWorldZTransform),
+	// needed to linearize CustomDepth (GeometryMode == 1 only; unused for splat depth-accum).
+	FVector4f InvDeviceZToWorldZTransform = FVector4f(0, 0, 0, 0);
 };
 
 class FGaussianSplatSceneProxy;
@@ -226,7 +236,8 @@ public:
 		FBufferRHIRef IndexBuffer,
 		int32 TotalSplatCount,
 		int32 DebugMode,
-		bool bOutputDepth = false   // also write the alpha-weighted depth MRT (RT2) for lighting
+		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
+		bool bOutputNormal = false   // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
 	);
 
 	//----------------------------------------------------------------------
@@ -308,7 +319,8 @@ public:
 		FGaussianGlobalAccumulator* GlobalAccumulator,
 		FBufferRHIRef IndexBuffer,
 		int32 DebugMode,
-		bool bOutputDepth = false   // also write the alpha-weighted depth MRT (RT2) for lighting
+		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
+		bool bOutputNormal = false   // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
 	);
 
 	/**
@@ -323,6 +335,8 @@ public:
 		const FSceneView& View,
 		FTextureRHIRef IntermediateTexture,
 		FTextureRHIRef DepthAccumTexture,           // alpha-weighted depth MRT (RG32F); null = no lighting
+		FTextureRHIRef CustomDepthTexture,          // proxy-mesh CustomDepth; null = GeometryMode 1 unavailable
+		FTextureRHIRef NormalAccumTexture,           // alpha-weighted per-splat normal MRT; null = GeometryMode 2 unavailable
 		const FGaussianSceneLighting& Lighting      // gathered scene lights
 	);
 

@@ -1173,7 +1173,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	FBufferRHIRef IndexBuffer,
 	int32 TotalSplatCount,
 	int32 DebugMode,
-	bool bOutputDepth)
+	bool bOutputDepth,
+	bool bOutputNormal)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal);
 
@@ -1182,9 +1183,12 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 		return;
 	}
 
-	// Select the pixel-shader permutation: with depth output (3 RTs) only when lighting needs it.
+	// Select the pixel-shader permutation: extra MRTs (3 RTs) only when lighting needs them.
+	// bOutputDepth (GeometryMode 0/1) and bOutputNormal (GeometryMode 2) are mutually exclusive
+	// at runtime (GeometryMode selects one), but nothing stops both being requested together.
 	FGaussianSplatPS::FPermutationDomain PSPermutation;
 	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(bOutputDepth);
+	PSPermutation.Set<FGaussianSplatPS::FOutputNormal>(bOutputNormal);
 
 	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
@@ -1211,14 +1215,32 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
 		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
 	>::GetRHI();
-	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement,
-	// and (when bOutputDepth) RT2 (RG32F depth accumulation) premultiplied like RT0.
-	if (bOutputDepth)
+	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
+	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
+	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.
+	if (bOutputDepth && bOutputNormal)
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
+			CW_RG,   BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT2 depth accum
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT3 normal accum
+		>::GetRHI();
+	}
+	else if (bOutputDepth)
 	{
 		GraphicsPSOInit.BlendState = TStaticBlendState<
 			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
 			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
 			CW_RG,   BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT2 depth accum
+		>::GetRHI();
+	}
+	else if (bOutputNormal)
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT2 normal accum
 		>::GetRHI();
 	}
 	else
@@ -1621,7 +1643,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	FGaussianGlobalAccumulator* GlobalAccumulator,
 	FBufferRHIRef IndexBuffer,
 	int32 DebugMode,
-	bool bOutputDepth)
+	bool bOutputDepth,
+	bool bOutputNormal)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect);
 
@@ -1630,9 +1653,10 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 		return;
 	}
 
-	// Select the pixel-shader permutation: with depth output (3 RTs) only when lighting needs it.
+	// Select the pixel-shader permutation: extra MRTs (3 RTs) only when lighting needs them.
 	FGaussianSplatPS::FPermutationDomain PSPermutation;
 	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(bOutputDepth);
+	PSPermutation.Set<FGaussianSplatPS::FOutputNormal>(bOutputNormal);
 
 	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
@@ -1659,15 +1683,32 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
 		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
 	>::GetRHI();
-	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement,
-	// and (when bOutputDepth) RT2 (RG32F depth accumulation) premultiplied like RT0 so it composites
-	// to sum(viewZ*alpha*T) / sum(alpha*T). CW_RGBA on RT0 tracks accumulated alpha for the composite.
-	if (bOutputDepth)
+	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
+	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
+	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.
+	if (bOutputDepth && bOutputNormal)
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
+			CW_RG,   BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT2 depth accum
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT3 normal accum
+		>::GetRHI();
+	}
+	else if (bOutputDepth)
 	{
 		GraphicsPSOInit.BlendState = TStaticBlendState<
 			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
 			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
 			CW_RG,   BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT2 depth accum
+		>::GetRHI();
+	}
+	else if (bOutputNormal)
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
+			CW_RGBA, BO_Add, BF_One, BF_Zero,               BO_Add, BF_One, BF_Zero,                // RT1 velocity
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha   // RT2 normal accum
 		>::GetRHI();
 	}
 	else
@@ -1947,6 +1988,8 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	const FSceneView& View,
 	FTextureRHIRef IntermediateTexture,
 	FTextureRHIRef DepthAccumTexture,
+	FTextureRHIRef CustomDepthTexture,
+	FTextureRHIRef NormalAccumTexture,
 	const FGaussianSceneLighting& Lighting)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatComposite);
@@ -1990,12 +2033,33 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.IntermediateSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
 	// Screen-space lighting parameters.
-	// DepthAccumTexture (RG32F) holds alpha-weighted view-space depth. If it's null (lighting
-	// disabled / no depth pass this frame), bind IntermediateTexture as a harmless stand-in and
-	// force LightingBlend = 0 so the shader skips the lighting branch entirely.
+	// DepthAccumTexture (RG32F) holds alpha-weighted view-space depth, used for world-position
+	// reconstruction by GeometryMode 0 AND GeometryMode 2 (2 reuses 0's position, only overrides
+	// the normal). CustomDepthTexture is the proxy-mesh alternative (GeometryMode 1). NormalAccum
+	// holds GeometryMode 2's alpha-weighted per-splat normal. Any texture that's null (lighting
+	// disabled / not produced this frame) gets IntermediateTexture bound as a harmless stand-in.
+	// Whichever geometry source(s) the active mode needs gate LightingBlend to 0 if any are
+	// missing, so the shader skips the lighting branch entirely rather than reading meaningless data.
 	const bool bHasDepth = DepthAccumTexture.IsValid();
+	const bool bHasCustomDepth = CustomDepthTexture.IsValid();
+	const bool bHasNormalAccum = NormalAccumTexture.IsValid();
+	bool bGeometryReady = bHasDepth;
+	if (Lighting.GeometryMode == 1)
+	{
+		bGeometryReady = bHasCustomDepth;
+	}
+	else if (Lighting.GeometryMode == 2)
+	{
+		bGeometryReady = bHasDepth && bHasNormalAccum;
+	}
 	PSParameters.DepthAccumTexture = bHasDepth ? DepthAccumTexture : IntermediateTexture;
 	PSParameters.DepthAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.CustomDepthTexture = bHasCustomDepth ? CustomDepthTexture : IntermediateTexture;
+	PSParameters.CustomDepthSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.NormalAccumTexture = bHasNormalAccum ? NormalAccumTexture : IntermediateTexture;
+	PSParameters.NormalAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.InvDeviceZToWorldZTransform = Lighting.InvDeviceZToWorldZTransform;
+	PSParameters.GeometryMode = (uint32)Lighting.GeometryMode;
 	PSParameters.InvViewMatrix   = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	{
 		// FocalLength in pixels, matching CalcViewData (M00/M11 are jitter-independent).
@@ -2009,9 +2073,11 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.CameraWorldPos  = FVector3f(View.ViewMatrices.GetViewOrigin());
 	PSParameters.NumLights           = (uint32)Lighting.NumLights;
 	PSParameters.AmbientColor        = Lighting.AmbientColor;
-	PSParameters.LightingBlend       = bHasDepth ? Lighting.LightingBlend : 0.f;
+	PSParameters.LightingBlend       = bGeometryReady ? Lighting.LightingBlend : 0.f;
 	PSParameters.LightIntensityScale = Lighting.IntensityScale;
 	PSParameters.LightResponseCeiling = Lighting.ResponseCeiling;
+	PSParameters.RelightRatioMin = Lighting.RelightRatioMin;
+	PSParameters.RelightRatioMax = Lighting.RelightRatioMax;
 	PSParameters.NormalSmoothRadius  = (uint32)Lighting.NormalSmoothRadius;
 	PSParameters.NormalSmoothFrac    = Lighting.NormalSmoothFrac;
 	PSParameters.NormalSampleStep    = (uint32)Lighting.NormalSampleStep;

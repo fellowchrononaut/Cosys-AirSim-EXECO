@@ -146,6 +146,14 @@ struct FGaussianSplatViewData
 
 	/** Padding for 16-byte alignment */
 	uint32 Padding = 0;
+
+	/** Analytic per-splat normal (world space): the splat's own thinnest covariance axis,
+	 *  oriented toward the camera. Used by GeometryMode 2 (per-splat normal accumulation)
+	 *  instead of reconstructing a normal from screen-space depth. */
+	FVector3f SplatNormal = FVector3f::ZeroVector;
+
+	/** Padding after SplatNormal for 16-byte alignment */
+	float SplatNormalPad = 0.0f;
 };
 
 /**

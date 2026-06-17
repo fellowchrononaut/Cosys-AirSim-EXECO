@@ -97,6 +97,7 @@ struct FVertexOutput
 	uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
 	float3 TranslatedWorldPos : TEXCOORD3;  // For velocity calculation in pixel shader
 	float4 CenterClipPos : TEXCOORD4;       // Splat center clip position for velocity (Nanite-style)
+	float3 SplatNormal : TEXCOORD5;         // Analytic per-splat normal (world space), GeometryMode 2
 };
 
 // Pixel shader output with velocity for TAA/TSR
@@ -110,6 +111,18 @@ struct FPixelOutput
 	// (premultiplied "over"), so the buffer composites to .r = sum(viewZ*alpha*T),
 	// .g = sum(alpha*T); expected depth = r/g. Same weights as the color blend.
 	float4 DepthAccum : SV_Target2;
+#endif
+#if OUTPUT_NORMAL
+	// Alpha-weighted analytic-normal accumulation for GeometryMode 2.
+	// .rgb = splatNormal * alpha, .a = alpha; composite recovers normalize(rgb / a).
+	// GeometryMode 2 reuses GeometryMode 0's depth accumulation for world-position reconstruction
+	// (only the normal source changes), so OUTPUT_DEPTH and OUTPUT_NORMAL are BOTH active together
+	// for that mode — NormalAccum lands at SV_Target3, right after DepthAccum.
+#if OUTPUT_DEPTH
+	float4 NormalAccum : SV_Target3;
+#else
+	float4 NormalAccum : SV_Target2;
+#endif
 #endif
 };
 
@@ -134,6 +147,7 @@ FVertexOutput MainVS(
 	Output.DebugFlag = 0;
 	Output.TranslatedWorldPos = viewData.TranslatedWorldPos;
 	Output.CenterClipPos = viewData.ClipPosition;
+	Output.SplatNormal = viewData.SplatNormal;
 
 	// Check validity (w <= 0 means invalid/behind camera)
 	if (viewData.ClipPosition.w <= 0.0)
@@ -144,6 +158,7 @@ FVertexOutput MainVS(
 		Output.Color = float4(0, 0, 0, 0);
 		Output.TranslatedWorldPos = float3(0, 0, 0);
 		Output.CenterClipPos = float4(0, 0, 0, 1);
+		Output.SplatNormal = float3(0, 0, 0);
 		return Output;
 	}
 
@@ -237,6 +252,10 @@ FPixelOutput MainPS(FVertexOutput Input)
 		// No meaningful surface depth in debug viz; contribute nothing.
 		Output.DepthAccum = float4(0, 0, 0, 0);
 	#endif
+	#if OUTPUT_NORMAL
+		// No meaningful normal in debug viz; contribute nothing.
+		Output.NormalAccum = float4(0, 0, 0, 0);
+	#endif
 		return Output;
 	}
 
@@ -278,6 +297,11 @@ FPixelOutput MainPS(FVertexOutput Input)
 	// premultiplied "over" blend factor on RT2.
 	float ViewZ = Input.CenterClipPos.w;
 	Output.DepthAccum = float4(ViewZ * color.a, color.a, 0.0, color.a);
+#endif
+#if OUTPUT_NORMAL
+	// Accumulate alpha-weighted analytic normal (GeometryMode 2), same premultiplied-"over"
+	// pattern as DepthAccum above: composite recovers normalize(sum(N*a*T) / sum(a*T)).
+	Output.NormalAccum = float4(Input.SplatNormal * color.a, color.a);
 #endif
 	return Output;
 }

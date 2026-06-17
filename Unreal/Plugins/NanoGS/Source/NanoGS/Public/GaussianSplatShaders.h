@@ -207,7 +207,10 @@ class FGaussianSplatPS : public FGlobalShader
 	// view-space depth for screen-space lighting. Off by default so the raster pipeline is
 	// unchanged (2 RTs) when lighting is disabled.
 	class FOutputDepth : SHADER_PERMUTATION_BOOL("OUTPUT_DEPTH");
-	using FPermutationDomain = TShaderPermutationDomain<FOutputDepth>;
+	// When set, the pixel shader writes an extra MRT accumulating each splat's own alpha-weighted
+	// analytic normal (GeometryMode 2), instead of/alongside the depth accumulation above.
+	class FOutputNormal : SHADER_PERMUTATION_BOOL("OUTPUT_NORMAL");
+	using FPermutationDomain = TShaderPermutationDomain<FOutputDepth, FOutputNormal>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		// Velocity calculation: transform translated world position to previous clip space
@@ -261,6 +264,10 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		// Expected view-space depth at a pixel = R / G.
 		SHADER_PARAMETER_TEXTURE(Texture2D, DepthAccumTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, DepthAccumSampler)
+		// GeometryMode 2: alpha-weighted per-splat analytic normal accumulation (RGBA16F).
+		// .rgb = sum(normal*alpha*T), .a = sum(alpha*T); normal = normalize(rgb / a).
+		SHADER_PARAMETER_TEXTURE(Texture2D, NormalAccumTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, NormalAccumSampler)
 		SHADER_PARAMETER(FMatrix44f, InvViewMatrix)     // view -> world (GetInvViewMatrix)
 		SHADER_PARAMETER(FVector2f,  FocalLength)       // pixels: (ProjM00*W/2, ProjM11*H/2)
 		SHADER_PARAMETER(FVector2f,  ScreenSize)        // ViewRect extent (pixels)
@@ -276,10 +283,18 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER(float,     LightingBlend)
 		SHADER_PARAMETER(float,     LightIntensityScale) // global sensitivity for per-light intensity
 		SHADER_PARAMETER(float,     LightResponseCeiling) // per-light contribution ceiling (raise past 1 for brighter lights)
+		SHADER_PARAMETER(float,     RelightRatioMin) // clamp floor for the brightness-preserving relight ratio
+		SHADER_PARAMETER(float,     RelightRatioMax) // clamp ceiling for the brightness-preserving relight ratio
 		// Bilateral depth smoothing for normal reconstruction (removes per-splat scatter)
 		SHADER_PARAMETER(uint32,    NormalSmoothRadius)  // kernel radius in pixels; 0 = off
 		SHADER_PARAMETER(float,     NormalSmoothFrac)    // depth-similarity sigma as fraction of view depth
 		SHADER_PARAMETER(uint32,    NormalSampleStep)    // central-difference baseline (pixels) for the normal
+		// Proxy-mesh geometry mode (GeometryMode == 1): a hidden mesh's CustomDepth, reconstructed
+		// with the engine's own DeviceZ->linear-Z transform instead of the splat depth accumulation.
+		SHADER_PARAMETER_TEXTURE(Texture2D, CustomDepthTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, CustomDepthSampler)
+		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
+		SHADER_PARAMETER(uint32,    GeometryMode)        // 0 = splat depth-accum, 1 = proxy mesh CustomDepth
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
