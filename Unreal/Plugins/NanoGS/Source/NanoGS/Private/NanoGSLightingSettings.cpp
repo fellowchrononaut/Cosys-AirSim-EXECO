@@ -34,6 +34,7 @@ void UNanoGSLightingSettings::ApplyToCVars() const
 	SetCVarFloat(TEXT("gs.LightingBlend"),         LightingBlend);
 	SetCVarFloat(TEXT("gs.AmbientIntensity"),      AmbientIntensity);
 	SetCVarFloat(TEXT("gs.LightIntensityScale"),   LightIntensityScale);
+	SetCVarFloat(TEXT("gs.LightResponseCeiling"),  LightResponseCeiling);
 	SetCVarInt  (TEXT("gs.NormalSampleStep"),      NormalSampleStep);
 	SetCVarInt  (TEXT("gs.NormalSmoothRadius"),    NormalSmoothRadius);
 	SetCVarFloat(TEXT("gs.NormalSmoothDepthSigma"), NormalSmoothDepthSigma);

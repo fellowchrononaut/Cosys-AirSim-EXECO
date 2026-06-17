@@ -2011,6 +2011,7 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.AmbientColor        = Lighting.AmbientColor;
 	PSParameters.LightingBlend       = bHasDepth ? Lighting.LightingBlend : 0.f;
 	PSParameters.LightIntensityScale = Lighting.IntensityScale;
+	PSParameters.LightResponseCeiling = Lighting.ResponseCeiling;
 	PSParameters.NormalSmoothRadius  = (uint32)Lighting.NormalSmoothRadius;
 	PSParameters.NormalSmoothFrac    = Lighting.NormalSmoothFrac;
 	PSParameters.NormalSampleStep    = (uint32)Lighting.NormalSampleStep;

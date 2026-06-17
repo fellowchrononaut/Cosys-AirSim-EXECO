@@ -275,6 +275,7 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER(FVector3f, AmbientColor)
 		SHADER_PARAMETER(float,     LightingBlend)
 		SHADER_PARAMETER(float,     LightIntensityScale) // global sensitivity for per-light intensity
+		SHADER_PARAMETER(float,     LightResponseCeiling) // per-light contribution ceiling (raise past 1 for brighter lights)
 		// Bilateral depth smoothing for normal reconstruction (removes per-splat scatter)
 		SHADER_PARAMETER(uint32,    NormalSmoothRadius)  // kernel radius in pixels; 0 = off
 		SHADER_PARAMETER(float,     NormalSmoothFrac)    // depth-similarity sigma as fraction of view depth

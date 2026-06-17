@@ -35,6 +35,7 @@ uint   NumLights;
 float3 AmbientColor;
 float  LightingBlend;
 float  LightIntensityScale;                // global sensitivity for per-light intensity
+float  LightResponseCeiling;                // per-light contribution ceiling (raise past 1 for brighter lights)
 uint   NormalSmoothRadius;                 // bilateral depth-smoothing kernel radius (px); 0 = off
 float  NormalSmoothFrac;                    // depth-similarity sigma as fraction of view depth
 uint   NormalSampleStep;                    // central-difference baseline (px) for the normal
@@ -230,15 +231,18 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 
 				// Two-sided Lambert: splats have no fixed facing, so use abs(NdotL)
 				float ndl = abs(dot(N, Ldir));
-				// Soft-saturation response: maps [0,inf) intensity -> [0,1) so bright lights
-				// asymptote instead of blowing out ("nothing but the light"). The editor
-				// Intensity slider still modulates, especially in the low/mid range.
-				float resp = 1.0 - exp(-intensity * LightIntensityScale);
+				// Soft-saturation response: maps [0,inf) intensity -> [0,LightResponseCeiling) so
+				// bright lights asymptote instead of hard-clipping. Ceiling > 1 lets strong lights
+				// keep getting brighter past the old fixed 1.0 cap; ceiling = 1 reproduces the
+				// original behavior. The editor Intensity slider still modulates, especially in
+				// the low/mid range.
+				float resp = LightResponseCeiling * (1.0 - exp(-intensity * LightIntensityScale));
 				lightSum += tint * (resp * ndl * atten);
 			}
 
-			// Clamp to avoid HDR blowout
-			lightSum = min(lightSum, 4.0);
+			// Clamp to avoid HDR blowout; scales with the response ceiling so raising the
+			// ceiling doesn't get silently clipped back down by this safety net.
+			lightSum = min(lightSum, 4.0 * max(LightResponseCeiling, 1.0));
 
 			float3 litLinear = linearColor * lightSum;
 			linearColor = lerp(linearColor, litLinear, LightingBlend);

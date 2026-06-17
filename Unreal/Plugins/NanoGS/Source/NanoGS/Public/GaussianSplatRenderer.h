@@ -29,6 +29,7 @@ struct FGaussianSceneLighting
 	FVector3f AmbientColor   = FVector3f(0.1f, 0.1f, 0.1f);
 	float     LightingBlend  = 0.f;   // 0 = unlit (original), 1 = fully lit
 	float     IntensityScale = 0.3f;  // global sensitivity: contribution = tint * Intensity * IntensityScale
+	float     ResponseCeiling = 1.f;  // per-light contribution ceiling; raise past 1 for brighter lights
 	// Bilateral depth smoothing for normal reconstruction (removes per-splat depth scatter)
 	int32     NormalSmoothRadius = 2;     // kernel radius in pixels; 0 = off
 	float     NormalSmoothFrac   = 0.02f; // depth-similarity sigma as fraction of view depth

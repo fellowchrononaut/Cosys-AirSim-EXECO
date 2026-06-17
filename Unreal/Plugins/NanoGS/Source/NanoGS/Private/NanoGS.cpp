@@ -96,6 +96,14 @@ TAutoConsoleVariable<float> CVarGSLightIntensityScale(
 	TEXT("Raise to make lights reach full brightness at lower intensities; lower to soften. Default 0.1."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<float> CVarGSLightResponseCeiling(
+	TEXT("gs.LightResponseCeiling"),
+	1.0f,
+	TEXT("Per-light contribution ceiling. Per-light response = Ceiling * (1 - exp(-intensity * gs.LightIntensityScale)),\n")
+	TEXT("so 1.0 reproduces the original behavior (asymptotes to 1) and raising it lets strong lights keep\n")
+	TEXT("getting brighter past that point instead of plateauing. Default 1.0."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<int32> CVarGSNormalSmoothRadius(
 	TEXT("gs.NormalSmoothRadius"),
 	2,
@@ -133,6 +141,7 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 	const float Amb = CVarGSAmbientIntensity.GetValueOnRenderThread();
 	Out.AmbientColor = FVector3f(Amb, Amb, Amb);
 	Out.IntensityScale = CVarGSLightIntensityScale.GetValueOnRenderThread();
+	Out.ResponseCeiling = CVarGSLightResponseCeiling.GetValueOnRenderThread();
 	Out.NormalSmoothRadius = FMath::Clamp(CVarGSNormalSmoothRadius.GetValueOnRenderThread(), 0, 6);
 	Out.NormalSmoothFrac = FMath::Max(CVarGSNormalSmoothFrac.GetValueOnRenderThread(), 0.f);
 	Out.NormalSampleStep = FMath::Clamp(CVarGSNormalSampleStep.GetValueOnRenderThread(), 1, 16);

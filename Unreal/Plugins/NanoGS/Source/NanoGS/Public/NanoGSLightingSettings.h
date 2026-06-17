@@ -57,6 +57,13 @@ public:
 		meta = (ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
 	float LightIntensityScale = 0.1f;
 
+	/** Per-light brightness ceiling. 1.0 = original behavior (each light asymptotes to full
+	 *  brightness and no brighter). Raise above 1.0 to let strong lights keep getting brighter
+	 *  instead of plateauing. (gs.LightResponseCeiling) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting",
+		meta = (ClampMin = "0.1", ClampMax = "8.0", UIMin = "1.0", UIMax = "4.0"))
+	float LightResponseCeiling = 1.0f;
+
 	/** Normal baseline (pixels): the surface slope is measured between samples this far apart.
 	 *  Higher = flatter, less noisy surfaces (the main fix for the "noisy SfM mesh" look). (gs.NormalSampleStep) */
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting|Normal Smoothing",
