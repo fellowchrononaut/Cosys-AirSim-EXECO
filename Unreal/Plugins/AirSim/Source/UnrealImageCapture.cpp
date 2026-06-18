@@ -147,6 +147,69 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
     }
 }
 
+void UnrealImageCapture::collectRenderParams(
+    const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,
+    std::vector<msr::airlib::ImageCaptureBase::ImageResponse>& responses,
+    std::vector<std::shared_ptr<RenderRequest::RenderParams>>& render_params,
+    std::vector<CameraResponsePair>& camera_response_pairs,
+    UGameViewportClient*& viewport) const
+{
+    for (unsigned int i = 0; i < requests.size(); ++i) {
+        APIPCamera* camera = cameras_->at(requests.at(i).camera_name);
+        if (requests[i].image_type == ImageType::Annotation) {
+            if (camera->GetAnnotationNameExist(requests[i].annotation_name))
+                const_cast<UnrealImageCapture*>(this)->updateCameraVisibility(camera, requests[i]);
+        }
+        else {
+            const_cast<UnrealImageCapture*>(this)->updateCameraVisibility(camera, requests[i]);
+        }
+    }
+
+    for (unsigned int i = 0; i < requests.size(); ++i) {
+        APIPCamera* camera = cameras_->at(requests.at(i).camera_name);
+
+        if (viewport == nullptr)
+            viewport = camera->GetWorld()->GetGameViewport();
+
+        size_t resp_idx = responses.size();
+        responses.push_back(ImageResponse());
+        ImageResponse& response = responses.back();
+
+        UTextureRenderTarget2D* textureTarget = nullptr;
+        USceneCaptureComponent2D* capture = nullptr;
+        if (requests[i].image_type == ImageType::Annotation) {
+            if (camera->GetAnnotationNameExist(requests[i].annotation_name)) {
+                capture = camera->getCaptureComponent(requests[i].image_type, false, requests[i].annotation_name);
+                if (capture == nullptr)
+                    response.message = "Can't take screenshot because none camera type is not active";
+                else if (capture->TextureTarget == nullptr)
+                    response.message = "Can't take screenshot because texture target is null";
+                else
+                    textureTarget = capture->TextureTarget;
+            }
+            else {
+                response.message = "Can't take screenshot because none annotation name does not exist for this camera";
+            }
+        }
+        else {
+            capture = camera->getCaptureComponent(requests[i].image_type, false, requests[i].annotation_name);
+            if (capture == nullptr)
+                response.message = "Can't take screenshot because none camera type is not active";
+            else if (capture->TextureTarget == nullptr)
+                response.message = "Can't take screenshot because texture target is null";
+            else
+                textureTarget = capture->TextureTarget;
+        }
+
+        bool disable_gamma = (requests[i].image_type == ImageCaptureBase::ImageType::Segmentation
+                              || requests[i].image_type == ImageCaptureBase::ImageType::Annotation);
+        render_params.push_back(std::make_shared<RenderRequest::RenderParams>(
+            capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma));
+
+        camera_response_pairs.push_back(CameraResponsePair{ camera, resp_idx });
+    }
+}
+
 bool UnrealImageCapture::updateCameraVisibility(APIPCamera* camera, const msr::airlib::ImageCaptureBase::ImageRequest& request)
 {
     bool visibilityChanged = false;

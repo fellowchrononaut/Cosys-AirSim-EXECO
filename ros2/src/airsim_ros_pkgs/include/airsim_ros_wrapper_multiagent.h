@@ -187,6 +187,7 @@ private:
     static constexpr uint16_t DRONE_PORT = 41451;
     static constexpr uint16_t CAR_PORT   = 41452;
     static constexpr uint16_t CV_PORT    = 41453;
+    static constexpr uint16_t WORLD_PORT = 41454;
 
     // -----------------------------------------------------------------------
     // Per-vehicle ROS state structs
@@ -447,6 +448,7 @@ private:
     msr::airlib::RpcLibClientBase airsim_client_images_drone_;
     msr::airlib::RpcLibClientBase airsim_client_images_car_;
     msr::airlib::RpcLibClientBase airsim_client_images_cv_;
+    msr::airlib::RpcLibClientBase airsim_client_images_world_;
 
     msr::airlib::RpcLibClientBase airsim_client_lidar_drone_;
     msr::airlib::RpcLibClientBase airsim_client_lidar_car_;

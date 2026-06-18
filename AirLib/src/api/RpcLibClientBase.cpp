@@ -343,6 +343,24 @@ __pragma(warning(disable : 4239))
 
             return RpcLibAdaptorsBase::ImageResponse::to(response_adaptor);
         }
+        std::map<std::string, vector<ImageCaptureBase::ImageResponse>>
+        RpcLibClientBase::simGetImagesAllVehicles(
+            const std::map<std::string, vector<ImageCaptureBase::ImageRequest>>& vehicle_requests)
+        {
+            // Convert input map to adapter map
+            std::map<std::string, std::vector<RpcLibAdaptorsBase::ImageRequest>> req_adapter;
+            for (const auto& kv : vehicle_requests)
+                req_adapter[kv.first] = RpcLibAdaptorsBase::ImageRequest::from(kv.second);
+
+            const auto& resp_adapter = pimpl_->client.call("simGetImagesAllVehicles", req_adapter)
+                .as<std::map<std::string, std::vector<RpcLibAdaptorsBase::ImageResponse>>>();
+
+            std::map<std::string, vector<ImageCaptureBase::ImageResponse>> result;
+            for (const auto& kv : resp_adapter)
+                result[kv.first] = RpcLibAdaptorsBase::ImageResponse::to(kv.second);
+            return result;
+        }
+
         vector<uint8_t> RpcLibClientBase::simGetImage(const std::string& camera_name, ImageCaptureBase::ImageType type, const std::string& vehicle_name, const std::string& annotation_name)
         {
             vector<uint8_t> result = pimpl_->client.call("simGetImage", camera_name, type, vehicle_name, annotation_name).as<vector<uint8_t>>();

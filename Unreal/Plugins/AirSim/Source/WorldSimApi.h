@@ -120,6 +120,8 @@ public:
 
     virtual std::vector<ImageCaptureBase::ImageResponse> getImages(const std::vector<ImageCaptureBase::ImageRequest>& requests, const std::string& vehicle_name) const override;
     virtual std::vector<uint8_t> getImage(ImageCaptureBase::ImageType image_type, const CameraDetails& camera_details, const std::string& annotation_name) const override;
+    virtual std::map<std::string, std::vector<ImageCaptureBase::ImageResponse>> getImagesAllVehicles(
+        const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const override;
 
     //CinemAirSim
     virtual std::vector<std::string> getPresetLensSettings(const CameraDetails& camera_details) override;

@@ -5,6 +5,7 @@
 #include "UnrealClient.h"
 #include "common/ImageCaptureBase.hpp"
 #include "common/common_utils/UniqueValueMap.hpp"
+#include "RenderRequest.h"
 
 class AIRSIM_API UnrealImageCapture : public msr::airlib::ImageCaptureBase
 {
@@ -15,6 +16,17 @@ public:
     virtual ~UnrealImageCapture();
 
     virtual void getImages(const std::vector<ImageRequest>& requests, std::vector<ImageResponse>& responses) const override;
+
+    struct CameraResponsePair {
+        APIPCamera* camera;
+        size_t response_idx;
+    };
+
+    void collectRenderParams(const std::vector<ImageRequest>& requests,
+                             std::vector<ImageResponse>& responses,
+                             std::vector<std::shared_ptr<RenderRequest::RenderParams>>& render_params,
+                             std::vector<CameraResponsePair>& camera_response_pairs,
+                             UGameViewportClient*& viewport) const;
 
 private:
     void getSceneCaptureImage(const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,

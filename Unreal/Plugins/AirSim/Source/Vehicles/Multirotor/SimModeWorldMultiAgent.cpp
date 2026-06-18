@@ -20,6 +20,7 @@
 #include "vehicles/multirotor/api/MultirotorRpcLibServer.hpp"
 #include "vehicles/car/api/CarRpcLibServer.hpp"
 #include "vehicles/computervision/api/ComputerVisionRpcLibServer.hpp"
+#include "api/WorldRpcLibServer.hpp"
 #include "common/SteppableClock.hpp"
 
 void ASimModeWorldMultiAgent::BeginPlay()
@@ -114,7 +115,12 @@ std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> ASimModeWorldMultiAgent
 
     api_servers.push_back(std::make_unique<msr::airlib::ComputerVisionRpcLibServer>(
         getApiProvider(), getSettings().api_server_address, port_cv));
-    
+
+    uint16_t port_world = 41454;
+
+    api_servers.push_back(std::make_unique<msr::airlib::WorldRpcLibServer>(
+        getApiProvider(), getSettings().api_server_address, port_world));
+
     return api_servers;
 #endif
 }

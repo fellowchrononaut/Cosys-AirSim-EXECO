@@ -2,10 +2,12 @@
 
 #include "CoreMinimal.h"
 #include "Engine/TextureRenderTarget2D.h"
-#include "common/WorkerThread.hpp"
+#include "RHIGPUReadback.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/GameViewportClient.h"
+#include "Containers/Ticker.h"
 #include <memory>
+#include <future>
 #include "common/Common.hpp"
 
 
@@ -44,21 +46,17 @@ private:
     std::shared_ptr<RenderResult>* results_;
     unsigned int req_size_;
 
-    std::shared_ptr<msr::airlib::WorkerThreadSignal> wait_signal_;
-
     bool saved_DisableWorldRendering_ = false;
     UGameViewportClient * const game_viewport_;
     FDelegateHandle end_draw_handle_;
+    TArray<TUniquePtr<FRHIGPUTextureReadback>> readbacks_;
+    std::unique_ptr<std::promise<void>> promise_;
+    FTSTicker::FDelegateHandle ticker_handle_;
     std::function<void()> query_camera_pose_cb_;
 
 public:
     RenderRequest(UGameViewportClient * game_viewport, std::function<void()>&& query_camera_pose_cb);
     ~RenderRequest();
-
-    void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
-    {
-        ExecuteTask();
-    } 
 
     FORCEINLINE TStatId GetStatId() const
     {
@@ -70,5 +68,11 @@ public:
     void getScreenshot(
         std::shared_ptr<RenderParams> params[], std::vector<std::shared_ptr<RenderResult>>& results, unsigned int req_size, bool use_safe_method);
 
-    void ExecuteTask();
+private:
+    // Phase 1: render thread enqueues GPU→CPU DMA for all cameras and returns.
+    void submitCopies(FRHICommandListImmediate& RHICmdList);
+    // Phase 2: game tick polls IsReady() on all readbacks; returns false to unregister when done.
+    bool checkReadbacks(float dt);
+    // Phase 3: render thread locks ready readbacks, copies to CPU buffers, fulfills promise.
+    void collectReadbacks(FRHICommandListImmediate& RHICmdList);
 };

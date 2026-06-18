@@ -980,6 +980,90 @@ std::vector<WorldSimApi::ImageCaptureBase::ImageResponse> WorldSimApi::getImages
     return responses;
 }
 
+std::map<std::string, std::vector<WorldSimApi::ImageCaptureBase::ImageResponse>>
+WorldSimApi::getImagesAllVehicles(
+    const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const
+{
+    std::vector<std::shared_ptr<RenderRequest::RenderParams>> all_params;
+    std::vector<ImageCaptureBase::ImageResponse> all_responses;
+    std::vector<UnrealImageCapture::CameraResponsePair> camera_response_pairs;
+    UGameViewportClient* viewport = nullptr;
+
+    // Per-vehicle bookmarks so we can split results back
+    std::map<std::string, std::pair<size_t, size_t>> vehicle_offsets;
+
+    for (const auto& kv : vehicle_requests) {
+        const std::string& vehicle_name = kv.first;
+        const auto& requests = kv.second;
+        if (requests.empty()) continue;
+
+        const UnrealImageCapture* capture = simmode_->getImageCapture(vehicle_name);
+        if (!capture) continue;
+
+        size_t offset = all_responses.size();
+        capture->collectRenderParams(requests, all_responses, all_params, camera_response_pairs, viewport);
+        vehicle_offsets[vehicle_name] = { offset, requests.size() };
+    }
+
+    if (viewport == nullptr || all_params.empty())
+        return {};
+
+    // One combined render call — one frame wait for all vehicles
+    auto pose_cb = [&camera_response_pairs, &all_responses]() {
+        for (const auto& p : camera_response_pairs) {
+            auto camera_pose = p.camera->getPose();
+            all_responses[p.response_idx].camera_position = camera_pose.position;
+            all_responses[p.response_idx].camera_orientation = camera_pose.orientation;
+        }
+    };
+
+    std::vector<std::shared_ptr<RenderRequest::RenderResult>> all_results;
+    RenderRequest render_request{ viewport, std::move(pose_cb) };
+    render_request.getScreenshot(all_params.data(), all_results, all_params.size(), false);
+
+    // Fill per-camera fields in responses from results
+    size_t ri = 0;
+    for (const auto& kv : vehicle_requests) {
+        const std::string& vehicle_name = kv.first;
+        const auto& requests = kv.second;
+        auto it = vehicle_offsets.find(vehicle_name);
+        if (it == vehicle_offsets.end()) continue;
+        size_t offset = it->second.first;
+        for (size_t j = 0; j < requests.size() && ri < all_results.size(); ++j, ++ri) {
+            ImageCaptureBase::ImageResponse& response = all_responses[offset + j];
+            const auto& result = all_results[ri];
+            response.camera_name = requests[j].camera_name;
+            response.time_stamp = result->time_stamp;
+            response.image_data_uint8 = std::vector<uint8_t>(
+                result->image_data_uint8.GetData(),
+                result->image_data_uint8.GetData() + result->image_data_uint8.Num());
+            response.image_data_float = std::vector<float>(
+                result->image_data_float.GetData(),
+                result->image_data_float.GetData() + result->image_data_float.Num());
+            response.pixels_as_float = requests[j].pixels_as_float;
+            response.compress = requests[j].compress;
+            response.width = result->width;
+            response.height = result->height;
+            response.image_type = requests[j].image_type;
+            response.annotation_name = requests[j].annotation_name;
+        }
+    }
+
+    // Split back into per-vehicle map
+    std::map<std::string, std::vector<ImageCaptureBase::ImageResponse>> result_map;
+    for (const auto& kv : vehicle_requests) {
+        const std::string& vehicle_name = kv.first;
+        auto it = vehicle_offsets.find(vehicle_name);
+        if (it == vehicle_offsets.end()) continue;
+        size_t offset = it->second.first;
+        size_t count = it->second.second;
+        result_map[vehicle_name] = std::vector<ImageCaptureBase::ImageResponse>(
+            all_responses.begin() + offset,
+            all_responses.begin() + offset + count);
+    }
+    return result_map;
+}
+
 std::vector<uint8_t> WorldSimApi::getImage(ImageCaptureBase::ImageType image_type, const CameraDetails& camera_details, const std::string& annotation_name) const
 {
     std::vector<ImageCaptureBase::ImageRequest> request{

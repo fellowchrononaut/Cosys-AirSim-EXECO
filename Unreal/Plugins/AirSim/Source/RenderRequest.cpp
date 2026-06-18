@@ -8,12 +8,16 @@
 #include "Async/Async.h"
 
 RenderRequest::RenderRequest(UGameViewportClient* game_viewport, std::function<void()>&& query_camera_pose_cb)
-    : params_(nullptr), results_(nullptr), req_size_(0), wait_signal_(new msr::airlib::WorkerThreadSignal), game_viewport_(game_viewport), query_camera_pose_cb_(std::move(query_camera_pose_cb))
+    : params_(nullptr), results_(nullptr), req_size_(0), game_viewport_(game_viewport),
+      query_camera_pose_cb_(std::move(query_camera_pose_cb))
 {
 }
 
 RenderRequest::~RenderRequest()
 {
+    if (ticker_handle_.IsValid()) {
+        FTSTicker::GetCoreTicker().RemoveTicker(ticker_handle_);
+    }
 }
 
 // read pixels from render target using render thread, then compress the result into PNG
@@ -55,12 +59,21 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
         }
     }
     else {
-        //wait for render thread to pick up our task
         params_ = params;
         results_ = results.data();
         req_size_ = req_size;
 
-        // Queue up the task of querying camera pose in the game thread and synchronizing render thread with camera pose
+        // Pre-allocate one readback object per camera
+        readbacks_.Empty();
+        for (unsigned int i = 0; i < req_size_; ++i) {
+            readbacks_.Add(MakeUnique<FRHIGPUTextureReadback>(
+                *FString::Printf(TEXT("AirSimReadback_%u"), i)));
+        }
+
+        // Promise fulfilled on render thread once collectReadbacks() finishes.
+        promise_ = std::make_unique<std::promise<void>>();
+        std::future<void> future = promise_->get_future();
+
         AsyncTask(ENamedThreads::GameThread, [this]() {
             check(IsInGameThread());
 
@@ -69,18 +82,22 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this] {
                 check(IsInGameThread());
 
-                // capture CameraPose for this frame
+                // Capture camera pose for this frame while still on game thread
                 query_camera_pose_cb_();
 
-                // The completion is called immeidately after GameThread sends the
-                // rendering commands to RenderThread. Hence, our ExecuteTask will
-                // execute *immediately* after RenderThread renders the scene!
+                // Submit GPU→CPU copies — render thread returns immediately after EnqueueCopy.
                 RenderRequest* This = this;
-                ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)
+                ENQUEUE_RENDER_COMMAND(SubmitReadbackCopies)
                 (
                     [This](FRHICommandListImmediate& RHICmdList) {
-                        This->ExecuteTask();
+                        This->submitCopies(RHICmdList);
                     });
+
+                // Poll readbacks each game tick — render thread is free during this window.
+                ticker_handle_ = FTSTicker::GetCoreTicker().AddTicker(
+                    FTickerDelegate::CreateLambda([this](float dt) {
+                        return this->checkReadbacks(dt);
+                    }), 0.0f);
 
                 game_viewport_->bDisableWorldRendering = saved_DisableWorldRendering_;
 
@@ -88,7 +105,6 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
                 game_viewport_->OnEndDraw().Remove(end_draw_handle_);
             });
 
-            // while we're still on GameThread, enqueue request for capture the scene!
             for (unsigned int i = 0; i < req_size_; ++i) {
                 if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
                     params_[i]->render_component->CaptureSceneDeferred();
@@ -96,13 +112,16 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             }
         });
 
-        // wait for this task to complete
-        while (!wait_signal_->waitFor(5)) {
-            // log a message and continue wait
-            // lamda function still references a few objects for which there is no refcount.
-            // Walking away will cause memory corruption, which is much more difficult to debug.
-            UE_LOG(LogTemp, Warning, TEXT("Failed: timeout waiting for screenshot"));
-        }
+        // Block RPC thread until render thread finishes collectReadbacks().
+        // Client semantics unchanged; render thread is freed during GPU readback wait.
+        future.wait();
+
+        // Data already copied into results_[i]->bmp by render thread in collectReadbacks()
+        req_size_ = 0;
+        params_ = nullptr;
+        results_ = nullptr;
+        readbacks_.Empty();
+        promise_.reset();
     }
 
     for (unsigned int i = 0; i < req_size; ++i) {
@@ -144,46 +163,89 @@ FReadSurfaceDataFlags RenderRequest::setupRenderResource(const FTextureRenderTar
     return flags;
 }
 
-void RenderRequest::ExecuteTask()
+void RenderRequest::submitCopies(FRHICommandListImmediate& RHICmdList)
 {
-    if (params_ != nullptr && req_size_ > 0) {
-        for (unsigned int i = 0; i < req_size_; ++i) {
-            if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
-                FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
-                auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
-                if (rt_resource != nullptr) {
-                    const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
-                    FIntPoint size;
-                    auto flags = setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
+    if (params_ == nullptr || req_size_ == 0) return;
 
-                    //should we be using ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER which was in original commit by @saihv
-                    //https://github.com/Microsoft/AirSim/pull/162/commits/63e80c43812300a8570b04ed42714a3f6949e63f#diff-56b790f9394f7ca1949ddbb320d8456fR64
-                    if (!params_[i]->pixels_as_float) {
-                        //below is undocumented method that avoids flushing, but it seems to segfault every 2000 or so calls
-                        RHICmdList.ReadSurfaceData(
-                            rhi_texture,
-                            FIntRect(0, 0, size.X, size.Y),
-                            results_[i]->bmp,
-                            flags);
+    // Submit GPU DMA for all cameras and stamp render-frame time.
+    // Render thread returns after this — actual DMA runs asynchronously on GPU.
+    const auto ts = msr::airlib::ClockFactory::get()->nowNanos();
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
+            auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
+            if (rt_resource != nullptr) {
+                FIntPoint size;
+                setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
+                const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
+                if (rhi_texture.IsValid()) {
+                    readbacks_[i]->EnqueueCopy(RHICmdList, rhi_texture);
+                }
+            }
+        }
+        results_[i]->time_stamp = ts;
+    }
+}
+
+bool RenderRequest::checkReadbacks(float /*dt*/)
+{
+    check(IsInGameThread());
+
+    if (params_ == nullptr || req_size_ == 0) {
+        ticker_handle_.Reset();
+        return false;
+    }
+
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
+            if (!readbacks_[i].IsValid() || !readbacks_[i]->IsReady()) {
+                return true; // not ready — poll again next tick
+            }
+        }
+    }
+
+    // All GPU DMAs complete — schedule Lock/copy/Unlock on render thread.
+    RenderRequest* This = this;
+    ENQUEUE_RENDER_COMMAND(CollectReadbacks)
+    (
+        [This](FRHICommandListImmediate& RHICmdList) {
+            This->collectReadbacks(RHICmdList);
+            This->promise_->set_value();
+        });
+
+    ticker_handle_.Reset();
+    return false;
+}
+
+void RenderRequest::collectReadbacks(FRHICommandListImmediate& /*RHICmdList*/)
+{
+    if (params_ == nullptr || req_size_ == 0) return;
+
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr
+            && results_[i]->width > 0 && results_[i]->height > 0) {
+            int32 rowPitchInPixels;
+            void* rawData = readbacks_[i]->Lock(rowPitchInPixels);
+            if (rawData) {
+                const int32 w = results_[i]->width;
+                const int32 h = results_[i]->height;
+                if (!params_[i]->pixels_as_float) {
+                    results_[i]->bmp.SetNumUninitialized(w * h, false);
+                    const FColor* src = static_cast<const FColor*>(rawData);
+                    FColor* dst = results_[i]->bmp.GetData();
+                    for (int32 y = 0; y < h; ++y) {
+                        FMemory::Memcpy(dst + y * w, src + y * rowPitchInPixels, w * sizeof(FColor));
                     }
-                    else {
-                        RHICmdList.ReadSurfaceFloatData(
-                            rhi_texture,
-                            FIntRect(0, 0, size.X, size.Y),
-                            results_[i]->bmp_float,
-                            CubeFace_PosX,
-                            0,
-                            0);
+                }
+                else {
+                    results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+                    const FFloat16Color* src = static_cast<const FFloat16Color*>(rawData);
+                    FFloat16Color* dst = results_[i]->bmp_float.GetData();
+                    for (int32 y = 0; y < h; ++y) {
+                        FMemory::Memcpy(dst + y * w, src + y * rowPitchInPixels, w * sizeof(FFloat16Color));
                     }
                 }
             }
-            results_[i]->time_stamp = msr::airlib::ClockFactory::get()->nowNanos();
+            readbacks_[i]->Unlock();
         }
-
-        req_size_ = 0;
-        params_ = nullptr;
-        results_ = nullptr;
-
-        wait_signal_->signal();
     }
 }

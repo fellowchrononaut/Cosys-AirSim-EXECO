@@ -61,6 +61,7 @@ AirsimROSWrapperMultiAgent::AirsimROSWrapperMultiAgent(
     , airsim_client_images_drone_(host_ip, DRONE_PORT)
     , airsim_client_images_car_(host_ip, CAR_PORT)
     , airsim_client_images_cv_(host_ip, CV_PORT)
+    , airsim_client_images_world_(host_ip, WORLD_PORT)
     // Dedicated lidar connections
     , airsim_client_lidar_drone_(host_ip, DRONE_PORT)
     , airsim_client_lidar_car_(host_ip, CAR_PORT)
@@ -916,15 +917,23 @@ void AirsimROSWrapperMultiAgent::echo_timer_cb()
 void AirsimROSWrapperMultiAgent::img_response_timer_cb()
 {
     try {
+        // Build combined request map for all vehicles
+        std::map<std::string, std::vector<ImageRequest>> all_requests;
+        for (const auto& pair : airsim_img_request_vehicle_name_pair_vec_)
+            all_requests[pair.vehicle_name] = pair.requests;
+
+        // Single RPC call through world server — one frame wait for all vehicles
+        auto all_responses = airsim_client_images_world_.simGetImagesAllVehicles(all_requests);
+
+        // Publish in the same order as airsim_img_request_vehicle_name_pair_vec_
+        // so image_response_idx aligns with image_pub_vec_ / cam_info_pub_vec_
         int image_response_idx = 0;
         for (const auto& pair : airsim_img_request_vehicle_name_pair_vec_) {
-            auto& img_client = get_images_client(pair.mode);
-            const std::vector<ImageResponse>& img_response = img_client.simGetImages(pair.requests, pair.vehicle_name);
-
-            if (img_response.size() == pair.requests.size()) {
-                process_and_publish_img_response(img_response, image_response_idx, pair.vehicle_name);
-                image_response_idx += img_response.size();
+            auto it = all_responses.find(pair.vehicle_name);
+            if (it != all_responses.end() && it->second.size() == pair.requests.size()) {
+                process_and_publish_img_response(it->second, image_response_idx, pair.vehicle_name);
             }
+            image_response_idx += static_cast<int>(pair.requests.size());
         }
     }
     catch (rpc::rpc_error& e) {
