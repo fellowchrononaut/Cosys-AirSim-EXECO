@@ -3,21 +3,58 @@
 #include "Engine/TextureRenderTarget2D.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "ImageUtils.h"
+#include "PixelFormat.h"
+#include "HAL/CriticalSection.h"
 
 #include "AirBlueprintLib.h"
 #include "Async/Async.h"
 
+namespace
+{
+    // Single place to extend GPU readback support to more pixel formats.
+    // Today AirSim only configures PF_B8G8R8A8 (8-bit BGRA color) and PF_FloatRGBA
+    // (16-bit half-float RGBA) for its render targets — see PIPCamera.cpp.
+    // When adding new formats (e.g. PF_R32_FLOAT for single-channel depth, or
+    // PF_G16R16F for 2-channel optical flow), add a case here AND the matching
+    // decode branch in RenderRequest::ExecuteTask().
+    bool isSupportedReadbackFormat(EPixelFormat format, bool pixels_as_float)
+    {
+        if (!pixels_as_float && format == PF_B8G8R8A8) return true;   // → FColor decode
+        if ( pixels_as_float && format == PF_FloatRGBA) return true;   // → FFloat16Color decode
+        return false;
+    }
+
+    // Log each unique (camera_name, format, pixels_as_float) mismatch once per
+    // process so a fleet of misconfigured cameras doesn't spam the log on every
+    // capture tick.
+    void warnUnsupportedFormatOnce(const FString& camera_name, unsigned int req_index, EPixelFormat format, bool pixels_as_float)
+    {
+        static FCriticalSection mutex;
+        static TSet<FString> warned;
+
+        const FString key = FString::Printf(TEXT("%s|%d|%d"),
+            *camera_name, (int)format, pixels_as_float ? 1 : 0);
+
+        FScopeLock lock(&mutex);
+        if (warned.Contains(key)) return;
+        warned.Add(key);
+
+        const TCHAR* fmt_name = GPixelFormats[format].Name ? GPixelFormats[format].Name : TEXT("Unknown");
+        UE_LOG(LogTemp, Warning,
+            TEXT("RenderRequest: unsupported GPU readback format for camera '%s' (request_idx=%u, format=%s, pixels_as_float=%d). Camera will return empty response. Extend isSupportedReadbackFormat() to add support."),
+            *camera_name, req_index, fmt_name, pixels_as_float ? 1 : 0);
+    }
+}
+
 RenderRequest::RenderRequest(UGameViewportClient* game_viewport, std::function<void()>&& query_camera_pose_cb)
     : params_(nullptr), results_(nullptr), req_size_(0), game_viewport_(game_viewport),
+      wait_signal_(std::make_shared<msr::airlib::WorkerThreadSignal>()),
       query_camera_pose_cb_(std::move(query_camera_pose_cb))
 {
 }
 
 RenderRequest::~RenderRequest()
 {
-    if (ticker_handle_.IsValid()) {
-        FTSTicker::GetCoreTicker().RemoveTicker(ticker_handle_);
-    }
 }
 
 // read pixels from render target using render thread, then compress the result into PNG
@@ -63,16 +100,14 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
         results_ = results.data();
         req_size_ = req_size;
 
-        // Pre-allocate one readback object per camera
+        // Pre-allocate one readback object per camera; reset enqueue/format trackers.
         readbacks_.Empty();
+        enqueued_.Init(false, req_size_);
+        formats_.Init(PF_Unknown, req_size_);
         for (unsigned int i = 0; i < req_size_; ++i) {
             readbacks_.Add(MakeUnique<FRHIGPUTextureReadback>(
                 *FString::Printf(TEXT("AirSimReadback_%u"), i)));
         }
-
-        // Promise fulfilled on render thread once collectReadbacks() finishes.
-        promise_ = std::make_unique<std::promise<void>>();
-        std::future<void> future = promise_->get_future();
 
         AsyncTask(ENamedThreads::GameThread, [this]() {
             check(IsInGameThread());
@@ -85,19 +120,29 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
                 // Capture camera pose for this frame while still on game thread
                 query_camera_pose_cb_();
 
-                // Submit GPU→CPU copies — render thread returns immediately after EnqueueCopy.
+                // One render command does EnqueueCopy + Lock + copy + Unlock + signal.
+                // Render thread stalls during Lock (5–20ms) but RPC capture latency is
+                // ~1 game tick + GPU readback rather than the 2–3 game ticks the prior
+                // ticker-poll design cost. wait_signal_->signal() is guaranteed via the
+                // try/catch wrapper so an exception in ExecuteTask won't hang the RPC.
                 RenderRequest* This = this;
-                ENQUEUE_RENDER_COMMAND(SubmitReadbackCopies)
+                ENQUEUE_RENDER_COMMAND(GpuReadback)
                 (
                     [This](FRHICommandListImmediate& RHICmdList) {
-                        This->submitCopies(RHICmdList);
+                        try {
+                            This->ExecuteTask(RHICmdList);
+                        }
+                        catch (const std::exception& e) {
+                            UE_LOG(LogTemp, Error,
+                                TEXT("RenderRequest::ExecuteTask threw std::exception: %s"),
+                                UTF8_TO_TCHAR(e.what()));
+                        }
+                        catch (...) {
+                            UE_LOG(LogTemp, Error,
+                                TEXT("RenderRequest::ExecuteTask threw unknown exception"));
+                        }
+                        This->wait_signal_->signal();
                     });
-
-                // Poll readbacks each game tick — render thread is free during this window.
-                ticker_handle_ = FTSTicker::GetCoreTicker().AddTicker(
-                    FTickerDelegate::CreateLambda([this](float dt) {
-                        return this->checkReadbacks(dt);
-                    }), 0.0f);
 
                 game_viewport_->bDisableWorldRendering = saved_DisableWorldRendering_;
 
@@ -112,16 +157,23 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             }
         });
 
-        // Block RPC thread until render thread finishes collectReadbacks().
-        // Client semantics unchanged; render thread is freed during GPU readback wait.
-        future.wait();
+        // Block RPC thread until render thread completes EnqueueCopy + Lock + copy.
+        // Watchdog: if signal doesn't fire within 5s, log loudly each iteration so a
+        // hung capture is visible. True cancellation needs heap-owned per-call state
+        // (see TODO atop ExecuteTask) so we still wait forever — but never silently.
+        while (!wait_signal_->waitFor(5)) {
+            UE_LOG(LogTemp, Warning,
+                TEXT("RenderRequest: capture taking >5s for %u camera(s); still waiting"),
+                req_size_);
+        }
 
-        // Data already copied into results_[i]->bmp by render thread in collectReadbacks()
+        // Data already copied into results_[i]->bmp by render thread in ExecuteTask()
         req_size_ = 0;
         params_ = nullptr;
         results_ = nullptr;
         readbacks_.Empty();
-        promise_.reset();
+        enqueued_.Empty();
+        formats_.Empty();
     }
 
     for (unsigned int i = 0; i < req_size; ++i) {
@@ -163,89 +215,99 @@ FReadSurfaceDataFlags RenderRequest::setupRenderResource(const FTextureRenderTar
     return flags;
 }
 
-void RenderRequest::submitCopies(FRHICommandListImmediate& RHICmdList)
+// TODO(scalability): true cancellation of an in-flight capture (e.g. on timeout,
+// PIE shutdown, or world destruction) requires the per-call state — params_,
+// results_, readbacks_, enqueued_, formats_ — to be heap-owned via shared_ptr
+// captured by the render lambda. Currently they are RenderRequest members, so
+// abandoning the wait would risk use-after-free if the caller destroys the
+// RenderRequest before the render command runs. See reviewer notes (High #1).
+void RenderRequest::ExecuteTask(FRHICommandListImmediate& RHICmdList)
 {
     if (params_ == nullptr || req_size_ == 0) return;
 
-    // Submit GPU DMA for all cameras and stamp render-frame time.
-    // Render thread returns after this — actual DMA runs asynchronously on GPU.
+    // Stamp render-frame time once for the whole batch so all cameras share the
+    // same timestamp — load-bearing for multi-vehicle / stereo synchronization.
     const auto ts = msr::airlib::ClockFactory::get()->nowNanos();
+
+    // Phase 1: submit GPU DMA for every valid camera, recording which ones
+    // actually got enqueued and what format the GPU texture has.
     for (unsigned int i = 0; i < req_size_; ++i) {
-        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
-            auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
-            if (rt_resource != nullptr) {
-                FIntPoint size;
-                setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
-                const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
-                if (rhi_texture.IsValid()) {
-                    readbacks_[i]->EnqueueCopy(RHICmdList, rhi_texture);
-                }
-            }
-        }
         results_[i]->time_stamp = ts;
+
+        if (params_[i]->render_target == nullptr || params_[i]->render_component == nullptr) {
+            continue;
+        }
+        auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
+        if (rt_resource == nullptr) {
+            continue;
+        }
+        FIntPoint size;
+        setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
+        const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
+        if (!rhi_texture.IsValid()) {
+            continue;
+        }
+
+        const EPixelFormat format = rhi_texture->GetFormat();
+        formats_[i] = format;
+
+        if (!isSupportedReadbackFormat(format, params_[i]->pixels_as_float)) {
+            warnUnsupportedFormatOnce(params_[i]->camera_name, i, format, params_[i]->pixels_as_float);
+            // Mark response invalid so the caller's formatting pass skips it
+            // instead of producing garbage from the empty bmp/bmp_float.
+            results_[i]->width = 0;
+            results_[i]->height = 0;
+            continue;
+        }
+
+        readbacks_[i]->EnqueueCopy(RHICmdList, rhi_texture);
+        enqueued_[i] = true;
     }
-}
 
-bool RenderRequest::checkReadbacks(float /*dt*/)
-{
-    check(IsInGameThread());
-
-    if (params_ == nullptr || req_size_ == 0) {
-        ticker_handle_.Reset();
-        return false;
-    }
-
+    // Phase 2: Lock each enqueued readback. Lock() blocks the render thread until
+    // that readback's GPU DMA completes — but because all EnqueueCopy calls above
+    // are submitted before any Lock, the GPU pipelines the DMAs in parallel and
+    // later Lock() calls usually return immediately.
     for (unsigned int i = 0; i < req_size_; ++i) {
-        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
-            if (!readbacks_[i].IsValid() || !readbacks_[i]->IsReady()) {
-                return true; // not ready — poll again next tick
+        if (!enqueued_[i] || results_[i]->width <= 0 || results_[i]->height <= 0) {
+            continue;
+        }
+
+        int32 rowPitchInPixels;
+        void* rawData = readbacks_[i]->Lock(rowPitchInPixels);
+        if (rawData) {
+            const int32 w = results_[i]->width;
+            const int32 h = results_[i]->height;
+            // Dispatch on actual GPU format recorded above, not client-requested
+            // pixels_as_float. Add cases here when extending isSupportedReadbackFormat().
+            switch (formats_[i]) {
+            case PF_B8G8R8A8:
+            {
+                results_[i]->bmp.SetNumUninitialized(w * h, false);
+                const FColor* src = static_cast<const FColor*>(rawData);
+                FColor* dst = results_[i]->bmp.GetData();
+                for (int32 y = 0; y < h; ++y) {
+                    FMemory::Memcpy(dst + y * w, src + y * rowPitchInPixels, w * sizeof(FColor));
+                }
+                break;
+            }
+            case PF_FloatRGBA:
+            {
+                results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+                const FFloat16Color* src = static_cast<const FFloat16Color*>(rawData);
+                FFloat16Color* dst = results_[i]->bmp_float.GetData();
+                for (int32 y = 0; y < h; ++y) {
+                    FMemory::Memcpy(dst + y * w, src + y * rowPitchInPixels, w * sizeof(FFloat16Color));
+                }
+                break;
+            }
+            default:
+                // Unreachable: Phase 1 would have rejected this format. Defensive.
+                results_[i]->width = 0;
+                results_[i]->height = 0;
+                break;
             }
         }
-    }
-
-    // All GPU DMAs complete — schedule Lock/copy/Unlock on render thread.
-    RenderRequest* This = this;
-    ENQUEUE_RENDER_COMMAND(CollectReadbacks)
-    (
-        [This](FRHICommandListImmediate& RHICmdList) {
-            This->collectReadbacks(RHICmdList);
-            This->promise_->set_value();
-        });
-
-    ticker_handle_.Reset();
-    return false;
-}
-
-void RenderRequest::collectReadbacks(FRHICommandListImmediate& /*RHICmdList*/)
-{
-    if (params_ == nullptr || req_size_ == 0) return;
-
-    for (unsigned int i = 0; i < req_size_; ++i) {
-        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr
-            && results_[i]->width > 0 && results_[i]->height > 0) {
-            int32 rowPitchInPixels;
-            void* rawData = readbacks_[i]->Lock(rowPitchInPixels);
-            if (rawData) {
-                const int32 w = results_[i]->width;
-                const int32 h = results_[i]->height;
-                if (!params_[i]->pixels_as_float) {
-                    results_[i]->bmp.SetNumUninitialized(w * h, false);
-                    const FColor* src = static_cast<const FColor*>(rawData);
-                    FColor* dst = results_[i]->bmp.GetData();
-                    for (int32 y = 0; y < h; ++y) {
-                        FMemory::Memcpy(dst + y * w, src + y * rowPitchInPixels, w * sizeof(FColor));
-                    }
-                }
-                else {
-                    results_[i]->bmp_float.SetNumUninitialized(w * h, false);
-                    const FFloat16Color* src = static_cast<const FFloat16Color*>(rawData);
-                    FFloat16Color* dst = results_[i]->bmp_float.GetData();
-                    for (int32 y = 0; y < h; ++y) {
-                        FMemory::Memcpy(dst + y * w, src + y * rowPitchInPixels, w * sizeof(FFloat16Color));
-                    }
-                }
-            }
-            readbacks_[i]->Unlock();
-        }
+        readbacks_[i]->Unlock();
     }
 }

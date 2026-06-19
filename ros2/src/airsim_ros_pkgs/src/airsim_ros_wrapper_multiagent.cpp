@@ -116,6 +116,7 @@ void AirsimROSWrapperMultiAgent::initialize_airsim()
         airsim_client_images_drone_.confirmConnection();
         airsim_client_images_car_.confirmConnection();
         airsim_client_images_cv_.confirmConnection();
+        airsim_client_images_world_.confirmConnection();
 
         airsim_client_lidar_drone_.confirmConnection();
         airsim_client_lidar_car_.confirmConnection();
@@ -916,6 +917,21 @@ void AirsimROSWrapperMultiAgent::echo_timer_cb()
 
 void AirsimROSWrapperMultiAgent::img_response_timer_cb()
 {
+    // Drop policy: if the previous capture is still in flight, skip this tick
+    // entirely rather than queuing. Bounded latency for fleet VSLAM matters more
+    // than every-frame fidelity. RCLCPP_WARN_THROTTLE avoids log spam when the
+    // pipeline is sustainedly slower than the timer period.
+    bool expected = false;
+    if (!img_capture_in_flight_.compare_exchange_strong(expected, true)) {
+        RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 5000,
+            "Skipping image capture tick: previous capture still in flight");
+        return;
+    }
+    struct InFlightGuard {
+        std::atomic<bool>& flag;
+        ~InFlightGuard() { flag.store(false); }
+    } guard{img_capture_in_flight_};
+
     try {
         // Build combined request map for all vehicles
         std::map<std::string, std::vector<ImageRequest>> all_requests;

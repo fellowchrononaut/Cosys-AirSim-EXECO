@@ -5,10 +5,9 @@
 #include "RHIGPUReadback.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/GameViewportClient.h"
-#include "Containers/Ticker.h"
 #include <memory>
-#include <future>
 #include "common/Common.hpp"
+#include "common/WorkerThread.hpp"
 
 
 class RenderRequest : public FRenderCommand
@@ -20,9 +19,11 @@ public:
         bool pixels_as_float;
         bool compress;
         bool disable_gamma;
+        // For diagnostic logging when the GPU readback format is unsupported.
+        FString camera_name;
 
-        RenderParams(USceneCaptureComponent2D * render_component_val, UTextureRenderTarget2D* render_target_val, bool pixels_as_float_val, bool compress_val, bool disable_gamma_val)
-            : render_component(render_component_val), render_target(render_target_val), pixels_as_float(pixels_as_float_val), compress(compress_val), disable_gamma(disable_gamma_val)
+        RenderParams(USceneCaptureComponent2D * render_component_val, UTextureRenderTarget2D* render_target_val, bool pixels_as_float_val, bool compress_val, bool disable_gamma_val, const FString& camera_name_val = TEXT(""))
+            : render_component(render_component_val), render_target(render_target_val), pixels_as_float(pixels_as_float_val), compress(compress_val), disable_gamma(disable_gamma_val), camera_name(camera_name_val)
         {
         }
     };
@@ -50,8 +51,16 @@ private:
     UGameViewportClient * const game_viewport_;
     FDelegateHandle end_draw_handle_;
     TArray<TUniquePtr<FRHIGPUTextureReadback>> readbacks_;
-    std::unique_ptr<std::promise<void>> promise_;
-    FTSTicker::FDelegateHandle ticker_handle_;
+    // Per-camera flag: true iff EnqueueCopy was actually called in ExecuteTask.
+    // The Lock/copy loop only operates on enqueued cameras so one skipped camera
+    // (invalid texture, unsupported pixel format) doesn't stall the batch.
+    TArray<bool> enqueued_;
+    // Per-camera actual GPU texture pixel format, recorded at submit time so the
+    // decode dispatches on real GPU layout rather than client-requested type.
+    TArray<EPixelFormat> formats_;
+    // CPU-thread signal: render-thread ExecuteTask signals when all readbacks have
+    // been locked and copied; RPC thread blocks on waitFor() with watchdog logging.
+    std::shared_ptr<msr::airlib::WorkerThreadSignal> wait_signal_;
     std::function<void()> query_camera_pose_cb_;
 
 public:
@@ -69,10 +78,8 @@ public:
         std::shared_ptr<RenderParams> params[], std::vector<std::shared_ptr<RenderResult>>& results, unsigned int req_size, bool use_safe_method);
 
 private:
-    // Phase 1: render thread enqueues GPU→CPU DMA for all cameras and returns.
-    void submitCopies(FRHICommandListImmediate& RHICmdList);
-    // Phase 2: game tick polls IsReady() on all readbacks; returns false to unregister when done.
-    bool checkReadbacks(float dt);
-    // Phase 3: render thread locks ready readbacks, copies to CPU buffers, fulfills promise.
-    void collectReadbacks(FRHICommandListImmediate& RHICmdList);
+    // Render thread: submit EnqueueCopy for all valid cameras, then Lock/copy/Unlock
+    // for each enqueued camera. Render thread blocks during Lock until GPU DMA
+    // completes — typically 5–20ms. Signals wait_signal_ when done.
+    void ExecuteTask(FRHICommandListImmediate& RHICmdList);
 };

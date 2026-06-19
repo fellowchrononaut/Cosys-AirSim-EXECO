@@ -75,6 +75,7 @@ STRICT_MODE_OFF
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2/convert.h>
+#include <atomic>
 #include <unordered_map>
 #include <memory>
 
@@ -516,6 +517,12 @@ private:
     std::vector<image_transport::Publisher> image_pub_vec_;
     std::vector<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr> cam_info_pub_vec_;
     std::vector<sensor_msgs::msg::CameraInfo> camera_info_msg_vec_;
+
+    // In-flight guard for the batch image RPC. If a capture takes longer than the
+    // timer period, drop the current tick rather than queueing — bounded latency
+    // beats every-frame fidelity for fleet VSLAM. Atomic mostly future-proofs
+    // against multi-threaded executors; single-threaded timers won't re-enter.
+    std::atomic<bool> img_capture_in_flight_{false};
 
     std::unordered_map<std::string, bool> sensor_name_to_passive_enable_map_;
     std::unordered_map<std::string, bool> sensor_name_to_active_enable_map_;

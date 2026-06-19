@@ -100,7 +100,9 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
         
         bool disable_gamma = false;
         if (requests[i].image_type == ImageCaptureBase::ImageType::Segmentation || requests[i].image_type == ImageCaptureBase::ImageType::Annotation)disable_gamma = true;
-        render_params.push_back(std::make_shared<RenderRequest::RenderParams>(capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma));
+        render_params.push_back(std::make_shared<RenderRequest::RenderParams>(
+            capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma,
+            FString(requests[i].camera_name.c_str())));
     }
 
     if (nullptr == gameViewport) {
@@ -204,7 +206,8 @@ void UnrealImageCapture::collectRenderParams(
         bool disable_gamma = (requests[i].image_type == ImageCaptureBase::ImageType::Segmentation
                               || requests[i].image_type == ImageCaptureBase::ImageType::Annotation);
         render_params.push_back(std::make_shared<RenderRequest::RenderParams>(
-            capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma));
+            capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma,
+            FString(requests[i].camera_name.c_str())));
 
         camera_response_pairs.push_back(CameraResponsePair{ camera, resp_idx });
     }
