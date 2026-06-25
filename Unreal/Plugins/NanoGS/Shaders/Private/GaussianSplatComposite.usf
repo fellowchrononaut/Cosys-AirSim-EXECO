@@ -38,6 +38,7 @@ float  LightIntensityScale;                // global sensitivity for per-light i
 float  LightResponseCeiling;                // per-light contribution ceiling (raise past 1 for brighter lights)
 float  RelightRatioMin;                     // clamp floor for the brightness-preserving relight ratio
 float  RelightRatioMax;                     // clamp ceiling for the brightness-preserving relight ratio
+uint   UseRelightRatio;                     // 1 = brightness-preserving ratio (default), 0 = old direct multiply
 uint   NormalSmoothRadius;                 // bilateral depth-smoothing kernel radius (px); 0 = off
 float  NormalSmoothFrac;                    // depth-similarity sigma as fraction of view depth
 uint   NormalSampleStep;                    // central-difference baseline (px) for the normal
@@ -48,6 +49,10 @@ Texture2D    CustomDepthTexture;
 SamplerState CustomDepthSampler;
 float4       InvDeviceZToWorldZTransform;
 uint         GeometryMode;                  // 0 = splat depth-accum, 1 = proxy mesh CustomDepth, 2 = per-splat normal
+
+// Diagnostic visualization for the active GeometryMode's reconstructed geometry.
+// 0 = off (default), 1 = show the reconstructed normal as an RGB color.
+uint         DebugView;
 
 // GeometryMode 2: alpha-weighted per-splat analytic-normal accumulation (RGBA16F).
 // .rgb = sum(splatNormal*alpha*T), .a = sum(alpha*T); normal = normalize(rgb / a).
@@ -192,16 +197,63 @@ bool ReconstructWorldAuto(int2 pixel, out float3 worldPos)
 
 // GeometryMode 2: recover the alpha-weighted average per-splat analytic normal at a pixel.
 // NormalAccumTexture holds sum(splatNormal*alpha*T) in .rgb and sum(alpha*T) in .a (same
-// premultiplied-"over" pattern as DepthAccumTexture). Returns false where there's no coverage.
+// premultiplied-"over" pattern as DepthAccumTexture). Per-splat orientation has real scatter
+// (training noise, not just an axis-pick ambiguity), and the single-pixel accumulation only
+// averages over the few splats that happened to land in that exact pixel — so it still shows
+// speckle. Bilateral-smoothed across neighbouring pixels (same depth-similarity weighting as
+// SmoothViewZ, reusing NormalSmoothRadius/NormalSmoothFrac) to average out that scatter, while
+// the depth-similarity term keeps silhouettes/creases from blurring together. Returns false
+// where there's no coverage.
 bool ReconstructNormalFromAccum(int2 pixel, out float3 normal)
 {
 	normal = float3(0, 0, 1);
-	float4 accum = NormalAccumTexture.Load(int3(pixel, 0));
-	if (accum.a <= 1e-6)
+	float4 accumC = NormalAccumTexture.Load(int3(pixel, 0));
+	if (accumC.a <= 1e-6)
 	{
 		return false;
 	}
-	normal = normalize(accum.rgb / accum.a);
+
+	int R = (int)NormalSmoothRadius;
+	if (R <= 0)
+	{
+		normal = normalize(accumC.rgb / accumC.a);
+		return true;
+	}
+
+	float2 daC = DepthAccumTexture.Load(int3(pixel, 0)).rg;
+	float zC = (daC.g > 1e-6) ? (daC.r / daC.g) : 0.0;
+	float sigma  = max(NormalSmoothFrac * zC, 1e-3);
+	float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+
+	float3 nSum = float3(0, 0, 0);
+	float  wSum = 0.0;
+	[loop]
+	for (int dy = -R; dy <= R; ++dy)
+	{
+		[loop]
+		for (int dx = -R; dx <= R; ++dx)
+		{
+			int2 p = pixel + int2(dx, dy);
+			float4 accum = NormalAccumTexture.Load(int3(p, 0));
+			if (accum.a <= 1e-6) continue;
+
+			float w = accum.a;  // coverage
+			if (zC > 0.0)
+			{
+				float2 da = DepthAccumTexture.Load(int3(p, 0)).rg;
+				if (da.g > 1e-6)
+				{
+					float z  = da.r / da.g;
+					float dz = z - zC;
+					w *= exp(-dz * dz * inv2s2);  // depth-similarity (preserves edges/creases)
+				}
+			}
+			nSum += (accum.rgb / accum.a) * w;
+			wSum += w;
+		}
+	}
+
+	normal = (wSum > 0.0) ? normalize(nSum / wSum) : normalize(accumC.rgb / accumC.a);
 	return true;
 }
 
@@ -238,10 +290,12 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 	// Convert sRGB to linear for UE's SceneColor buffer
 	float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
 
-	// Screen-space dynamic lighting — only when enabled and lights are present.
+	// Screen-space dynamic lighting — when enabled and lights are present, OR when a debug
+	// visualization is requested (DebugView bypasses the per-light loop and tonemap entirely, so
+	// it works even with LightingBlend at 0 / no scene lights).
 	// Guard: require all three samples to have splat coverage (ReconstructWorld returns false
 	// on uncovered pixels) so we don't build normals across silhouette edges.
-	if (LightingBlend > 0.0 && NumLights > 0)
+	if (DebugView != 0 || (LightingBlend > 0.0 && NumLights > 0))
 	{
 		int2 P = PixelPos;
 		float3 N;
@@ -279,6 +333,15 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 
 		if (bHaveGeometry)
 		{
+			if (DebugView == 1)
+			{
+				// Visualize the reconstructed world-space normal directly as an RGB color
+				// (standard normal-map encoding). Bypasses the per-light loop and tonemap
+				// entirely so the raw reconstructed data is visible undistorted.
+				float3 debugColor = N * 0.5 + 0.5;
+				float3 debugPremultiplied = debugColor * srgbAccum.a;
+				return float4(debugPremultiplied, srgbAccum.a);
+			}
 
 			// lightSum is the actual, orientation-dependent shading. neutralLight is the same
 			// lights/attenuation/response evaluated with a fixed "average orientation" NdotL stand-in
@@ -339,13 +402,25 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 				neutralLight += tint * (resp * NeutralNdl * atten);
 			}
 
-			// Ratio of actual to neutral shading — isolates the orientation-driven variation from
-			// the absolute light level, then clamps it to a modest range so directional lighting
-			// stays visible without washing out or blacking out the splat's own baked appearance.
-			float3 ratio = lightSum / max(neutralLight, 1e-4);
-			ratio = clamp(ratio, RelightRatioMin, RelightRatioMax);
+			float3 lightTerm;
+			if (UseRelightRatio != 0)
+			{
+				// Ratio of actual to neutral shading — isolates the orientation-driven variation
+				// from the absolute light level, then clamps it to a modest range so directional
+				// lighting stays visible without washing out or blacking out the splat's own baked
+				// appearance.
+				lightTerm = clamp(lightSum / max(neutralLight, 1e-4), RelightRatioMin, RelightRatioMax);
+			}
+			else
+			{
+				// Original behavior: multiply by the absolute light level directly. Simpler, but
+				// double-shades/darkens since the splat's baked color already has some lighting in
+				// it — kept as an opt-out for comparison. Clamp avoids HDR blowout, scaling with the
+				// response ceiling so raising it doesn't get silently clipped back down.
+				lightTerm = min(lightSum, 4.0 * max(LightResponseCeiling, 1.0));
+			}
 
-			float3 litLinear = linearColor * ratio;
+			float3 litLinear = linearColor * lightTerm;
 			linearColor = lerp(linearColor, litLinear, LightingBlend);
 		}
 	}

@@ -122,6 +122,28 @@ TAutoConsoleVariable<float> CVarGSRelightRatioMax(
 	TEXT("Clamp ceiling for the brightness-preserving relight ratio. See gs.RelightRatioMin. Default 1.6."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<int32> CVarGSUseRelightRatio(
+	TEXT("gs.UseRelightRatio"),
+	1,
+	TEXT("1: Brightness-preserving ratio blend (default) — multiplies by actual/neutral shading,\n")
+	TEXT("   clamped to [gs.RelightRatioMin, gs.RelightRatioMax], avoiding double-shading the splat's\n")
+	TEXT("   already-baked color.\n")
+	TEXT("0: Old direct multiply by the absolute light level. Simpler, but darkens/blows out more\n")
+	TEXT("   easily since it ignores that the baked color already has some lighting in it. Kept as\n")
+	TEXT("   an opt-out for comparison."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<int32> CVarGSNormalConfidenceFade(
+	TEXT("gs.NormalConfidenceFade"),
+	1,
+	TEXT("GeometryMode 2 (per-splat normal) only. 1 (default): weight the per-splat normal\n")
+	TEXT("accumulation by each splat's confidence — low for near-isotropic splats whose 'thinnest\n")
+	TEXT("axis' choice is essentially a coin-flip, which otherwise causes salt-and-pepper dark\n")
+	TEXT("speckling where unstable normals randomly face away from lights. Pixels dominated by\n")
+	TEXT("low-confidence splats fade back toward the unlit splat color instead of trusting a noisy\n")
+	TEXT("normal. 0: ignore confidence (original behavior)."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<int32> CVarGSNormalSmoothRadius(
 	TEXT("gs.NormalSmoothRadius"),
 	2,
@@ -161,6 +183,18 @@ TAutoConsoleVariable<int32> CVarGSLightingGeometryMode(
 	TEXT("    changes), so it still benefits from gs.NormalSmoothRadius-free clean normals."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<int32> CVarGSLightingDebugView(
+	TEXT("gs.LightingDebugView"),
+	0,
+	TEXT("Diagnostic visualization for the active GeometryMode's reconstructed geometry. Bypasses\n")
+	TEXT("the per-light loop and tonemap entirely so the raw data is visible undistorted; works even\n")
+	TEXT("with gs.LightingBlend at 0 or no scene lights.\n")
+	TEXT(" 0: Off (default).\n")
+	TEXT(" 1: Show the reconstructed per-pixel world-space normal as an RGB color (normal*0.5+0.5,\n")
+	TEXT("    standard normal-map encoding). Pixels with no valid geometry show the plain unlit\n")
+	TEXT("    splat color, which doubles as a coverage/confidence-fade visualization."),
+	ECVF_RenderThreadSafe);
+
 // Export for other modules
 int32 GGaussianSplatShowClusterBounds = 0;
 
@@ -168,7 +202,11 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 {
 	FGaussianSceneLighting Out;
 	Out.LightingBlend = CVarGSLightingBlend.GetValueOnRenderThread();
-	if (Out.LightingBlend <= 0.f) return Out;   // fast-out, lighting disabled
+	Out.DebugView = CVarGSLightingDebugView.GetValueOnRenderThread();
+	// Fast-out when lighting is disabled, UNLESS a debug view is requested — the debug view
+	// bypasses the per-light loop entirely, so it still needs GeometryMode/depth gathered below
+	// even with LightingBlend at 0.
+	if (Out.LightingBlend <= 0.f && Out.DebugView == 0) return Out;
 
 	const float Amb = CVarGSAmbientIntensity.GetValueOnRenderThread();
 	Out.AmbientColor = FVector3f(Amb, Amb, Amb);
@@ -176,6 +214,8 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 	Out.ResponseCeiling = CVarGSLightResponseCeiling.GetValueOnRenderThread();
 	Out.RelightRatioMin = CVarGSRelightRatioMin.GetValueOnRenderThread();
 	Out.RelightRatioMax = FMath::Max(CVarGSRelightRatioMax.GetValueOnRenderThread(), Out.RelightRatioMin);
+	Out.bUseRelightRatio = CVarGSUseRelightRatio.GetValueOnRenderThread() != 0;
+	Out.bUseNormalConfidenceFade = CVarGSNormalConfidenceFade.GetValueOnRenderThread() != 0;
 	Out.NormalSmoothRadius = FMath::Clamp(CVarGSNormalSmoothRadius.GetValueOnRenderThread(), 0, 6);
 	Out.NormalSmoothFrac = FMath::Max(CVarGSNormalSmoothFrac.GetValueOnRenderThread(), 0.f);
 	Out.NormalSampleStep = FMath::Clamp(CVarGSNormalSampleStep.GetValueOnRenderThread(), 1, 16);
@@ -408,13 +448,15 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// GeometryMode 0 uses it for normals AND position; GeometryMode 2 reuses it for position only
 	// (its own normal comes from NormalAccum below). GeometryMode 1 (proxy mesh CustomDepth) doesn't
 	// use this MRT at all — skip allocating it.
-	const bool bLightingActive = (SceneLighting.LightingBlend > 0.f)
-	                          && (SceneLighting.NumLights > 0)
+	const bool bWantsLighting = (SceneLighting.LightingBlend > 0.f) && (SceneLighting.NumLights > 0);
+	const bool bWantsDebugView = (SceneLighting.DebugView != 0);
+	const bool bLightingActive = (bWantsLighting || bWantsDebugView)
 	                          && (VelocityTexture != nullptr)
 	                          && (DebugMode == 0);
 	const bool bOutputDepth = bLightingActive && (SceneLighting.GeometryMode == 0 || SceneLighting.GeometryMode == 2);
 	// GeometryMode 2 only: alpha-weighted per-splat analytic normal accumulation.
 	const bool bOutputNormal = bLightingActive && (SceneLighting.GeometryMode == 2);
+	const bool bUseNormalConfidenceFade = SceneLighting.bUseNormalConfidenceFade;
 
 	// GeometryMode 1: pull the proxy mesh's CustomDepth out of the scene textures the renderer
 	// already produced this frame (populated only if at least one primitive has "Render CustomDepth
@@ -627,7 +669,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			ERDGPassFlags::Raster,
 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal](FRHICommandListImmediate& RHICmdList)
+			 CurrentDebugForceLODLevel, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
+			 bUseNormalConfidenceFade](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
@@ -832,7 +875,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 					// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
 					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
-						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, bOutputDepth, bOutputNormal);
+						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, bOutputDepth, bOutputNormal,
+						bUseNormalConfidenceFade);
 				}
 				else
 				{
@@ -917,7 +961,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					// Single draw call for ALL proxies (capped to render budget)
 					FGaussianSplatRenderer::DrawSplatsGlobal(
 						RHICmdList, *SceneView, RawAccumulator,
-						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode, bOutputDepth, bOutputNormal);
+						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode, bOutputDepth, bOutputNormal,
+						bUseNormalConfidenceFade);
 				}
 			}
 		);
@@ -939,12 +984,18 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		Pass2Parameters->NormalAccumTexture = bOutputNormal ? NormalAccumTexture : IntermediateTexture;
 		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
 
+		// FGaussianSceneLighting (16 lights + many scalar fields) is too large to capture by
+		// value in the lambda below — RDG caps lambda capture size at 1024 bytes and this struct
+		// has grown past that combined with the other captures. Heap-allocate a copy and capture
+		// a TSharedRef (just a pointer) instead; CompositeToSceneColor still gets the full struct.
+		TSharedRef<FGaussianSceneLighting> SceneLightingRef = MakeShared<FGaussianSceneLighting>(SceneLighting);
+
 		GraphBuilder.AddPass(
 			RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
 			Pass2Parameters,
 			ERDGPassFlags::Raster,
 			[SceneView, IntermediateTexture, DepthAccumTexture, CustomDepthTexture, NormalAccumTexture,
-			 bOutputDepth, bOutputNormal, SceneLighting](FRHICommandListImmediate& RHICmdList)
+			 bOutputDepth, bOutputNormal, SceneLightingRef](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 
@@ -959,7 +1010,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				FRHITexture* NormalAccumRHI = (bOutputNormal && NormalAccumTexture) ? NormalAccumTexture->GetRHI() : nullptr;
 
 				FGaussianSplatRenderer::CompositeToSceneColor(
-					RHICmdList, *SceneView, IntermediateRHI, DepthAccumRHI, CustomDepthRHI, NormalAccumRHI, SceneLighting);
+					RHICmdList, *SceneView, IntermediateRHI, DepthAccumRHI, CustomDepthRHI, NormalAccumRHI, *SceneLightingRef);
 			}
 		);
 }

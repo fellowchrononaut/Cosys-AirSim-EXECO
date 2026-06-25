@@ -32,12 +32,15 @@ namespace
 void UNanoGSLightingSettings::ApplyToCVars() const
 {
 	SetCVarInt  (TEXT("gs.LightingGeometryMode"),  (int32)GeometryMode);
+	SetCVarInt  (TEXT("gs.LightingDebugView"),     bShowReconstructedNormals ? 1 : 0);
 	SetCVarFloat(TEXT("gs.LightingBlend"),         LightingBlend);
 	SetCVarFloat(TEXT("gs.AmbientIntensity"),      AmbientIntensity);
 	SetCVarFloat(TEXT("gs.LightIntensityScale"),   LightIntensityScale);
 	SetCVarFloat(TEXT("gs.LightResponseCeiling"),  LightResponseCeiling);
 	SetCVarFloat(TEXT("gs.RelightRatioMin"),       RelightRatioMin);
 	SetCVarFloat(TEXT("gs.RelightRatioMax"),       RelightRatioMax);
+	SetCVarInt  (TEXT("gs.UseRelightRatio"),       bUseRelightRatio ? 1 : 0);
+	SetCVarInt  (TEXT("gs.NormalConfidenceFade"),  bNormalConfidenceFade ? 1 : 0);
 	SetCVarInt  (TEXT("gs.NormalSampleStep"),      NormalSampleStep);
 	SetCVarInt  (TEXT("gs.NormalSmoothRadius"),    NormalSmoothRadius);
 	SetCVarFloat(TEXT("gs.NormalSmoothDepthSigma"), NormalSmoothDepthSigma);

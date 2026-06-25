@@ -79,7 +79,7 @@ void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
 	viewData.ClusterID = clusterID;
 	viewData.Padding = lodLevel;
 	viewData.SplatNormal = float3(0, 0, 0);
-	viewData.SplatNormalPad = 0;
+	viewData.SplatNormalConfidence = 0;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 
@@ -135,6 +135,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	{
 		splatNormal = -splatNormal;
 	}
+	float splatNormalConfidence = CalcSplatNormalConfidence(scale);
 	float3x3 viewMat = (float3x3)WorldToView;
 	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
 
@@ -231,7 +232,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	viewData.ClusterID = selectedClusterID;
 	viewData.Padding = selectedLODLevel;
 	viewData.SplatNormal = splatNormal;
-	viewData.SplatNormalPad = 0;
+	viewData.SplatNormalConfidence = splatNormalConfidence;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 

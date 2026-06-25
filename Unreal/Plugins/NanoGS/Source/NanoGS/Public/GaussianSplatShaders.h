@@ -220,6 +220,9 @@ class FGaussianSplatPS : public FGlobalShader
 		SHADER_PARAMETER(FVector3f, PreViewTranslation)
 		// Previous frame's PreViewTranslation for correct velocity calculation
 		SHADER_PARAMETER(FVector3f, PrevPreViewTranslation)
+		// GeometryMode 2: weight NormalAccum by per-splat normal confidence (fades lighting back
+		// toward unlit for near-isotropic splats whose "thinnest axis" pick is unreliable).
+		SHADER_PARAMETER(uint32, UseNormalConfidenceFade)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -285,6 +288,7 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER(float,     LightResponseCeiling) // per-light contribution ceiling (raise past 1 for brighter lights)
 		SHADER_PARAMETER(float,     RelightRatioMin) // clamp floor for the brightness-preserving relight ratio
 		SHADER_PARAMETER(float,     RelightRatioMax) // clamp ceiling for the brightness-preserving relight ratio
+		SHADER_PARAMETER(uint32,    UseRelightRatio) // 1 = brightness-preserving ratio (default), 0 = old direct multiply
 		// Bilateral depth smoothing for normal reconstruction (removes per-splat scatter)
 		SHADER_PARAMETER(uint32,    NormalSmoothRadius)  // kernel radius in pixels; 0 = off
 		SHADER_PARAMETER(float,     NormalSmoothFrac)    // depth-similarity sigma as fraction of view depth
@@ -295,6 +299,9 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER_SAMPLER(SamplerState, CustomDepthSampler)
 		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZTransform)
 		SHADER_PARAMETER(uint32,    GeometryMode)        // 0 = splat depth-accum, 1 = proxy mesh CustomDepth
+		// Diagnostic visualization for the active GeometryMode's reconstructed geometry.
+		// 0 = off (default), 1 = show the reconstructed normal as an RGB color.
+		SHADER_PARAMETER(uint32,    DebugView)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

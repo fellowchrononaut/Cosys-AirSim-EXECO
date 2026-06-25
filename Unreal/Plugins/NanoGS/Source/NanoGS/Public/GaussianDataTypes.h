@@ -152,8 +152,11 @@ struct FGaussianSplatViewData
 	 *  instead of reconstructing a normal from screen-space depth. */
 	FVector3f SplatNormal = FVector3f::ZeroVector;
 
-	/** Padding after SplatNormal for 16-byte alignment */
-	float SplatNormalPad = 0.0f;
+	/** Confidence [0,1] that SplatNormal's "thinnest axis" choice is reliable: low when the
+	 *  splat is close to isotropic (no clear thin axis), where the choice is essentially a
+	 *  coin-flip and the normal is unstable between neighboring splats. Used to fade lighting
+	 *  back toward unlit for low-confidence splats instead of trusting a noisy normal. */
+	float SplatNormalConfidence = 0.0f;
 };
 
 /**

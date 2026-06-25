@@ -59,6 +59,13 @@ public:
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting")
 	ENanoGSLightingGeometryMode GeometryMode = ENanoGSLightingGeometryMode::SplatDepth;
 
+	/** Diagnostic: show the active GeometryMode's reconstructed world-space normal as an RGB
+	 *  color instead of lighting the splat. Works even with Lighting Blend at 0 / no scene
+	 *  lights — useful for checking whether normals look correct before tuning lighting.
+	 *  (gs.LightingDebugView) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting")
+	bool bShowReconstructedNormals = false;
+
 	/** 0 = unlit (original splat appearance), 1 = fully lit by the scene's lights. (gs.LightingBlend) */
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting",
 		meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
@@ -94,6 +101,21 @@ public:
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting",
 		meta = (ClampMin = "1.0", ClampMax = "4.0", UIMin = "1.0", UIMax = "3.0"))
 	float RelightRatioMax = 1.6f;
+
+	/** Brightness-preserving relight blend (recommended): multiplies by actual/neutral shading so
+	 *  the splat's already-baked color doesn't get double-shaded. Uncheck to use the old direct
+	 *  multiply by the absolute light level instead — simpler, but darkens/blows out more easily.
+	 *  Kept as an opt-out for comparison. (gs.UseRelightRatio) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting")
+	bool bUseRelightRatio = true;
+
+	/** GeometryMode 2 (Per-Splat Normal) only. Weights the per-splat normal accumulation by each
+	 *  splat's confidence — low for near-isotropic splats whose "thinnest axis" pick is essentially
+	 *  a coin-flip, which otherwise causes salt-and-pepper dark speckling where unstable normals
+	 *  randomly face away from lights. Pixels dominated by low-confidence splats fade back toward
+	 *  the unlit splat color instead of trusting a noisy normal. (gs.NormalConfidenceFade) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting|Normal Smoothing")
+	bool bNormalConfidenceFade = true;
 
 	/** Normal baseline (pixels): the surface slope is measured between samples this far apart.
 	 *  Higher = flatter, less noisy surfaces (the main fix for the "noisy SfM mesh" look). (gs.NormalSampleStep) */

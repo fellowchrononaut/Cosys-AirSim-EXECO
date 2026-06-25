@@ -24,7 +24,7 @@ struct FGaussianSplatViewData
 	uint ClusterID;            // Cluster ID for debug visualization
 	uint Padding;              // Padding for 16-byte alignment
 	float3 SplatNormal;        // Analytic per-splat normal (world space, camera-facing), GeometryMode 2
-	float SplatNormalPad;      // Padding for 16-byte alignment
+	float SplatNormalConfidence; // [0,1] confidence the thinnest-axis choice is reliable (see CalcSplatNormalConfidence)
 };
 
 // Chunk info for quantized data (must match C++ FGaussianChunkInfo)
@@ -205,6 +205,20 @@ float3 CalcSplatLocalNormal(float4 rotation, float3 scale)
 	if (scale.z < minScale) { minScale = scale.z; minIdx = 2; }
 
 	return float3(R[0][minIdx], R[1][minIdx], R[2][minIdx]);
+}
+
+// Confidence that CalcSplatLocalNormal's thinnest-axis pick is reliable. A clean disc-shaped
+// splat has one scale much smaller than the other two (clear thin axis). A near-isotropic splat
+// has its two smallest scales close together, so which one wins is essentially a coin-flip that
+// can differ between neighboring splats representing the same physical surface — exactly the
+// "speckled" noise this is meant to catch. Returns 0 (no confidence, fully ambiguous) to 1
+// (smallest scale is negligible next to the middle one, thin axis is unambiguous).
+float CalcSplatNormalConfidence(float3 scale)
+{
+	float lo  = min(scale.x, min(scale.y, scale.z));
+	float hi  = max(scale.x, max(scale.y, scale.z));
+	float mid = scale.x + scale.y + scale.z - lo - hi;
+	return saturate((mid - lo) / max(mid, 1e-6));
 }
 
 // Project 3D covariance to 2D screen space using EWA splatting formula

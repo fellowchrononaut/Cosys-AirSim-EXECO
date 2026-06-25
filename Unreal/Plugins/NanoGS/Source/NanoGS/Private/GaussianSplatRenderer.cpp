@@ -1174,7 +1174,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	int32 TotalSplatCount,
 	int32 DebugMode,
 	bool bOutputDepth,
-	bool bOutputNormal)
+	bool bOutputNormal,
+	bool bUseNormalConfidenceFade)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal);
 
@@ -1275,6 +1276,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 
 	FGaussianSplatPS::FParameters PSParameters;
 	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+	PSParameters.UseNormalConfidenceFade = bUseNormalConfidenceFade ? 1u : 0u;
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 
 	RHICmdList.SetStreamSource(0, nullptr, 0);
@@ -1644,7 +1646,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	FBufferRHIRef IndexBuffer,
 	int32 DebugMode,
 	bool bOutputDepth,
-	bool bOutputNormal)
+	bool bOutputNormal,
+	bool bUseNormalConfidenceFade)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect);
 
@@ -1745,6 +1748,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 
 	FGaussianSplatPS::FParameters PSParameters;
 	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+	PSParameters.UseNormalConfidenceFade = bUseNormalConfidenceFade ? 1u : 0u;
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 
 	RHICmdList.SetStreamSource(0, nullptr, 0);
@@ -2060,6 +2064,7 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.NormalAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	PSParameters.InvDeviceZToWorldZTransform = Lighting.InvDeviceZToWorldZTransform;
 	PSParameters.GeometryMode = (uint32)Lighting.GeometryMode;
+	PSParameters.DebugView = (uint32)Lighting.DebugView;
 	PSParameters.InvViewMatrix   = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	{
 		// FocalLength in pixels, matching CalcViewData (M00/M11 are jitter-independent).
@@ -2078,6 +2083,7 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.LightResponseCeiling = Lighting.ResponseCeiling;
 	PSParameters.RelightRatioMin = Lighting.RelightRatioMin;
 	PSParameters.RelightRatioMax = Lighting.RelightRatioMax;
+	PSParameters.UseRelightRatio = Lighting.bUseRelightRatio ? 1u : 0u;
 	PSParameters.NormalSmoothRadius  = (uint32)Lighting.NormalSmoothRadius;
 	PSParameters.NormalSmoothFrac    = Lighting.NormalSmoothFrac;
 	PSParameters.NormalSampleStep    = (uint32)Lighting.NormalSampleStep;

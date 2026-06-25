@@ -44,6 +44,7 @@ uint EnableNanite;  // 1=Nanite enabled, 0=disabled (non-Nanite assets hidden in
 float4x4 PrevTranslatedWorldToClip;  // Previous frame's un-jittered matrix for velocity
 float3 PreViewTranslation;           // Current frame's pre-view translation
 float3 PrevPreViewTranslation;       // Previous frame's pre-view translation
+uint   UseNormalConfidenceFade;      // GeometryMode 2: weight NormalAccum by per-splat confidence
 #endif
 
 // Convert HSV to RGB (Nanite-style saturated colors)
@@ -97,7 +98,7 @@ struct FVertexOutput
 	uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
 	float3 TranslatedWorldPos : TEXCOORD3;  // For velocity calculation in pixel shader
 	float4 CenterClipPos : TEXCOORD4;       // Splat center clip position for velocity (Nanite-style)
-	float3 SplatNormal : TEXCOORD5;         // Analytic per-splat normal (world space), GeometryMode 2
+	float4 SplatNormal : TEXCOORD5;         // xyz = analytic per-splat normal (world space), w = confidence [0,1]
 };
 
 // Pixel shader output with velocity for TAA/TSR
@@ -147,7 +148,7 @@ FVertexOutput MainVS(
 	Output.DebugFlag = 0;
 	Output.TranslatedWorldPos = viewData.TranslatedWorldPos;
 	Output.CenterClipPos = viewData.ClipPosition;
-	Output.SplatNormal = viewData.SplatNormal;
+	Output.SplatNormal = float4(viewData.SplatNormal, viewData.SplatNormalConfidence);
 
 	// Check validity (w <= 0 means invalid/behind camera)
 	if (viewData.ClipPosition.w <= 0.0)
@@ -158,7 +159,7 @@ FVertexOutput MainVS(
 		Output.Color = float4(0, 0, 0, 0);
 		Output.TranslatedWorldPos = float3(0, 0, 0);
 		Output.CenterClipPos = float4(0, 0, 0, 1);
-		Output.SplatNormal = float3(0, 0, 0);
+		Output.SplatNormal = float4(0, 0, 0, 0);
 		return Output;
 	}
 
@@ -300,8 +301,14 @@ FPixelOutput MainPS(FVertexOutput Input)
 #endif
 #if OUTPUT_NORMAL
 	// Accumulate alpha-weighted analytic normal (GeometryMode 2), same premultiplied-"over"
-	// pattern as DepthAccum above: composite recovers normalize(sum(N*a*T) / sum(a*T)).
-	Output.NormalAccum = float4(Input.SplatNormal * color.a, color.a);
+	// pattern as DepthAccum above: composite recovers normalize(sum(N*w*T) / sum(w*T)).
+	// When UseNormalConfidenceFade is set, w = alpha * confidence instead of just alpha, so
+	// splats with an unreliable (near-isotropic) thinnest-axis pick contribute less to the
+	// average normal — and pixels where every contributing splat is low-confidence end up with
+	// a near-zero total weight, which the composite pass already treats as "no coverage" and
+	// fades back to the unlit splat color instead of trusting a noisy normal.
+	float normalWeight = color.a * ((UseNormalConfidenceFade != 0) ? Input.SplatNormal.w : 1.0);
+	Output.NormalAccum = float4(Input.SplatNormal.xyz * normalWeight, normalWeight);
 #endif
 	return Output;
 }

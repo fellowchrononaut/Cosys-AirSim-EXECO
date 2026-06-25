@@ -32,6 +32,8 @@ struct FGaussianSceneLighting
 	float     ResponseCeiling = 1.f;  // per-light contribution ceiling; raise past 1 for brighter lights
 	float     RelightRatioMin = 0.6f; // clamp floor for the brightness-preserving relight ratio
 	float     RelightRatioMax = 1.6f; // clamp ceiling for the brightness-preserving relight ratio
+	bool      bUseRelightRatio = true; // false = old direct multiply by absolute light level
+	bool      bUseNormalConfidenceFade = true; // GeometryMode 2: weight NormalAccum by per-splat confidence
 	// Bilateral depth smoothing for normal reconstruction (removes per-splat depth scatter)
 	int32     NormalSmoothRadius = 2;     // kernel radius in pixels; 0 = off
 	float     NormalSmoothFrac   = 0.02f; // depth-similarity sigma as fraction of view depth
@@ -44,6 +46,11 @@ struct FGaussianSceneLighting
 	// Engine's per-frame DeviceZ->linear-view-Z transform (FSceneView::InvDeviceZToWorldZTransform),
 	// needed to linearize CustomDepth (GeometryMode == 1 only; unused for splat depth-accum).
 	FVector4f InvDeviceZToWorldZTransform = FVector4f(0, 0, 0, 0);
+
+	// Diagnostic visualization for the active GeometryMode's reconstructed geometry. 0 = off
+	// (default). 1 = show the reconstructed per-pixel normal as an RGB color. Bypasses the
+	// per-light loop and tonemap, and works even with LightingBlend at 0 / no scene lights.
+	int32     DebugView = 0;
 };
 
 class FGaussianSplatSceneProxy;
@@ -237,7 +244,8 @@ public:
 		int32 TotalSplatCount,
 		int32 DebugMode,
 		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
-		bool bOutputNormal = false   // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
+		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
+		bool bUseNormalConfidenceFade = true // GeometryMode 2: weight NormalAccum by per-splat confidence
 	);
 
 	//----------------------------------------------------------------------
@@ -320,7 +328,8 @@ public:
 		FBufferRHIRef IndexBuffer,
 		int32 DebugMode,
 		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
-		bool bOutputNormal = false   // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
+		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
+		bool bUseNormalConfidenceFade = true // GeometryMode 2: weight NormalAccum by per-splat confidence
 	);
 
 	/**
