@@ -223,6 +223,13 @@ class FGaussianSplatPS : public FGlobalShader
 		// GeometryMode 2: weight NormalAccum by per-splat normal confidence (fades lighting back
 		// toward unlit for near-isotropic splats whose "thinnest axis" pick is unreliable).
 		SHADER_PARAMETER(uint32, UseNormalConfidenceFade)
+		// Depth-proximity weighting (gs.DepthProximityWeighting), second-pass only: bound to the
+		// first pass's now-resolved depth accumulation so this pass can down-weight splats whose
+		// own depth doesn't match the known surface depth. Dummy texture + flag 0 elsewhere.
+		SHADER_PARAMETER_TEXTURE(Texture2D, CompletedDepthAccumTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, CompletedDepthAccumSampler)
+		SHADER_PARAMETER(uint32, UseDepthProximityWeight)
+		SHADER_PARAMETER(float, DepthProximitySigma)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -286,6 +293,7 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER(float,     LightingBlend)
 		SHADER_PARAMETER(float,     LightIntensityScale) // global sensitivity for per-light intensity
 		SHADER_PARAMETER(float,     LightResponseCeiling) // per-light contribution ceiling (raise past 1 for brighter lights)
+		SHADER_PARAMETER(float,     LightWrap) // wrap lighting: ndl_wrapped = (ndl + Wrap) / (1 + Wrap); 0 = off
 		SHADER_PARAMETER(float,     RelightRatioMin) // clamp floor for the brightness-preserving relight ratio
 		SHADER_PARAMETER(float,     RelightRatioMax) // clamp ceiling for the brightness-preserving relight ratio
 		SHADER_PARAMETER(uint32,    UseRelightRatio) // 1 = brightness-preserving ratio (default), 0 = old direct multiply
@@ -293,6 +301,7 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER(uint32,    NormalSmoothRadius)  // kernel radius in pixels; 0 = off
 		SHADER_PARAMETER(float,     NormalSmoothFrac)    // depth-similarity sigma as fraction of view depth
 		SHADER_PARAMETER(uint32,    NormalSampleStep)    // central-difference baseline (pixels) for the normal
+		SHADER_PARAMETER(uint32,    UseNormalConfidenceFade) // GeometryMode 0/1: fade lighting by depth-neighbourhood confidence
 		// Proxy-mesh geometry mode (GeometryMode == 1): a hidden mesh's CustomDepth, reconstructed
 		// with the engine's own DeviceZ->linear-Z transform instead of the splat depth accumulation.
 		SHADER_PARAMETER_TEXTURE(Texture2D, CustomDepthTexture)

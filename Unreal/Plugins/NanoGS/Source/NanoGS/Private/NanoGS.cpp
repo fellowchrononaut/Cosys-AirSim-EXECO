@@ -34,6 +34,16 @@ BEGIN_SHADER_PARAMETER_STRUCT(FGaussianCompositePassParameters, )
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
 
+// Pass 1b (gs.DepthProximityWeighting, GeometryMode 2 only): re-rasterizes splats a second time,
+// after Pass 1's DepthAccumTexture is fully resolved, writing ONLY a depth-proximity-weighted
+// NormalAccum. DepthAccumTexture here is a read (RTV->SRV barrier); the render targets are
+// throwaway color/velocity scratch (the per-splat PS always writes those two, regardless of
+// permutation) plus the real NormalAccumTexture.
+BEGIN_SHADER_PARAMETER_STRUCT(FGaussianNormalProximityPassParameters, )
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthAccumTexture)
+	RENDER_TARGET_BINDING_SLOTS()
+END_SHADER_PARAMETER_STRUCT()
+
 //----------------------------------------------------------------------
 // Console Variables for Gaussian Splatting
 //----------------------------------------------------------------------
@@ -144,6 +154,37 @@ TAutoConsoleVariable<int32> CVarGSNormalConfidenceFade(
 	TEXT("normal. 0: ignore confidence (original behavior)."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<float> CVarGSLightWrap(
+	TEXT("gs.LightWrap"),
+	0.3f,
+	TEXT("Wrap lighting (Penner/Half-Lambert generalization): ndl_wrapped = (ndl + Wrap) / (1 + Wrap),\n")
+	TEXT("applied to the two-sided abs(NdotL) term. Lifts the floor near the terminator so it fades\n")
+	TEXT("into shadow instead of bottoming out at a hard zero (which otherwise looks like a stark dark\n")
+	TEXT("ring/line with bright lobes on both sides, since splats use two-sided abs(NdotL) to stay\n")
+	TEXT("robust to ambiguous/flipped normals). 0 = off (original hard terminator). Default 0.3."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<int32> CVarGSDepthProximityWeighting(
+	TEXT("gs.DepthProximityWeighting"),
+	0,
+	TEXT("GeometryMode 2 (per-splat normal) only. 1: re-rasterizes splats a SECOND time, after the\n")
+	TEXT("depth-accumulation MRT from the first pass is fully resolved, weighting each splat's normal\n")
+	TEXT("contribution by how close its own depth is to the now-known reconstructed surface depth.\n")
+	TEXT("Suppresses background/secondary splats (visible through a semi-transparent foreground\n")
+	TEXT("splat) from polluting that pixel's normal with a stable-but-wrong orientation — a different\n")
+	TEXT("failure mode than gs.NormalConfidenceFade's near-isotropic-axis noise. Roughly doubles the\n")
+	TEXT("splat-draw cost for GeometryMode 2. 0 (default): off, normal accumulation happens once in\n")
+	TEXT("the same pass as depth/color."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<float> CVarGSDepthProximitySigma(
+	TEXT("gs.DepthProximitySigma"),
+	0.05f,
+	TEXT("Depth-similarity sigma (fraction of view depth) for gs.DepthProximityWeighting's per-splat\n")
+	TEXT("proximity falloff. Smaller = more aggressively rejects splats whose depth differs from the\n")
+	TEXT("resolved surface depth. Default 0.05 (5%% of depth)."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<int32> CVarGSNormalSmoothRadius(
 	TEXT("gs.NormalSmoothRadius"),
 	2,
@@ -212,10 +253,13 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 	Out.AmbientColor = FVector3f(Amb, Amb, Amb);
 	Out.IntensityScale = CVarGSLightIntensityScale.GetValueOnRenderThread();
 	Out.ResponseCeiling = CVarGSLightResponseCeiling.GetValueOnRenderThread();
+	Out.LightWrap = FMath::Clamp(CVarGSLightWrap.GetValueOnRenderThread(), 0.f, 1.f);
 	Out.RelightRatioMin = CVarGSRelightRatioMin.GetValueOnRenderThread();
 	Out.RelightRatioMax = FMath::Max(CVarGSRelightRatioMax.GetValueOnRenderThread(), Out.RelightRatioMin);
 	Out.bUseRelightRatio = CVarGSUseRelightRatio.GetValueOnRenderThread() != 0;
 	Out.bUseNormalConfidenceFade = CVarGSNormalConfidenceFade.GetValueOnRenderThread() != 0;
+	Out.bDepthProximityWeighting = CVarGSDepthProximityWeighting.GetValueOnRenderThread() != 0;
+	Out.DepthProximitySigma = FMath::Max(CVarGSDepthProximitySigma.GetValueOnRenderThread(), 0.f);
 	Out.NormalSmoothRadius = FMath::Clamp(CVarGSNormalSmoothRadius.GetValueOnRenderThread(), 0, 6);
 	Out.NormalSmoothFrac = FMath::Max(CVarGSNormalSmoothFrac.GetValueOnRenderThread(), 0.f);
 	Out.NormalSampleStep = FMath::Clamp(CVarGSNormalSampleStep.GetValueOnRenderThread(), 1, 16);
@@ -457,6 +501,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// GeometryMode 2 only: alpha-weighted per-splat analytic normal accumulation.
 	const bool bOutputNormal = bLightingActive && (SceneLighting.GeometryMode == 2);
 	const bool bUseNormalConfidenceFade = SceneLighting.bUseNormalConfidenceFade;
+	// gs.DepthProximityWeighting: whether Pass 1b (a second, normal-only re-rasterization after
+	// Pass 1's depth accum is resolved) should run this frame. Decided properly once bAllNanite is
+	// known below (Pass 1b only supports the Nanite-compacted indirect-draw path — see Pass 1b setup).
+	bool bDepthProximityPass = bOutputNormal && SceneLighting.bDepthProximityWeighting;
 
 	// GeometryMode 1: pull the proxy mesh's CustomDepth out of the scene textures the renderer
 	// already produced this frame (populated only if at least one primitive has "Render CustomDepth
@@ -519,7 +567,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	{
 		Pass1Parameters->RenderTargets[2] = FRenderTargetBinding(DepthAccumTexture, ERenderTargetLoadAction::EClear);
 	}
-	// RT3: normal accumulation (GeometryMode 2 binds both RT2 depth accum and RT3 normal accum)
+	// RT3: normal accumulation (GeometryMode 2 binds both RT2 depth accum and RT3 normal accum).
+	// When gs.DepthProximityWeighting is active, Pass 1b re-clears and overwrites this with a
+	// depth-proximity-weighted version once DepthAccum is resolved — Pass 1's write here is
+	// then wasted but harmless (cheap relative to the second draw call Pass 1b already costs).
 	if (bOutputNormal)
 	{
 		Pass1Parameters->RenderTargets[3] = FRenderTargetBinding(NormalAccumTexture, ERenderTargetLoadAction::EClear);
@@ -606,6 +657,11 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		{
 			bAllNanite = false;
 		}
+
+		// Pass 1b (depth-proximity weighting) only supports the Nanite-compacted indirect-draw
+		// path: it needs to re-issue the exact same draw using the GPU-resident indirect args
+		// buffer, with no CPU-known splat count to fall back to for the non-compaction path.
+		bDepthProximityPass = bDepthProximityPass && bAllNanite;
 
 		if (TotalSplatCount == 0)
 		{
@@ -966,6 +1022,64 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				}
 			}
 		);
+
+		// Pass 1b (gs.DepthProximityWeighting): re-rasterize the same already-sorted splats a
+		// second time, now that Pass 1's DepthAccumTexture is fully resolved, so each splat's
+		// normal contribution can be weighted by how close its own depth is to the known surface
+		// depth — suppresses background/secondary splats bleeding through a semi-transparent
+		// foreground splat from polluting that pixel's normal. Reuses the same sorted/indirect
+		// draw data Pass 1 just built (no re-sort, no CalcViewData), so the extra cost is just the
+		// second raster+blend pass. Only supports the Nanite-compacted indirect path (bAllNanite).
+		if (bDepthProximityPass)
+		{
+			// The per-splat PS always writes Color+Velocity (SV_Target0/1) regardless of
+			// permutation; this pass only cares about NormalAccum, so bind throwaway scratch
+			// targets for the other two and let RDG discard them (nothing reads them afterward).
+			FRDGTextureDesc ScratchColorDesc = FRDGTextureDesc::Create2D(
+				ColorTexture->Desc.Extent,
+				PF_FloatRGBA,
+				FClearValueBinding(FLinearColor::Transparent),
+				TexCreate_RenderTargetable | TexCreate_ShaderResource);
+			FRDGTexture* ScratchColorTexture = GraphBuilder.CreateTexture(ScratchColorDesc, TEXT("GaussianSplatScratchColorRT"));
+
+			FRDGTexture* ScratchVelocityTexture = GraphBuilder.CreateTexture(VelocityTexture->Desc, TEXT("GaussianSplatScratchVelocityRT"));
+
+			FGaussianNormalProximityPassParameters* Pass1bParameters = GraphBuilder.AllocParameters<FGaussianNormalProximityPassParameters>();
+			Pass1bParameters->DepthAccumTexture = DepthAccumTexture;  // read barrier: RTV(Pass 1) -> SRV(Pass 1b)
+			Pass1bParameters->RenderTargets[0] = FRenderTargetBinding(ScratchColorTexture, ERenderTargetLoadAction::EClear);
+			Pass1bParameters->RenderTargets[1] = FRenderTargetBinding(ScratchVelocityTexture, ERenderTargetLoadAction::EClear);
+			Pass1bParameters->RenderTargets[2] = FRenderTargetBinding(NormalAccumTexture, ERenderTargetLoadAction::EClear);
+			if (DepthTexture)
+			{
+				Pass1bParameters->RenderTargets.DepthStencil = FDepthStencilBinding(
+					DepthTexture,
+					ERenderTargetLoadAction::ELoad,
+					ERenderTargetLoadAction::ELoad,
+					FExclusiveDepthStencil::DepthWrite_StencilWrite
+				);
+			}
+
+			FGaussianGlobalAccumulator* RawAccumulatorForProximity = GlobalAccumulator.Get();
+			const float DepthProximitySigma = SceneLighting.DepthProximitySigma;
+
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("GaussianSplat_NormalDepthProximity"),
+				Pass1bParameters,
+				ERDGPassFlags::Raster,
+				[SceneView, RawAccumulatorForProximity, SharedIndexBuffer, DebugMode,
+				 bUseNormalConfidenceFade, DepthAccumTexture, DepthProximitySigma](FRHICommandListImmediate& RHICmdList)
+				{
+					if (!SceneView || !RawAccumulatorForProximity) return;
+					FRHITexture* DepthAccumRHI = DepthAccumTexture ? DepthAccumTexture->GetRHI() : nullptr;
+					if (!DepthAccumRHI) return;
+
+					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
+						RHICmdList, *SceneView, RawAccumulatorForProximity, SharedIndexBuffer, DebugMode,
+						/*bOutputDepth=*/false, /*bOutputNormal=*/true, bUseNormalConfidenceFade,
+						DepthAccumRHI, DepthProximitySigma);
+				}
+			);
+		}
 
 		// Pass 2: Composite intermediate sRGB RT onto SceneColor (sRGB → linear conversion +
 		// optional screen-space lighting from the alpha-weighted depth accumulation).

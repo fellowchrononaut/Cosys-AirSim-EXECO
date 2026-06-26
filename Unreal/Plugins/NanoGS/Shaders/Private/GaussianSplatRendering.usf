@@ -45,6 +45,17 @@ float4x4 PrevTranslatedWorldToClip;  // Previous frame's un-jittered matrix for 
 float3 PreViewTranslation;           // Current frame's pre-view translation
 float3 PrevPreViewTranslation;       // Previous frame's pre-view translation
 uint   UseNormalConfidenceFade;      // GeometryMode 2: weight NormalAccum by per-splat confidence
+// Depth-proximity weighting (gs.DepthProximityWeighting): bound only on the second, normal-only
+// re-rasterization pass, after DepthAccum from the first pass is fully resolved. Weights each
+// splat's normal contribution by how close its own depth (ViewZ below) is to the now-known
+// reconstructed surface depth at that pixel — suppresses background/secondary splats visible
+// through a semi-transparent foreground splat from polluting the average with a stable-but-wrong
+// orientation. Texture2D is bound to a harmless dummy and the flag left 0 on the normal pass's
+// first/combined-pass use, so this branch is inert there.
+Texture2D    CompletedDepthAccumTexture;
+SamplerState CompletedDepthAccumSampler;
+uint         UseDepthProximityWeight;
+float        DepthProximitySigma;
 #endif
 
 // Convert HSV to RGB (Nanite-style saturated colors)
@@ -291,12 +302,14 @@ FPixelOutput MainPS(FVertexOutput Input)
 	Output.Color = color;
 	// Output velocity for TAA/TSR (Nanite-style encoding)
 	Output.Velocity = EncodeVelocityToTexture(Velocity);
-#if OUTPUT_DEPTH
-	// Accumulate alpha-weighted view-space depth. CenterClipPos.w is the splat center's
-	// linear view-space depth (clip.w under UE projection). color.a is the post-Gaussian
-	// per-fragment alpha (same weight the color blend uses). The .a output drives the
-	// premultiplied "over" blend factor on RT2.
+	// CenterClipPos.w is the splat center's linear view-space depth (clip.w under UE projection).
+	// Needed by OUTPUT_DEPTH (to accumulate it) and by OUTPUT_NORMAL's depth-proximity weighting
+	// (to compare it against the already-resolved surface depth), so compute it unconditionally.
 	float ViewZ = Input.CenterClipPos.w;
+#if OUTPUT_DEPTH
+	// Accumulate alpha-weighted view-space depth. color.a is the post-Gaussian per-fragment alpha
+	// (same weight the color blend uses). The .a output drives the premultiplied "over" blend
+	// factor on RT2.
 	Output.DepthAccum = float4(ViewZ * color.a, color.a, 0.0, color.a);
 #endif
 #if OUTPUT_NORMAL
@@ -308,6 +321,25 @@ FPixelOutput MainPS(FVertexOutput Input)
 	// a near-zero total weight, which the composite pass already treats as "no coverage" and
 	// fades back to the unlit splat color instead of trusting a noisy normal.
 	float normalWeight = color.a * ((UseNormalConfidenceFade != 0) ? Input.SplatNormal.w : 1.0);
+	if (UseDepthProximityWeight != 0)
+	{
+		// Second-pass-only: DepthAccum from the first pass is now fully resolved, so we know the
+		// pixel's actual reconstructed surface depth. Splats far from it (e.g. a background splat
+		// peeking through a semi-transparent foreground one) get down-weighted instead of
+		// confidently contributing a normal that belongs to the wrong surface.
+		float2 da = CompletedDepthAccumTexture.Load(int3((int2)Input.Position.xy, 0)).rg;
+		if (da.g > 1e-6)
+		{
+			float surfaceZ = da.r / da.g;
+			float dz = ViewZ - surfaceZ;
+			float sigma = max(DepthProximitySigma * surfaceZ, 1e-3);
+			normalWeight *= exp(-dz * dz / (2.0 * sigma * sigma));
+		}
+		else
+		{
+			normalWeight = 0.0;  // no resolved surface here — nothing to compare against, don't trust it
+		}
+	}
 	Output.NormalAccum = float4(Input.SplatNormal.xyz * normalWeight, normalWeight);
 #endif
 	return Output;

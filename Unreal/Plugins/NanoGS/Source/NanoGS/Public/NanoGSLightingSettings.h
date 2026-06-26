@@ -88,6 +88,15 @@ public:
 		meta = (ClampMin = "0.1", ClampMax = "8.0", UIMin = "1.0", UIMax = "4.0"))
 	float LightResponseCeiling = 1.0f;
 
+	/** Splats use two-sided lighting (abs(NdotL)) since their normal's sign isn't guaranteed
+	 *  correct — without this, that creates a hard, symmetric dark ring/line exactly at the
+	 *  terminator (bright on both sides) instead of a smooth fade into shadow. Wrap lighting
+	 *  lifts that floor: 0 = original hard terminator, higher = softer/more gradual transition.
+	 *  (gs.LightWrap) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting",
+		meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float LightWrap = 0.3f;
+
 	/** Clamp floor for the brightness-preserving relight ratio. Splat colors are already a baked,
 	 *  lit appearance, not raw albedo — this lets directional shading vary that baked brightness
 	 *  within [Min, Max] instead of multiplying by the absolute light level (which double-shades
@@ -116,6 +125,17 @@ public:
 	 *  the unlit splat color instead of trusting a noisy normal. (gs.NormalConfidenceFade) */
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting|Normal Smoothing")
 	bool bNormalConfidenceFade = true;
+
+	/** GeometryMode 2 (Per-Splat Normal) only. Re-rasterizes splats a SECOND time, after the
+	 *  first pass's depth is fully resolved, weighting each splat's normal contribution by how
+	 *  close its own depth is to the now-known surface depth — suppresses background/secondary
+	 *  splats (visible through a semi-transparent foreground splat) from polluting that pixel's
+	 *  normal with a stable-but-wrong orientation. A different failure mode than the confidence
+	 *  fade above (which targets near-isotropic axis-pick noise, not background bleed-through).
+	 *  Roughly doubles the splat-draw cost for GeometryMode 2 — off by default.
+	 *  (gs.DepthProximityWeighting) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting|Normal Smoothing")
+	bool bDepthProximityWeighting = false;
 
 	/** Normal baseline (pixels): the surface slope is measured between samples this far apart.
 	 *  Higher = flatter, less noisy surfaces (the main fix for the "noisy SfM mesh" look). (gs.NormalSampleStep) */

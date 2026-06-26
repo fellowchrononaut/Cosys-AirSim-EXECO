@@ -36,12 +36,14 @@ float3 AmbientColor;
 float  LightingBlend;
 float  LightIntensityScale;                // global sensitivity for per-light intensity
 float  LightResponseCeiling;                // per-light contribution ceiling (raise past 1 for brighter lights)
+float  LightWrap;                           // wrap lighting: ndl_wrapped = (ndl + Wrap) / (1 + Wrap); 0 = off
 float  RelightRatioMin;                     // clamp floor for the brightness-preserving relight ratio
 float  RelightRatioMax;                     // clamp ceiling for the brightness-preserving relight ratio
 uint   UseRelightRatio;                     // 1 = brightness-preserving ratio (default), 0 = old direct multiply
 uint   NormalSmoothRadius;                 // bilateral depth-smoothing kernel radius (px); 0 = off
 float  NormalSmoothFrac;                    // depth-similarity sigma as fraction of view depth
 uint   NormalSampleStep;                    // central-difference baseline (px) for the normal
+uint   UseNormalConfidenceFade;             // GeometryMode 0/1: fade lighting by depth-neighbourhood confidence
 
 // GeometryMode 1: proxy-mesh CustomDepth (clean geometry, no per-splat depth scatter).
 // DeviceZ values, linearized with the engine's own DeviceZ->linear-view-Z transform.
@@ -87,14 +89,20 @@ float3 InverseACESTonemap(float3 color)
 // (linear) is recovered as r/g, then back-projected through the pinhole model (FocalLength)
 // to a view-space position, and transformed to world via InvViewMatrix.
 // View space: +X right, +Y up, +Z forward; pixel Y increases downward, hence the Y flip.
-// Bilateral-smoothed expected view-space depth at a pixel. Averages neighbouring expected
-// depths weighted by coverage and depth similarity, which suppresses the per-splat depth
-// scatter that otherwise makes reconstructed normals look like a noisy SfM mesh, while the
-// depth-similarity term preserves real silhouettes/creases. Returns false if no coverage.
-bool SmoothViewZ(int2 pixel, out float outZ)
+// Bilateral-smoothed expected view-space depth at a pixel, plus a [0,1] confidence: how
+// consistent the local depth neighbourhood is. A flat, coherent surface has neighbours that
+// agree closely (high confidence); a noisy/wrinkly region (the SfM-mesh-like per-splat depth
+// scatter) has high local variance (low confidence) — the same role gs.NormalConfidenceFade
+// already plays for GeometryMode 2's per-splat axis-pick instability, just measured from depth
+// variance instead of splat shape, since this path has no per-splat axis to query. Averages
+// neighbouring expected depths weighted by coverage and depth similarity, which suppresses the
+// per-splat depth scatter that otherwise makes reconstructed normals look like a noisy SfM mesh,
+// while the depth-similarity term preserves real silhouettes/creases. Returns false if no coverage.
+bool SmoothViewZ(int2 pixel, out float outZ, out float outConf)
 {
 	float2 daC = DepthAccumTexture.Load(int3(pixel, 0)).rg;
 	outZ = 0.0;
+	outConf = 1.0;
 	if (daC.g <= 1e-6)
 	{
 		return false;  // no coverage here
@@ -105,13 +113,14 @@ bool SmoothViewZ(int2 pixel, out float outZ)
 	if (R <= 0)
 	{
 		outZ = zC;
-		return true;
+		return true;  // no neighbourhood to measure variance over — assume confident
 	}
 
 	float sigma  = max(NormalSmoothFrac * zC, 1e-3);
 	float inv2s2 = 1.0 / (2.0 * sigma * sigma);
-	float wSum = 0.0;
-	float zSum = 0.0;
+	float wSum  = 0.0;
+	float zSum  = 0.0;
+	float zSqSum = 0.0;
 	[loop]
 	for (int dy = -R; dy <= R; ++dy)
 	{
@@ -123,11 +132,22 @@ bool SmoothViewZ(int2 pixel, out float outZ)
 			float z  = da.r / da.g;
 			float dz = z - zC;
 			float w  = da.g * exp(-dz * dz * inv2s2);  // coverage * depth-similarity
-			wSum += w;
-			zSum += z * w;
+			wSum   += w;
+			zSum   += z * w;
+			zSqSum += z * z * w;
 		}
 	}
 	outZ = (wSum > 0.0) ? (zSum / wSum) : zC;
+
+	if (wSum > 0.0)
+	{
+		float mean = zSum / wSum;
+		float variance = max(zSqSum / wSum - mean * mean, 0.0);
+		float stddev = sqrt(variance);
+		// Relative to the same sigma used for edge-preserving smoothing: a neighbourhood noisier
+		// than that "expected surface roughness" baseline is treated as low confidence.
+		outConf = saturate(1.0 - stddev / sigma);
+	}
 	return true;
 }
 
@@ -147,11 +167,11 @@ float3 ViewZAndPixelToWorld(int2 pixel, float viewZ)
 	return mul(float4(viewPos, 1.0), InvViewMatrix).xyz;    // row-major UE convention
 }
 
-bool ReconstructWorld(int2 pixel, out float3 worldPos)
+bool ReconstructWorld(int2 pixel, out float3 worldPos, out float outConf)
 {
 	worldPos = float3(0, 0, 0);
 	float viewZ;
-	if (!SmoothViewZ(pixel, viewZ))                        // expected (bilateral-smoothed) depth
+	if (!SmoothViewZ(pixel, viewZ, outConf))               // expected (bilateral-smoothed) depth
 	{
 		return false;  // no coverage here
 	}
@@ -170,10 +190,12 @@ float ConvertCustomDeviceZToViewZ(float DeviceZ)
 
 // GeometryMode 1: reconstruct from the hidden proxy mesh's CustomDepth instead of the splat's
 // own (noisy) depth accumulation. DeviceZ == 0 means no CustomDepth geometry at this pixel
-// (cleared/dummy texture), so we report no coverage exactly like ReconstructWorld does.
-bool ReconstructWorldFromCustomDepth(int2 pixel, out float3 worldPos)
+// (cleared/dummy texture), so we report no coverage exactly like ReconstructWorld does. The
+// proxy mesh is already clean geometry (no per-splat depth scatter), so confidence is always 1.
+bool ReconstructWorldFromCustomDepth(int2 pixel, out float3 worldPos, out float outConf)
 {
 	worldPos = float3(0, 0, 0);
+	outConf = 1.0;
 	float deviceZ = CustomDepthTexture.Load(int3(pixel, 0)).r;
 	if (deviceZ <= 0.0)
 	{
@@ -186,13 +208,13 @@ bool ReconstructWorldFromCustomDepth(int2 pixel, out float3 worldPos)
 
 // Dispatches to whichever geometry source GeometryMode selects. Both reconstruction paths feed
 // the same downstream normal/lighting code, so callers don't need to know which mode is active.
-bool ReconstructWorldAuto(int2 pixel, out float3 worldPos)
+bool ReconstructWorldAuto(int2 pixel, out float3 worldPos, out float outConf)
 {
 	if (GeometryMode == 1)
 	{
-		return ReconstructWorldFromCustomDepth(pixel, worldPos);
+		return ReconstructWorldFromCustomDepth(pixel, worldPos, outConf);
 	}
-	return ReconstructWorld(pixel, worldPos);
+	return ReconstructWorld(pixel, worldPos, outConf);
 }
 
 // GeometryMode 2: recover the alpha-weighted average per-splat analytic normal at a pixel.
@@ -202,8 +224,15 @@ bool ReconstructWorldAuto(int2 pixel, out float3 worldPos)
 // averages over the few splats that happened to land in that exact pixel — so it still shows
 // speckle. Bilateral-smoothed across neighbouring pixels (same depth-similarity weighting as
 // SmoothViewZ, reusing NormalSmoothRadius/NormalSmoothFrac) to average out that scatter, while
-// the depth-similarity term keeps silhouettes/creases from blurring together. Returns false
-// where there's no coverage.
+// the depth-similarity term keeps silhouettes/creases from blurring together.
+//
+// Neighbour-consistency: each pixel's camera-facing sign heuristic was decided independently at
+// splat-write time, so a neighbour can be confidently anti-parallel to the center rather than
+// just noisy. Summing it in as-is would partially cancel/bias the average instead of correcting
+// it, so each neighbour is flipped to agree with the center pixel's own (unsmoothed) sign before
+// it's weighted in — the same "orientation propagation" idea used for PCA normal sign ambiguity,
+// just using the center pixel as the local reference instead of building an explicit graph.
+// Returns false where there's no coverage.
 bool ReconstructNormalFromAccum(int2 pixel, out float3 normal)
 {
 	normal = float3(0, 0, 1);
@@ -213,10 +242,12 @@ bool ReconstructNormalFromAccum(int2 pixel, out float3 normal)
 		return false;
 	}
 
+	float3 nC = accumC.rgb / accumC.a;  // sign reference for neighbour consistency
+
 	int R = (int)NormalSmoothRadius;
 	if (R <= 0)
 	{
-		normal = normalize(accumC.rgb / accumC.a);
+		normal = normalize(nC);
 		return true;
 	}
 
@@ -248,12 +279,18 @@ bool ReconstructNormalFromAccum(int2 pixel, out float3 normal)
 					w *= exp(-dz * dz * inv2s2);  // depth-similarity (preserves edges/creases)
 				}
 			}
-			nSum += (accum.rgb / accum.a) * w;
+
+			float3 nNeighbor = accum.rgb / accum.a;
+			if (dot(nNeighbor, nC) < 0.0)
+			{
+				nNeighbor = -nNeighbor;  // align to local consensus instead of cancelling it out
+			}
+			nSum += nNeighbor * w;
 			wSum += w;
 		}
 	}
 
-	normal = (wSum > 0.0) ? normalize(nSum / wSum) : normalize(accumC.rgb / accumC.a);
+	normal = (wSum > 0.0) ? normalize(nSum / wSum) : normalize(nC);
 	return true;
 }
 
@@ -301,6 +338,13 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 		float3 N;
 		float3 wC;
 		bool bHaveGeometry;
+		// [0,1] fade for how much to trust the reconstructed normal at this pixel. GeometryMode 2
+		// already bakes its own confidence into NormalAccum's per-splat weighting, so it stays at
+		// 1 here; GeometryMode 0/1 derive it from local depth-neighbourhood consistency (see
+		// SmoothViewZ) so a noisy/wrinkly region fades toward the unlit splat color instead of
+		// shading from an unreliable normal — same intent as gs.NormalConfidenceFade in mode 2,
+		// applied to this path's only available signal.
+		float geometryConfidence = 1.0;
 
 		if (GeometryMode == 2)
 		{
@@ -308,7 +352,8 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 			// its own normal), so just read the center pixel's accumulated normal directly, and
 			// reuse GeometryMode 0's single-sample position reconstruction (same depth source).
 			float3 wCenter;
-			bHaveGeometry = ReconstructWorld(P, wCenter) && ReconstructNormalFromAccum(P, N);
+			float posConf;
+			bHaveGeometry = ReconstructWorld(P, wCenter, posConf) && ReconstructNormalFromAccum(P, N);
 			wC = wCenter;
 		}
 		else
@@ -317,10 +362,11 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 			// Central differences over a wide baseline: the normal is the surface slope between
 			// samples s pixels apart, which averages out per-splat depth waviness (free — no extra taps).
 			float3 wL, wR, wD, wU;
-			bool okL = ReconstructWorldAuto(P - int2(s, 0), wL);
-			bool okR = ReconstructWorldAuto(P + int2(s, 0), wR);
-			bool okD = ReconstructWorldAuto(P - int2(0, s), wD);
-			bool okU = ReconstructWorldAuto(P + int2(0, s), wU);
+			float confL, confR, confD, confU;
+			bool okL = ReconstructWorldAuto(P - int2(s, 0), wL, confL);
+			bool okR = ReconstructWorldAuto(P + int2(s, 0), wR, confR);
+			bool okD = ReconstructWorldAuto(P - int2(0, s), wD, confD);
+			bool okU = ReconstructWorldAuto(P + int2(0, s), wU, confU);
 			bHaveGeometry = okL && okR && okD && okU;
 
 			// Cross product gives a world-space normal (sign is arbitrary — we use abs NdotL)
@@ -329,6 +375,11 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 			// Surface position (for point/spot light vectors + attenuation): average of the
 			// four samples ≈ the center pixel's world position, free of an extra reconstruction.
 			wC = (wL + wR + wD + wU) * 0.25;
+
+			if (UseNormalConfidenceFade != 0)
+			{
+				geometryConfidence = min(min(confL, confR), min(confD, confU));
+			}
 		}
 
 		if (bHaveGeometry)
@@ -390,8 +441,14 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 					}
 				}
 
-				// Two-sided Lambert: splats have no fixed facing, so use abs(NdotL)
+				// Two-sided Lambert: splats have no fixed facing, so use abs(NdotL). Without wrap,
+				// this bottoms out at a hard zero exactly at the terminator (N perpendicular to
+				// Ldir) and ramps back up on the far side — a symmetric "V" that reads as a stark
+				// dark ring/line with bright lobes on both sides, not a smooth fade into shadow.
+				// Wrap lighting (Penner/Half-Lambert generalization) lifts that floor so it eases
+				// into shadow instead of hard-bottoming, while staying two-sided/sign-robust.
 				float ndl = abs(dot(N, Ldir));
+				ndl = saturate((ndl + LightWrap) / (1.0 + LightWrap));
 				// Soft-saturation response: maps [0,inf) intensity -> [0,LightResponseCeiling) so
 				// bright lights asymptote instead of hard-clipping. Ceiling > 1 lets strong lights
 				// keep getting brighter past the old fixed 1.0 cap; ceiling = 1 reproduces the
@@ -421,7 +478,7 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 			}
 
 			float3 litLinear = linearColor * lightTerm;
-			linearColor = lerp(linearColor, litLinear, LightingBlend);
+			linearColor = lerp(linearColor, litLinear, LightingBlend * geometryConfidence);
 		}
 	}
 

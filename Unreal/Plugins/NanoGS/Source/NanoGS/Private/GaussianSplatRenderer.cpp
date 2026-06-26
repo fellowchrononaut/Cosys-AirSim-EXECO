@@ -16,6 +16,7 @@
 #include "SceneView.h"
 #include "SceneRendering.h"  // For FViewInfo::ViewRect (screen percentage support)
 #include "RenderCore.h"
+#include "RenderUtils.h"  // GBlackTexture (dummy SRV for the inert/first-pass case of depth-proximity weighting)
 #include "CommonRenderResources.h"
 
 // Console variables (declared in GaussianSplatting.cpp)
@@ -1175,7 +1176,9 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	int32 DebugMode,
 	bool bOutputDepth,
 	bool bOutputNormal,
-	bool bUseNormalConfidenceFade)
+	bool bUseNormalConfidenceFade,
+	FRHITexture* CompletedDepthAccumTexture,
+	float DepthProximitySigma)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal);
 
@@ -1277,6 +1280,10 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	FGaussianSplatPS::FParameters PSParameters;
 	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
 	PSParameters.UseNormalConfidenceFade = bUseNormalConfidenceFade ? 1u : 0u;
+	PSParameters.CompletedDepthAccumTexture = CompletedDepthAccumTexture ? CompletedDepthAccumTexture : GBlackTexture->TextureRHI.GetReference();
+	PSParameters.CompletedDepthAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.UseDepthProximityWeight = CompletedDepthAccumTexture ? 1u : 0u;
+	PSParameters.DepthProximitySigma = DepthProximitySigma;
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 
 	RHICmdList.SetStreamSource(0, nullptr, 0);
@@ -1647,7 +1654,9 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	int32 DebugMode,
 	bool bOutputDepth,
 	bool bOutputNormal,
-	bool bUseNormalConfidenceFade)
+	bool bUseNormalConfidenceFade,
+	FRHITexture* CompletedDepthAccumTexture,
+	float DepthProximitySigma)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect);
 
@@ -1749,6 +1758,10 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	FGaussianSplatPS::FParameters PSParameters;
 	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
 	PSParameters.UseNormalConfidenceFade = bUseNormalConfidenceFade ? 1u : 0u;
+	PSParameters.CompletedDepthAccumTexture = CompletedDepthAccumTexture ? CompletedDepthAccumTexture : GBlackTexture->TextureRHI.GetReference();
+	PSParameters.CompletedDepthAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.UseDepthProximityWeight = CompletedDepthAccumTexture ? 1u : 0u;
+	PSParameters.DepthProximitySigma = DepthProximitySigma;
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 
 	RHICmdList.SetStreamSource(0, nullptr, 0);
@@ -2081,12 +2094,14 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.LightingBlend       = bGeometryReady ? Lighting.LightingBlend : 0.f;
 	PSParameters.LightIntensityScale = Lighting.IntensityScale;
 	PSParameters.LightResponseCeiling = Lighting.ResponseCeiling;
+	PSParameters.LightWrap = Lighting.LightWrap;
 	PSParameters.RelightRatioMin = Lighting.RelightRatioMin;
 	PSParameters.RelightRatioMax = Lighting.RelightRatioMax;
 	PSParameters.UseRelightRatio = Lighting.bUseRelightRatio ? 1u : 0u;
 	PSParameters.NormalSmoothRadius  = (uint32)Lighting.NormalSmoothRadius;
 	PSParameters.NormalSmoothFrac    = Lighting.NormalSmoothFrac;
 	PSParameters.NormalSampleStep    = (uint32)Lighting.NormalSampleStep;
+	PSParameters.UseNormalConfidenceFade = Lighting.bUseNormalConfidenceFade ? 1u : 0u;
 
 	// Fill flattened light arrays; zero-init all 16 slots first
 	for (int32 i = 0; i < FGaussianSceneLighting::MaxLights; ++i)

@@ -30,10 +30,23 @@ struct FGaussianSceneLighting
 	float     LightingBlend  = 0.f;   // 0 = unlit (original), 1 = fully lit
 	float     IntensityScale = 0.3f;  // global sensitivity: contribution = tint * Intensity * IntensityScale
 	float     ResponseCeiling = 1.f;  // per-light contribution ceiling; raise past 1 for brighter lights
+	// Wrap lighting (Penner/Half-Lambert generalization): ndl_wrapped = (ndl + Wrap) / (1 + Wrap).
+	// Lifts the floor of the two-sided abs(NdotL) term so it doesn't bottom out at a hard zero at
+	// the terminator (which otherwise reads as a stark dark ring/line with bright lobes on both
+	// sides) — softens the lit/unlit transition into a gentler fade. 0 = off (original behavior).
+	float     LightWrap = 0.3f;
 	float     RelightRatioMin = 0.6f; // clamp floor for the brightness-preserving relight ratio
 	float     RelightRatioMax = 1.6f; // clamp ceiling for the brightness-preserving relight ratio
 	bool      bUseRelightRatio = true; // false = old direct multiply by absolute light level
 	bool      bUseNormalConfidenceFade = true; // GeometryMode 2: weight NormalAccum by per-splat confidence
+	// GeometryMode 2 only. Re-rasterizes splats a second time, after the depth-accumulation MRT
+	// from the first pass is fully resolved, weighting each splat's normal contribution by how
+	// close its own depth is to the now-known reconstructed surface depth — suppresses background/
+	// secondary splats (visible through a semi-transparent foreground splat) from polluting that
+	// pixel's normal with a stable-but-wrong orientation. Roughly doubles the splat-draw cost for
+	// GeometryMode 2, so default off.
+	bool      bDepthProximityWeighting = false;
+	float     DepthProximitySigma = 0.05f; // depth-similarity sigma as a fraction of view depth
 	// Bilateral depth smoothing for normal reconstruction (removes per-splat depth scatter)
 	int32     NormalSmoothRadius = 2;     // kernel radius in pixels; 0 = off
 	float     NormalSmoothFrac   = 0.02f; // depth-similarity sigma as fraction of view depth
@@ -245,7 +258,9 @@ public:
 		int32 DebugMode,
 		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
 		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
-		bool bUseNormalConfidenceFade = true // GeometryMode 2: weight NormalAccum by per-splat confidence
+		bool bUseNormalConfidenceFade = true, // GeometryMode 2: weight NormalAccum by per-splat confidence
+		FRHITexture* CompletedDepthAccumTexture = nullptr, // 2nd-pass only: resolved depth-accum SRV for depth-proximity weighting
+		float DepthProximitySigma = 0.05f                  // depth-similarity sigma as a fraction of view depth
 	);
 
 	//----------------------------------------------------------------------
@@ -329,7 +344,9 @@ public:
 		int32 DebugMode,
 		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
 		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
-		bool bUseNormalConfidenceFade = true // GeometryMode 2: weight NormalAccum by per-splat confidence
+		bool bUseNormalConfidenceFade = true, // GeometryMode 2: weight NormalAccum by per-splat confidence
+		FRHITexture* CompletedDepthAccumTexture = nullptr, // 2nd-pass only: resolved depth-accum SRV for depth-proximity weighting
+		float DepthProximitySigma = 0.05f                  // depth-similarity sigma as a fraction of view depth
 	);
 
 	/**
