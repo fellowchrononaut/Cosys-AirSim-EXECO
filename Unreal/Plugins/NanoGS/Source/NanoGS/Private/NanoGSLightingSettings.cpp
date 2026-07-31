@@ -33,6 +33,7 @@ void UNanoGSLightingSettings::ApplyToCVars() const
 {
 	SetCVarInt  (TEXT("gs.LightingGeometryMode"),  (int32)GeometryMode);
 	SetCVarInt  (TEXT("gs.LightingDebugView"),     bShowReconstructedNormals ? 1 : 0);
+	SetCVarInt  (TEXT("gs.ShadowMode"),            (int32)ShadowMode);
 	SetCVarFloat(TEXT("gs.LightingBlend"),         LightingBlend);
 	SetCVarFloat(TEXT("gs.AmbientIntensity"),      AmbientIntensity);
 	SetCVarFloat(TEXT("gs.LightIntensityScale"),   LightIntensityScale);

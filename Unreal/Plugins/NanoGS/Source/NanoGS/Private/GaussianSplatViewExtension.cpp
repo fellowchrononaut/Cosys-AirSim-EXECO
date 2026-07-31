@@ -3,6 +3,11 @@
 #include "GaussianSplatViewExtension.h"
 #include "GaussianSplatSceneProxy.h"
 #include "RenderGraphBuilder.h"
+#include "NanoGSShadowManagerSubsystem.h"
+#include "Engine/World.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Engine/TextureRenderTargetCube.h"
+#include "SceneInterface.h"
 
 FGaussianSplatViewExtension* FGaussianSplatViewExtension::Instance = nullptr;
 
@@ -43,6 +48,58 @@ void FGaussianSplatViewExtension::SetupViewFamily(FSceneViewFamily& InViewFamily
 
 void FGaussianSplatViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
 {
+	// Game thread: snapshot gs.ShadowMode=ProxyMesh's active captures into render-thread-safe data
+	// (no UObject pointers) before render-thread work for this frame begins. GatherSceneLighting
+	// (NanoGS.cpp) reads this snapshot via GetShadowCaptureSnapshot().
+	TArray<FNanoGSShadowRenderData> NewSnapshot;
+	UWorld* World = InViewFamily.Scene ? InViewFamily.Scene->GetWorld() : nullptr;
+	if (World)
+	{
+		if (UNanoGSShadowManagerSubsystem* Manager = World->GetSubsystem<UNanoGSShadowManagerSubsystem>())
+		{
+			TArray<FNanoGSShadowCapture> Active;
+			Manager->GetActiveCaptures(Active);
+			for (const FNanoGSShadowCapture& C : Active)
+			{
+				FNanoGSShadowRenderData RD;
+				RD.bIsCube = C.bIsCube;
+				RD.bIsDirectional = C.bIsDirectional;
+				RD.LightWorldPos = C.LightWorldPos;
+				RD.LightDirection = C.LightDirection;
+				RD.ViewMatrix = C.ViewMatrix;
+				RD.ViewProjMatrix = C.ViewProjMatrix;
+
+				if (C.bIsCube && C.RenderTargetCube)
+				{
+					if (FTextureRenderTargetResource* Res = C.RenderTargetCube->GameThread_GetRenderTargetResource())
+					{
+						RD.DepthTexture = Res->TextureRHI;
+					}
+				}
+				else if (!C.bIsCube && C.RenderTarget2D)
+				{
+					if (FTextureRenderTargetResource* Res = C.RenderTarget2D->GameThread_GetRenderTargetResource())
+					{
+						RD.DepthTexture = Res->TextureRHI;
+					}
+				}
+
+				if (RD.DepthTexture.IsValid())
+				{
+					NewSnapshot.Add(RD);
+				}
+			}
+		}
+	}
+
+	FScopeLock Lock(&ShadowCaptureLock);
+	ShadowCaptureSnapshot = MoveTemp(NewSnapshot);
+}
+
+void FGaussianSplatViewExtension::GetShadowCaptureSnapshot(TArray<FNanoGSShadowRenderData>& OutCaptures) const
+{
+	FScopeLock Lock(&ShadowCaptureLock);
+	OutCaptures = ShadowCaptureSnapshot;
 }
 
 void FGaussianSplatViewExtension::RegisterProxy(FGaussianSplatSceneProxy* Proxy)

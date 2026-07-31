@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
+#include "GaussianSplatRenderer.h"  // FNanoGSShadowRenderData
 
 class FGaussianSplatSceneProxy;
 
@@ -50,12 +51,21 @@ public:
 	/** Get proxy lock for thread-safe access */
 	FCriticalSection& GetProxyLock() const { return ProxyLock; }
 
+	/** gs.ShadowMode = Proxy Mesh: this frame's active shadow captures, snapshotted on the game
+	 *  thread (BeginRenderViewFamily) from UNanoGSShadowManagerSubsystem. Render-thread-safe to
+	 *  call (lock-guarded copy) from GatherSceneLighting (NanoGS.cpp). */
+	void GetShadowCaptureSnapshot(TArray<FNanoGSShadowRenderData>& OutCaptures) const;
+
 private:
 	/** Registered scene proxies */
 	TArray<FGaussianSplatSceneProxy*> RegisteredProxies;
 
 	/** Critical section for thread-safe proxy access */
 	mutable FCriticalSection ProxyLock;
+
+	/** gs.ShadowMode = Proxy Mesh: latest game-thread snapshot, read on the render thread. */
+	TArray<FNanoGSShadowRenderData> ShadowCaptureSnapshot;
+	mutable FCriticalSection ShadowCaptureLock;
 
 	/** Singleton instance */
 	static FGaussianSplatViewExtension* Instance;

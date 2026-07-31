@@ -154,6 +154,27 @@ TAutoConsoleVariable<int32> CVarGSNormalConfidenceFade(
 	TEXT("normal. 0: ignore confidence (original behavior)."),
 	ECVF_RenderThreadSafe);
 
+TAutoConsoleVariable<int32> CVarGSShadowMode(
+	TEXT("gs.ShadowMode"),
+	0,
+	TEXT("Per-light shadows for splats. A light only casts a shadow if BOTH this is non-zero AND\n")
+	TEXT("the light's own 'Cast Shadows' property is enabled (same checkbox the rest of the scene\n")
+	TEXT("respects) — up to gs.ShadowMaxLights of them, prioritized the same way as the existing\n")
+	TEXT("light-selection scoring (directional first, then closest/brightest locals).\n")
+	TEXT(" 0: Off (default). No shadow rendering/sampling at all.\n")
+	TEXT(" 1: Proxy Mesh — shadow depth comes from a user-designated mesh (NOT YET IMPLEMENTED).\n")
+	TEXT(" 2: Splat Self-Shadow — shadow depth comes from the splats' own geometry (NOT YET IMPLEMENTED)."),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<int32> CVarGSShadowMaxLights(
+	TEXT("gs.ShadowMaxLights"),
+	4,
+	TEXT("Max simultaneous shadow-casting lights (fixed shader resource budget). If more lights are\n")
+	TEXT("eligible (gs.ShadowMode on + their own 'Cast Shadows' enabled) than this, the same\n")
+	TEXT("priority order used for general light selection picks which ones actually get a shadow\n")
+	TEXT("this frame. Default 4."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<float> CVarGSLightWrap(
 	TEXT("gs.LightWrap"),
 	0.3f,
@@ -264,6 +285,7 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 	Out.NormalSmoothFrac = FMath::Max(CVarGSNormalSmoothFrac.GetValueOnRenderThread(), 0.f);
 	Out.NormalSampleStep = FMath::Clamp(CVarGSNormalSampleStep.GetValueOnRenderThread(), 1, 16);
 	Out.GeometryMode = FMath::Clamp(CVarGSLightingGeometryMode.GetValueOnRenderThread(), 0, 2);
+	Out.ShadowMode = FMath::Clamp(CVarGSShadowMode.GetValueOnRenderThread(), 0, 2);
 	if (SceneView)
 	{
 		Out.InvDeviceZToWorldZTransform = SceneView->InvDeviceZToWorldZTransform;
@@ -296,6 +318,7 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 		L.Color     = NormalizeTint(C);
 		L.Intensity = MaxComp(C);
 		L.InvRadius = 0.f;  // no distance falloff for directional
+		L.bCastsShadow = P->CastsDynamicShadow();
 	}
 
 	// Local lights: iterate Scene->Lights (TSparseArray<FLightSceneInfoCompact>)
@@ -343,6 +366,7 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 		// letting a single gs.LightIntensityScale serve both. (Lumens/spot carry an extra
 		// cone/4PI factor that the scale CVar absorbs.)
 		GL.Intensity = MaxComp(LightColor) / (100.f * 100.f);
+		GL.bCastsShadow = P->CastsDynamicShadow();
 
 		if (LT == LightType_Spot)
 		{
@@ -382,6 +406,80 @@ static FGaussianSceneLighting GatherSceneLighting(const FSceneView* SceneView)
 	for (int32 i = 0; i < NumToAdd; ++i)
 	{
 		Out.Lights[Out.NumLights++] = Candidates[i].Light;
+	}
+
+	// Shadow slot assignment (gs.ShadowMode): Out.Lights[] is already in priority order
+	// (directional first, then locals by the same closest/brightest score used above), so the
+	// first MaxShadowLights lights with bCastsShadow true get a slot — no separate ranking needed.
+	if (Out.ShadowMode != 0)
+	{
+		const int32 MaxShadowLights = FMath::Clamp(
+			CVarGSShadowMaxLights.GetValueOnRenderThread(), 0, FGaussianSceneLighting::MaxShadowLights);
+		for (int32 i = 0; i < Out.NumLights && Out.NumShadowLights < MaxShadowLights; ++i)
+		{
+			if (Out.Lights[i].bCastsShadow)
+			{
+				Out.Lights[i].ShadowSlot = Out.NumShadowLights++;
+			}
+		}
+	}
+
+	// gs.ShadowMode == 1 (Proxy Mesh): match this frame's game-thread shadow-capture snapshot
+	// against the lights that were just assigned a ShadowSlot above. There's no shared stable
+	// identity between a game-thread ULightComponent and a render-thread FLightSceneProxy, so
+	// matching is approximate — position for local lights (point/spot), direction for directional
+	// (there's normally only one, so this is unambiguous in practice).
+	int32 SnapshotCount = -1;   // -1 = not queried (ShadowMode != 1 or no slots assigned)
+	int32 MatchedCount = 0;
+	if (Out.ShadowMode == 1 && Out.NumShadowLights > 0)
+	{
+		TArray<FNanoGSShadowRenderData> Snapshot;
+		if (FGaussianSplatViewExtension* VE = FGaussianSplatViewExtension::Get())
+		{
+			VE->GetShadowCaptureSnapshot(Snapshot);
+		}
+		SnapshotCount = Snapshot.Num();
+
+		constexpr float PosEpsilon = 5.f;       // cm
+		constexpr float DirCosEpsilon = 0.999f; // ~2.5 degrees
+
+		for (int32 i = 0; i < Out.NumLights; ++i)
+		{
+			FGaussianLight& L = Out.Lights[i];
+			if (L.ShadowSlot < 0) continue;
+
+			for (const FNanoGSShadowRenderData& RD : Snapshot)
+			{
+				const bool bMatch = (L.Type < 0.5f)
+					? (RD.bIsDirectional && FVector::DotProduct(FVector(L.Direction), RD.LightDirection) > DirCosEpsilon)
+					: (!RD.bIsDirectional && FVector::Dist(FVector(L.Position), RD.LightWorldPos) < PosEpsilon);
+				if (bMatch)
+				{
+					Out.ShadowCaptures[L.ShadowSlot] = RD;
+					MatchedCount++;
+					break;
+				}
+			}
+		}
+	}
+
+	// Phase-A/B verification: log only when the shadow-casting set (or match outcome) changes, so
+	// this is observable without spamming every frame.
+	{
+		static int32 LastLoggedMode = -1;
+		static int32 LastLoggedCount = -1;
+		static int32 LastLoggedSnapshot = -2;
+		static int32 LastLoggedMatched = -1;
+		if (Out.ShadowMode != LastLoggedMode || Out.NumShadowLights != LastLoggedCount
+			|| SnapshotCount != LastLoggedSnapshot || MatchedCount != LastLoggedMatched)
+		{
+			UE_LOG(LogTemp, Log, TEXT("[NanoGS] gs.ShadowMode=%d: %d/%d lights assigned a shadow slot; capture snapshot has %d entries; %d matched"),
+				Out.ShadowMode, Out.NumShadowLights, Out.NumLights, SnapshotCount, MatchedCount);
+			LastLoggedMode = Out.ShadowMode;
+			LastLoggedCount = Out.NumShadowLights;
+			LastLoggedSnapshot = SnapshotCount;
+			LastLoggedMatched = MatchedCount;
+		}
 	}
 
 	return Out;

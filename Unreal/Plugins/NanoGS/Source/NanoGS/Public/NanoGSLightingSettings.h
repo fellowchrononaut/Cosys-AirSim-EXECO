@@ -26,6 +26,16 @@ enum class ENanoGSLightingGeometryMode : uint8
 	PerSplatNormal  UMETA(DisplayName = "Per-Splat Normal (clean, no setup needed)"),
 };
 
+/** Shadow-casting geometry source for gs.ShadowMode. A light only casts a shadow if it's also
+ *  enabled here AND the light's own "Cast Shadows" property is on. */
+UENUM()
+enum class ENanoGSShadowMode : uint8
+{
+	Off            UMETA(DisplayName = "Off"),
+	ProxyMesh      UMETA(DisplayName = "Proxy Mesh (needs a tagged shadow-caster mesh)"),
+	SplatSelfShadow UMETA(DisplayName = "Splat Self-Shadow (no setup needed)"),
+};
+
 /**
  * Project Settings page (Edit > Project Settings > Plugins > NanoGS Lighting) for the
  * Gaussian-splat screen-space dynamic lighting. These values drive the gs.* console variables
@@ -65,6 +75,13 @@ public:
 	 *  (gs.LightingDebugView) */
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting")
 	bool bShowReconstructedNormals = false;
+
+	/** Per-light shadows for splats. A light only casts a shadow if BOTH this is non-Off AND the
+	 *  light's own "Cast Shadows" property is enabled. Proxy Mesh needs a mesh tagged with
+	 *  UNanoGSShadowCasterComponent; Splat Self-Shadow needs no extra scene setup but is more
+	 *  expensive (re-renders splats from each shadow-casting light's view). (gs.ShadowMode) */
+	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting")
+	ENanoGSShadowMode ShadowMode = ENanoGSShadowMode::Off;
 
 	/** 0 = unlit (original splat appearance), 1 = fully lit by the scene's lights. (gs.LightingBlend) */
 	UPROPERTY(EditAnywhere, config, Category = "NanoGS Lighting",

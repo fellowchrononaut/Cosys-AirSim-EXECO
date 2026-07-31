@@ -311,6 +311,28 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		// Diagnostic visualization for the active GeometryMode's reconstructed geometry.
 		// 0 = off (default), 1 = show the reconstructed normal as an RGB color.
 		SHADER_PARAMETER(uint32,    DebugView)
+
+		// gs.ShadowMode = Proxy Mesh: up to 4 shadow-casting lights' depth captures (named slots —
+		// shader parameter structs don't support arrays of distinct texture objects). LightShadowSlot
+		// maps each of the (up to 16) lights in the per-light loop to one of these 4 slots, -1 = none.
+		// ShadowValid[i] is 0 when that slot has no usable capture this frame (capture not ready,
+		// or — current limitation — the matched light is a point light using a cube capture, which
+		// this 2D-only sampling path doesn't support yet).
+		SHADER_PARAMETER_TEXTURE(Texture2D, ShadowDepthTexture0)
+		SHADER_PARAMETER_SAMPLER(SamplerState, ShadowDepthSampler0)
+		SHADER_PARAMETER_TEXTURE(Texture2D, ShadowDepthTexture1)
+		SHADER_PARAMETER_SAMPLER(SamplerState, ShadowDepthSampler1)
+		SHADER_PARAMETER_TEXTURE(Texture2D, ShadowDepthTexture2)
+		SHADER_PARAMETER_SAMPLER(SamplerState, ShadowDepthSampler2)
+		SHADER_PARAMETER_TEXTURE(Texture2D, ShadowDepthTexture3)
+		SHADER_PARAMETER_SAMPLER(SamplerState, ShadowDepthSampler3)
+		SHADER_PARAMETER_ARRAY(FMatrix44f, ShadowViewMatrix, [4])
+		SHADER_PARAMETER_ARRAY(FMatrix44f, ShadowViewProjMatrix, [4])
+		// Scalar (non-vector) types need SHADER_PARAMETER_SCALAR_ARRAY, not SHADER_PARAMETER_ARRAY
+		// (cbuffer packing requires 16-byte-aligned elements; the scalar-array macro packs 4 values
+		// per vector instead). Access via GET_SCALAR_ARRAY_ELEMENT on both the C++ and shader side.
+		SHADER_PARAMETER_SCALAR_ARRAY(uint32, ShadowValid, [4])
+		SHADER_PARAMETER_SCALAR_ARRAY(int32, LightShadowSlot, [16])
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

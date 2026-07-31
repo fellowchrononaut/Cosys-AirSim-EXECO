@@ -2119,6 +2119,38 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 		PSParameters.LightDirectionCosOuter[i] = FVector4f(L.Direction, L.CosOuter);
 		PSParameters.LightCosInner[i]          = FVector4f(L.CosInner, L.Intensity, 0.f, 0.f);
 	}
+	for (int32 i = Lighting.NumLights; i < FGaussianSceneLighting::MaxLights; ++i)
+	{
+		GET_SCALAR_ARRAY_ELEMENT(PSParameters.LightShadowSlot, i) = -1;
+	}
+	for (int32 i = 0; i < Lighting.NumLights; ++i)
+	{
+		GET_SCALAR_ARRAY_ELEMENT(PSParameters.LightShadowSlot, i) = Lighting.Lights[i].ShadowSlot;
+	}
+
+	// gs.ShadowMode = Proxy Mesh: bind up to 4 shadow-casting lights' depth captures. A slot is
+	// only "valid" in the shader if it has a usable 2D (directional/spot) capture this frame —
+	// point lights matched a cube capture aren't sampled yet (see ShadowValid comment in
+	// GaussianSplatShaders.h), so they fall back to the dummy texture with ShadowValid = 0.
+	FRHITexture* ShadowDummy = GBlackTexture->TextureRHI.GetReference();
+	FRHISamplerState* ShadowSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	FRHITexture* ShadowTex[4] = { ShadowDummy, ShadowDummy, ShadowDummy, ShadowDummy };
+	for (int32 i = 0; i < FGaussianSceneLighting::MaxShadowLights; ++i)
+	{
+		const FNanoGSShadowRenderData& SC = Lighting.ShadowCaptures[i];
+		const bool bValid = SC.DepthTexture.IsValid() && !SC.bIsCube;
+		GET_SCALAR_ARRAY_ELEMENT(PSParameters.ShadowValid, i) = bValid ? 1u : 0u;
+		PSParameters.ShadowViewMatrix[i] = SC.ViewMatrix;
+		PSParameters.ShadowViewProjMatrix[i] = SC.ViewProjMatrix;
+		if (bValid)
+		{
+			ShadowTex[i] = SC.DepthTexture.GetReference();
+		}
+	}
+	PSParameters.ShadowDepthTexture0 = ShadowTex[0]; PSParameters.ShadowDepthSampler0 = ShadowSampler;
+	PSParameters.ShadowDepthTexture1 = ShadowTex[1]; PSParameters.ShadowDepthSampler1 = ShadowSampler;
+	PSParameters.ShadowDepthTexture2 = ShadowTex[2]; PSParameters.ShadowDepthSampler2 = ShadowSampler;
+	PSParameters.ShadowDepthTexture3 = ShadowTex[3]; PSParameters.ShadowDepthSampler3 = ShadowSampler;
 
 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
 

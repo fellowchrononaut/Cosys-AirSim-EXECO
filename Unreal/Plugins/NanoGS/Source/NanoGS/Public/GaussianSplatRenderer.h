@@ -7,6 +7,24 @@
 #include "RenderGraphBuilder.h"
 #include "SceneView.h"
 
+// Render-thread-safe snapshot of one active gs.ShadowMode=ProxyMesh capture (no UObject pointers,
+// safe to hold/copy on the render thread). Produced on the game thread
+// (FGaussianSplatViewExtension::BeginRenderViewFamily, by querying UNanoGSShadowManagerSubsystem)
+// and consumed in GatherSceneLighting (NanoGS.cpp) by matching position/direction against
+// FGaussianLight entries that already have a ShadowSlot assigned — there's no shared stable
+// identity between a game-thread ULightComponent and a render-thread FLightSceneProxy, so this
+// match is approximate (see Dynamic-Lighting-Notes/nanogs-dynamic-lighting.md).
+struct FNanoGSShadowRenderData
+{
+	FTextureRHIRef DepthTexture;        // SCS_SceneDepth target: linear world-unit depth in .r
+	bool       bIsCube = false;
+	bool       bIsDirectional = false;
+	FVector    LightWorldPos = FVector::ZeroVector;
+	FVector    LightDirection = FVector::ZeroVector;
+	FMatrix44f ViewMatrix = FMatrix44f::Identity;      // 2D only: for the linear-depth comparison
+	FMatrix44f ViewProjMatrix = FMatrix44f::Identity;  // 2D only: for the UV projection
+};
+
 // One scene light, flattened for the composite shader. World space.
 struct FGaussianLight
 {
@@ -18,6 +36,14 @@ struct FGaussianLight
 	float     CosOuter    = -1.f;                  // spot outer cone cosine (<= -1 means "no cone")
 	float     CosInner    = 1.f;                   // spot inner cone cosine (for smooth edge)
 	float     Intensity   = 1.f;                   // brightness (max-component of HDR GetColor()); drives the slider
+
+	// Shadows (gs.ShadowMode): bCastsShadow mirrors this light's own "Cast Shadows" property
+	// (FLightSceneProxy::CastsDynamicShadow()) — eligibility only, not whether it actually got a
+	// shadow this frame. ShadowSlot is the assigned index into the fixed-size shadow-texture/matrix
+	// arrays (-1 = not assigned, either shadows are off, the light doesn't cast shadows, or it lost
+	// out to higher-priority lights under the gs.ShadowMaxLights cap).
+	bool      bCastsShadow = false;
+	int32     ShadowSlot   = -1;
 };
 
 // Per-frame scene lighting gathered on the render thread.
@@ -64,6 +90,18 @@ struct FGaussianSceneLighting
 	// (default). 1 = show the reconstructed per-pixel normal as an RGB color. Bypasses the
 	// per-light loop and tonemap, and works even with LightingBlend at 0 / no scene lights.
 	int32     DebugView = 0;
+
+	// Shadows (gs.ShadowMode). 0 = off (default), 1 = Proxy Mesh, 2 = Splat Self-Shadow — see
+	// FGaussianLight::bCastsShadow/ShadowSlot for which lights actually got a shadow this frame.
+	static constexpr int32 MaxShadowLights = 4;  // fixed shader resource budget, see gs.ShadowMaxLights
+	int32     ShadowMode = 0;
+	int32     NumShadowLights = 0;  // how many of Lights[] were actually assigned a ShadowSlot this frame
+	// Indexed by FGaussianLight::ShadowSlot. Filled in GatherSceneLighting by matching the
+	// game-thread shadow-capture snapshot (FGaussianSplatViewExtension::GetShadowCaptureSnapshot)
+	// against Lights[] entries that have a ShadowSlot assigned. DepthTexture.IsValid() == false
+	// means no matching capture was found this frame (capture not ready yet, or gs.ShadowMode
+	// isn't Proxy Mesh) — CompositeToSceneColor treats that slot as unshadowed.
+	FNanoGSShadowRenderData ShadowCaptures[MaxShadowLights];
 };
 
 class FGaussianSplatSceneProxy;

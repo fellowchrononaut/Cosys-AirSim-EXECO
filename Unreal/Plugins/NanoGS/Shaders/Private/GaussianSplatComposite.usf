@@ -61,6 +61,27 @@ uint         DebugView;
 Texture2D    NormalAccumTexture;
 SamplerState NormalAccumSampler;
 
+// gs.ShadowMode = Proxy Mesh: up to 4 shadow-casting lights' depth captures, fed by
+// UNanoGSShadowManagerSubsystem's USceneCaptureComponent2D (SCS_SceneDepth — linear world-unit
+// depth in .r, NOT device depth). Named slots since shader parameter structs can't hold an array
+// of distinct texture objects. LightShadowSlot[i] maps light i (in the per-light loop below) to
+// one of these 4 slots, or -1 for "no shadow." Point lights (cube captures) aren't sampled by
+// this 2D-only path yet — ShadowValid is 0 for those, so they're treated as unshadowed.
+Texture2D    ShadowDepthTexture0;
+SamplerState ShadowDepthSampler0;
+Texture2D    ShadowDepthTexture1;
+SamplerState ShadowDepthSampler1;
+Texture2D    ShadowDepthTexture2;
+SamplerState ShadowDepthSampler2;
+Texture2D    ShadowDepthTexture3;
+SamplerState ShadowDepthSampler3;
+float4x4     ShadowViewMatrix[4];     // world -> shadow view space; .z is the linear depth to compare
+float4x4     ShadowViewProjMatrix[4]; // world -> shadow clip space; for finding which UV to sample
+// Scalar (non-vector) arrays are packed 4-per-vector by SHADER_PARAMETER_SCALAR_ARRAY on the C++
+// side (cbuffer alignment) — access elements with GET_SCALAR_ARRAY_ELEMENT, not a plain [] index.
+uint4        ShadowValid[1];          // 4 uint32 packed into 1 uint4
+int4         LightShadowSlot[(MAX_LIGHTS + 3) / 4]; // MAX_LIGHTS int32 packed 4-per-vector
+
 // Attempt to invert UE's ACES filmic tone curve so that display-ready gaussian
 // splat colors survive tone mapping unchanged.  Uses the Narkowicz ACES fit
 // (same curve UE's default tone mapper approximates) and solves the quadratic
@@ -294,6 +315,46 @@ bool ReconstructNormalFromAccum(int2 pixel, out float3 normal)
 	return true;
 }
 
+// gs.ShadowMode = Proxy Mesh: hard (non-PCF — a future polish item) shadow test against one
+// capture's depth texture. ViewMat alone gives view-space Z, the same linear-depth convention
+// SCS_SceneDepth writes into the texture (matches it regardless of whether the capture's
+// projection is ortho or perspective); ViewProjMat is only used to find which UV to sample.
+float SampleShadowAt(Texture2D ShadowTex, SamplerState ShadowSamp, float4x4 ViewMat, float4x4 ViewProjMat, float3 WorldPos)
+{
+	float4 ViewPos = mul(float4(WorldPos, 1.0), ViewMat);
+	float  PixelDepth = ViewPos.z;
+
+	float4 Clip = mul(float4(WorldPos, 1.0), ViewProjMat);
+	if (Clip.w <= 0.0)
+	{
+		return 1.0;  // behind the shadow capture — can't tell, assume unshadowed
+	}
+	float2 UV = (Clip.xy / Clip.w) * float2(0.5, -0.5) + 0.5;
+	if (any(UV < 0.0) || any(UV > 1.0))
+	{
+		return 1.0;  // outside the capture's frustum — assume unshadowed
+	}
+
+	float ShadowDepth = ShadowTex.SampleLevel(ShadowSamp, UV, 0).r;
+	if (ShadowDepth <= 0.0)
+	{
+		return 1.0;  // no occluder geometry rendered at this UV (cleared/background) — unshadowed
+	}
+	const float ShadowBias = 5.0;  // cm; avoids self-shadowing acne
+	return (PixelDepth <= ShadowDepth + ShadowBias) ? 1.0 : 0.0;
+}
+
+// Dispatches to whichever of the 4 named shadow-texture slots LightIndex's light was assigned
+// (LightShadowSlot), or 1.0 (no shadow) if it has none / its slot isn't valid this frame.
+float ComputeShadowFactor(int Slot, float3 WorldPos)
+{
+	if (Slot == 0 && GET_SCALAR_ARRAY_ELEMENT(ShadowValid, 0) != 0) return SampleShadowAt(ShadowDepthTexture0, ShadowDepthSampler0, ShadowViewMatrix[0], ShadowViewProjMatrix[0], WorldPos);
+	if (Slot == 1 && GET_SCALAR_ARRAY_ELEMENT(ShadowValid, 1) != 0) return SampleShadowAt(ShadowDepthTexture1, ShadowDepthSampler1, ShadowViewMatrix[1], ShadowViewProjMatrix[1], WorldPos);
+	if (Slot == 2 && GET_SCALAR_ARRAY_ELEMENT(ShadowValid, 2) != 0) return SampleShadowAt(ShadowDepthTexture2, ShadowDepthSampler2, ShadowViewMatrix[2], ShadowViewProjMatrix[2], WorldPos);
+	if (Slot == 3 && GET_SCALAR_ARRAY_ELEMENT(ShadowValid, 3) != 0) return SampleShadowAt(ShadowDepthTexture3, ShadowDepthSampler3, ShadowViewMatrix[3], ShadowViewProjMatrix[3], WorldPos);
+	return 1.0;
+}
+
 struct FCompositeVSOutput
 {
 	float4 Position : SV_POSITION;
@@ -455,7 +516,11 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 				// original behavior. The editor Intensity slider still modulates, especially in
 				// the low/mid range.
 				float resp = LightResponseCeiling * (1.0 - exp(-intensity * LightIntensityScale));
-				lightSum     += tint * (resp * ndl       * atten);
+				// gs.ShadowMode: occlude this light's contribution only — neutralLight stays
+				// unshadowed (it's a fixed baseline, not a real orientation), so a fully-shadowed
+				// pixel naturally settles toward RelightRatioMin, same as a back-facing surface.
+				float shadow = ComputeShadowFactor(GET_SCALAR_ARRAY_ELEMENT(LightShadowSlot, i), wC);
+				lightSum     += tint * (resp * ndl       * atten * shadow);
 				neutralLight += tint * (resp * NeutralNdl * atten);
 			}
 
