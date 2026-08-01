@@ -51,6 +51,14 @@ private:
     FDelegateHandle end_draw_handle_;
     std::function<void()> query_camera_pose_cb_;
 
+    // Instant the whole batch was captured, sampled on the game thread in OnEndDraw next to
+    // query_camera_pose_cb_ (the same instant the camera poses are snapshotted). Every capture in
+    // a batch is CaptureSceneDeferred'd in one game-thread pass and the game thread then blocks
+    // until readback, so all images in a batch come from THIS instant regardless of how long the
+    // serial GPU render and readback take. Written game thread -> read render thread, ordered by
+    // the ENQUEUE_RENDER_COMMAND that follows. See airsim.BatchImageTimestamp.
+    msr::airlib::TTimePoint batch_time_stamp_ = 0;
+
 public:
     RenderRequest(UGameViewportClient * game_viewport, std::function<void()>&& query_camera_pose_cb);
     ~RenderRequest();

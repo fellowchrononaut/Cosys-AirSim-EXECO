@@ -48,6 +48,14 @@ private:
     msr::airlib::vector<msr::airlib::real_T> laser_angles_;
     msr::airlib::vector<FVector> point_cloud_draw_;
 	uint32 current_horizontal_angle_index_ = 0;
+	// airsim.LogLidarSweep diagnostic. A sweep is accumulated across several ticks, each tick's
+	// points expressed in the vehicle frame AT THAT TICK (shootLaser ends with
+	// transformToBodyFrame(..., lidar_pose + vehicle_pose)), then handed out as one cloud with one
+	// timestamp and one pose. If the vehicle moves during the sweep, earlier points carry a stale
+	// frame - they appear dragged along with the robot until the sweep completes and resets.
+	// These measure the span so that distortion can be quantified.
+	uint64 sweep_start_time_ = 0;   // sim ns, set on the first tick after a hand-off
+	int32 sweep_tick_count_ = 0;    // getPointCloud calls contributing to the current sweep
 	TArray<float> horizontal_angles_;
 	std::mt19937 gen_;
 	std::normal_distribution<float> dist_;

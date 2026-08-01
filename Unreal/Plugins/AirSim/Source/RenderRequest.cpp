@@ -6,6 +6,46 @@
 
 #include "AirBlueprintLib.h"
 #include "Async/Async.h"
+#include "HAL/IConsoleManager.h"
+#include "common/AirSimSettings.hpp"
+
+/** Diagnostic: log the batch capture instant against each result's own timestamp, plus the spread.
+ *  Every image in one simGetImages batch is rendered from a single sim instant (all captures are
+ *  CaptureSceneDeferred'd in one game-thread pass, and the game thread blocks until readback), but
+ *  ExecuteTask stamps each result as its OWN readback completes, sequentially. Synchronous images
+ *  can therefore carry timestamps spread by the readback duration - which reaches ROS unchanged via
+ *  header.stamp. Turn this on to measure that spread. */
+static TAutoConsoleVariable<int32> CVarLogImageTimestamps(
+    TEXT("airsim.LogImageTimestamps"),
+    0,
+    TEXT("Log per-batch vs per-result image timestamps and their spread.\n")
+    TEXT(" 0: Off (default)\n")
+    TEXT(" 1: One line per batch with each result's offset from the batch instant"),
+    ECVF_Default);
+
+/** Debug override for the ImageTimestampAtCapture setting. The setting is authoritative because it
+ *  changes recorded data and therefore belongs with the scenario config that gets archived
+ *  alongside a dataset; a console variable would be invisible provenance. This exists only to A/B
+ *  at runtime without editing settings.json.
+ *   -1 = follow settings (default), 0 = force readback stamps, 1 = force capture instant. */
+static TAutoConsoleVariable<int32> CVarBatchImageTimestamp(
+    TEXT("airsim.BatchImageTimestamp"),
+    -1,
+    TEXT("Debug override for the ImageTimestampAtCapture setting in settings.json.\n")
+    TEXT(" -1: Follow settings.json (default)\n")
+    TEXT("  0: Force per-result stamps taken when that image's readback completes (legacy)\n")
+    TEXT("  1: Force the shared capture instant, sampled with the camera poses in OnEndDraw"),
+    ECVF_Default);
+
+/** Resolve the setting against the debug override. */
+static bool ShouldStampAtCaptureInstant()
+{
+    const int32 Override = CVarBatchImageTimestamp.GetValueOnRenderThread();
+    if (Override >= 0) {
+        return Override != 0;
+    }
+    return msr::airlib::AirSimSettings::singleton().image_timestamp_at_capture;
+}
 
 RenderRequest::RenderRequest(UGameViewportClient* game_viewport, std::function<void()>&& query_camera_pose_cb)
     : params_(nullptr), results_(nullptr), req_size_(0), wait_signal_(new msr::airlib::WorkerThreadSignal), game_viewport_(game_viewport), query_camera_pose_cb_(std::move(query_camera_pose_cb))
@@ -68,6 +108,11 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             game_viewport_->bDisableWorldRendering = 0;
             end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this] {
                 check(IsInGameThread());
+
+                // Capture instant for the whole batch, taken with the poses so time and pose agree.
+                // This is the moment every image in the batch actually corresponds to; the serial
+                // GPU render and readback that follow add latency, not temporal skew.
+                batch_time_stamp_ = msr::airlib::ClockFactory::get()->nowNanos();
 
                 // capture CameraPose for this frame
                 query_camera_pose_cb_();
@@ -147,6 +192,11 @@ FReadSurfaceDataFlags RenderRequest::setupRenderResource(const FTextureRenderTar
 void RenderRequest::ExecuteTask()
 {
     if (params_ != nullptr && req_size_ > 0) {
+        // Readback-completion time per result, kept for the airsim.LogImageTimestamps diagnostic
+        // even when airsim.BatchImageTimestamp overrides what actually reaches the response.
+        TArray<msr::airlib::TTimePoint> readback_stamps;
+        readback_stamps.SetNumZeroed(req_size_);
+
         for (unsigned int i = 0; i < req_size_; ++i) {
             if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
                 FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
@@ -177,7 +227,31 @@ void RenderRequest::ExecuteTask()
                     }
                 }
             }
-            results_[i]->time_stamp = msr::airlib::ClockFactory::get()->nowNanos();
+            // Readback-completion time for this image. Sampled per result, so under the legacy
+            // convention a batch of images that all depict batch_time_stamp_ ends up with stamps
+            // spread by the readback duration - and, worse, lagged 48-69 ms behind the instant
+            // they depict. See ImageTimestampAtCapture in settings.json.
+            const msr::airlib::TTimePoint readback_stamp = msr::airlib::ClockFactory::get()->nowNanos();
+            results_[i]->time_stamp = (ShouldStampAtCaptureInstant() && batch_time_stamp_ != 0)
+                                          ? batch_time_stamp_
+                                          : readback_stamp;
+            readback_stamps[(int32)i] = readback_stamp;
+        }
+
+        if (CVarLogImageTimestamps.GetValueOnRenderThread() != 0) {
+            // Spread across the batch = how far apart synchronous images look downstream.
+            // TTimePoint is uint64_t, so cast before subtracting to keep deltas signed.
+            const int64 first = (int64)readback_stamps[0];
+            const int64 last = (int64)readback_stamps[(int32)req_size_ - 1];
+            FString offsets;
+            for (unsigned int i = 0; i < req_size_; ++i) {
+                offsets += FString::Printf(TEXT(" [%u]+%.3fms"), i,
+                                           (double)((int64)readback_stamps[(int32)i] - (int64)batch_time_stamp_) * 1e-6);
+            }
+            UE_LOG(LogTemp, Log,
+                   TEXT("[AirSim] image batch of %u: capture instant %llu, readback spread %.3f ms (first->last), offsets from capture:%s"),
+                   req_size_, (unsigned long long)batch_time_stamp_,
+                   (double)(last - first) * 1e-6, *offsets);
         }
 
         req_size_ = 0;

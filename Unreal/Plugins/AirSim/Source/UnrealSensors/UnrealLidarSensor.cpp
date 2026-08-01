@@ -8,7 +8,19 @@
 #include "NedTransform.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
+#include "HAL/IConsoleManager.h"
+#include "common/ClockFactory.hpp"
 #include <random>
+
+/** Shared with LidarCamera.cpp (GPU LiDAR, SensorType 8); this is the raycast LiDAR
+ *  (SensorType 6). Both accumulate a revolution across several ticks and hand it out with a single
+ *  timestamp and pose, so the oldest points carry a vehicle frame that is up to one revolution
+ *  stale. Declared extern here because the CVar object itself lives in LidarCamera.cpp. */
+extern TAutoConsoleVariable<int32> CVarLogLidarSweep;
+
+/** Resolves LidarDeskew against its debug override (airsim.LidarDeskew). Defined in
+ *  LidarCamera.cpp so both LiDAR sensors share one decision. */
+extern bool ShouldDeskewLidar();
 
 // ctor
 UnrealLidarSensor::UnrealLidarSensor(const AirSimSettings::LidarSetting& setting,
@@ -104,6 +116,12 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 
 	updatePose(lidar_pose, vehicle_pose);
 
+	// airsim.LogLidarSweep: mark the first tick contributing to a new revolution.
+	if (sweep_tick_count_ == 0) {
+		sweep_start_time_ = msr::airlib::ClockFactory::get()->nowNanos();
+	}
+	sweep_tick_count_++;
+
 	bool refresh = false;
 	msr::airlib::LidarSimpleParams params = getParams();
 	const auto number_of_lasers = params.number_of_channels;
@@ -165,6 +183,41 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 				UE_LOG(LogTemp, Warning, TEXT("Pointcloud or labels incorrect size! points:%i labels:%i"), (int)(point_cloud.size() / 3), groundtruth.size());
 			}
 			//UE_LOG(LogTemp, Display, TEXT("Pointcloud completed! points:%i labels:%i"), (int)(point_cloud.size() / 3), groundtruth.size());
+
+			// A full revolution just completed. LidarSimple::updateOutput will stamp the whole
+			// cloud with one clock()->nowNanos() and one pose - but its points were measured in
+			// the vehicle frame as it was on each contributing tick. The span below is how much
+			// vehicle motion the cloud straddles, i.e. how stale the oldest points' frame is.
+			if (CVarLogLidarSweep.GetValueOnGameThread() != 0) {
+				const uint64 now_ns = msr::airlib::ClockFactory::get()->nowNanos();
+				UE_LOG(LogTemp, Log,
+					   TEXT("[AirSim] raycast lidar sweep complete: span %.1f ms over %d ticks, %d points; oldest points use a vehicle frame ~that old"),
+					   (double)((int64)now_ns - (int64)sweep_start_time_) * 1e-6,
+					   sweep_tick_count_,
+					   (int32)(point_cloud.size() / 3));
+			}
+			sweep_tick_count_ = 0;
+
+			// De-skew: the accumulator holds world-frame points measured across several ticks.
+			// Re-express them all in the lidar frame as it is NOW - the instant this cloud's
+			// timestamp and pose refer to - so the cloud is internally consistent.
+			// Misses were pre-filled as exact zeros and labelled "out_of_range"; leave those alone,
+			// since transforming (0,0,0) would place a phantom return at the sensor offset.
+			if (ShouldDeskewLidar()) {
+				const msr::airlib::Pose sweep_end_pose = lidar_pose + vehicle_pose;
+				const size_t point_count = point_cloud.size() / 3;
+				for (size_t p = 0; p < point_count; ++p) {
+					if (p < groundtruth.size() && groundtruth[p] == "out_of_range") {
+						continue;
+					}
+					Vector3r world_point(point_cloud[p * 3], point_cloud[p * 3 + 1], point_cloud[p * 3 + 2]);
+					const Vector3r body_point = VectorMath::transformToBodyFrame(world_point, sweep_end_pose, true);
+					point_cloud[p * 3] = body_point.x();
+					point_cloud[p * 3 + 1] = body_point.y();
+					point_cloud[p * 3 + 2] = body_point.z();
+				}
+			}
+
 			point_cloud_final = point_cloud;
 			groundtruth_final = groundtruth;
 			point_cloud.clear();
@@ -313,8 +366,18 @@ bool UnrealLidarSensor::shootLaser(const msr::airlib::Pose& lidar_pose, const ms
 			point_v_i = ned_transform_->toLocalNed(impact_point);
 		}
 
-		// tranform to lidar frame
-		point = VectorMath::transformToBodyFrame(point_v_i, lidar_pose + vehicle_pose, true);
+		// When de-skewing, leave the point in the world/local-NED frame. The whole sweep is
+		// converted to the lidar frame once, at hand-off, using the vehicle pose at that instant -
+		// which is the instant the cloud's timestamp and pose refer to. Converting here instead
+		// would bake in this tick's vehicle pose and make the cloud internally inconsistent.
+		// See AirSimSettings::lidar_deskew.
+		if (ShouldDeskewLidar()) {
+			point = point_v_i;
+		}
+		else {
+			// tranform to lidar frame
+			point = VectorMath::transformToBodyFrame(point_v_i, lidar_pose + vehicle_pose, true);
+		}
 
 		return true;
 	}

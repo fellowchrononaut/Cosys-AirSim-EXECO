@@ -175,6 +175,16 @@ private:
 	bool initialized = false;
 	int32 wait_frames_ = 100;
 	int32 waited_frames_ = 0;
+	// airsim.LogLidarSweep diagnostic. A point cloud is accumulated slice-by-slice across several
+	// Update() calls and only handed out when a full revolution completes, then stamped once. The
+	// oldest points in it are therefore up to one revolution old. These track the wall/sim span of
+	// a revolution and how many slices it took, to quantify that staleness.
+	uint64 sweep_start_time_ = 0;      // sim ns, set on the first slice after a hand-off
+	int32 sweep_slice_count_ = 0;      // Update() calls that rendered into the current sweep
+	// Cached once per Update() from AirSimSettings::lidar_deskew - it is read per point, so it
+	// must not hit the settings singleton in the inner loop. When set, points are accumulated in
+	// world space and converted to the sensor frame once, at sweep hand-off.
+	bool deskew_enabled_ = true;
 	float hfov_ = 0;
 	float completed_hfov_ = 0;
 	bool reset_hfov_ = false;

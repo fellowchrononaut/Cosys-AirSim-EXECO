@@ -593,6 +593,39 @@ namespace airlib
 
         std::string clock_type = "";
         float clock_speed = 1.0f;
+        // Which instant an image's time_stamp refers to.
+        // true  (default, correct): the capture instant - the moment the scene captures were
+        //       queued, which is the world state the image actually depicts and the same instant
+        //       the response's camera_position/camera_orientation refer to.
+        // false (legacy): the moment that image's GPU readback completed. Measured 2026-08-01 to
+        //       run 48-69 ms LATER than the capture instant, so images were systematically lagged
+        //       against IMU/LiDAR/odometry, which all stamp from the same clock at their own
+        //       sample instant. Kept only to reproduce datasets recorded before the fix.
+        bool image_timestamp_at_capture = true;
+        // Motion-compensate ("de-skew") LiDAR sweeps.
+        //
+        // A LiDAR revolution is accumulated across several simulation ticks. Each tick's points are
+        // expressed in the vehicle frame AS IT WAS ON THAT TICK - the raycast sensor ends
+        // shootLaser() with transformToBodyFrame(..., lidar_pose + vehicle_pose), and the GPU
+        // sensor stores LUT directions in the actor frame of that slice. The completed cloud is
+        // then handed out with a SINGLE timestamp and a single pose, so a consumer applies one
+        // transform to points measured in several different frames.
+        //
+        // If the vehicle moves while a sweep is in progress, the earlier points are therefore
+        // rendered in the wrong place: they appear dragged along with the robot, then snap back
+        // when the sweep completes and the accumulator resets - once per revolution.
+        //
+        // true  (default): every point in a sweep is re-expressed in the vehicle frame at the
+        //       instant the sweep completed, which is the instant the cloud's timestamp and pose
+        //       refer to. The cloud becomes internally consistent.
+        // false (legacy): points keep the frame of whichever tick measured them. Kept to reproduce
+        //       datasets recorded before this fix, and to measure the distortion itself.
+        //
+        // Real rotating LiDAR has the same distortion, but real drivers ship per-point time
+        // offsets so a SLAM front-end can compensate. AirSim emits one stamp per cloud, so no
+        // consumer can correct it downstream - it has to be done here.
+        // Use airsim.LogLidarSweep 1 to measure the span each sweep straddles.
+        bool lidar_deskew = true;
         bool engine_sound = false;
         bool move_world_origin = false;
         bool initial_instance_segmentation = true;
@@ -1780,6 +1813,15 @@ namespace airlib
             }
 
             clock_speed = settings_json.getFloat("ClockSpeed", 1.0f);
+
+            // Sits with the clock settings because it selects which instant image timestamps
+            // refer to - the same category of thing as ClockType. Global, not per-camera.
+            image_timestamp_at_capture = settings_json.getBool("ImageTimestampAtCapture", true);
+
+            // Likewise: selects which instant a LiDAR sweep's points are expressed in. Global
+            // rather than per-sensor for now; a per-LidarSetting override can be layered on later
+            // if one vehicle ever needs different behaviour from another.
+            lidar_deskew = settings_json.getBool("LidarDeskew", true);
         }
 
         static std::shared_ptr<SensorSetting> createSensorSetting(

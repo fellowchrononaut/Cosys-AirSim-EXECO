@@ -22,6 +22,47 @@
 #include <string>
 #include <exception>
 #include "Misc/FileHelper.h"
+#include "HAL/IConsoleManager.h"
+#include "common/ClockFactory.hpp"
+
+/** Diagnostic: report how long a full LiDAR revolution takes to accumulate.
+ *
+ *  A GPU-LiDAR point cloud is built slice-by-slice across several Update() calls and only handed
+ *  to the API once a full revolution completes, at which point GPULidarSimple::updateOutput stamps
+ *  the whole cloud with a single clock()->nowNanos(). The oldest points in that cloud are
+ *  therefore up to one revolution old relative to their own timestamp - at RotationsPerSecond: 5
+ *  that is ~200 ms of robot motion, which reads downstream as the LiDAR lagging the vehicle.
+ *  Unlike a real rotating LiDAR, there are no per-point time offsets to de-skew with. */
+/** Debug override for the LidarDeskew setting, so a sweep's frame handling can be A/B'd at runtime
+ *  without restarting the sim - the same scene and robot pose on both sides of the comparison.
+ *  The setting stays authoritative because it changes recorded data and is archived with a dataset.
+ *   -1 = follow settings (default), 0 = force legacy per-tick frames, 1 = force de-skew. */
+TAutoConsoleVariable<int32> CVarLidarDeskew(   // non-static: also used by UnrealLidarSensor.cpp
+	TEXT("airsim.LidarDeskew"),
+	-1,
+	TEXT("Debug override for the LidarDeskew setting in settings.json.\n")
+	TEXT(" -1: Follow settings.json (default)\n")
+	TEXT("  0: Force OFF - points keep the vehicle frame of the tick that measured them (legacy)\n")
+	TEXT("  1: Force ON  - whole sweep re-expressed in the frame at sweep completion"),
+	ECVF_Default);
+
+/** Resolve the LidarDeskew setting against the debug override. Shared by both LiDAR sensors. */
+bool ShouldDeskewLidar()
+{
+	const int32 Override = CVarLidarDeskew.GetValueOnGameThread();
+	if (Override >= 0) {
+		return Override != 0;
+	}
+	return msr::airlib::AirSimSettings::singleton().lidar_deskew;
+}
+
+TAutoConsoleVariable<int32> CVarLogLidarSweep(   // non-static: also used by UnrealLidarSensor.cpp
+	TEXT("airsim.LogLidarSweep"),
+	0,
+	TEXT("Log the accumulation span of each completed GPU-LiDAR revolution.\n")
+	TEXT(" 0: Off (default)\n")
+	TEXT(" 1: One line per completed sweep: span in ms, slice count, point count"),
+	ECVF_Default);
 
 // Generate linear spaced array for N values between min and max
 TArray<float> LinearSpacedArray(float min, float max, size_t N) {
@@ -291,6 +332,9 @@ bool ALidarCamera::Update(float delta_time, msr::airlib::vector<msr::airlib::rea
 	// Toggle to indicate to AirSim that the sensor has done a full measurement and that the point_cloud_final holds a new full measurement that can be given to the API
 	bool refresh_pointcloud = false;
 
+	// Cache once per tick - read per point in SampleRenders, so keep it out of the inner loop.
+	deskew_enabled_ = ShouldDeskewLidar();
+
 	// Calculate the added rotation of the sensor by this update based on the time that has pased and the rotational speed of the sensor
 	float sensor_rotation_angle_ = hfov_ * delta_time * sensor_rotation_frequency_;
 	sensor_sum_rotation_angle_ += sensor_rotation_angle_;
@@ -336,10 +380,35 @@ bool ALidarCamera::Update(float delta_time, msr::airlib::vector<msr::airlib::rea
 		}
 		else {
 
+			// airsim.LogLidarSweep: mark the start of a revolution (first slice after a hand-off).
+			if (sweep_slice_count_ == 0) {
+				sweep_start_time_ = msr::airlib::ClockFactory::get()->nowNanos();
+			}
+			sweep_slice_count_++;
+
 			capture_2D_depth_->CaptureScene();
 			capture_2D_segmentation_->CaptureScene();
 			capture_2D_intensity_->CaptureScene();
 			refresh_pointcloud = SampleRenders(sensor_sum_rotation_angle_, cur_fov, point_cloud, point_cloud_final);
+
+			// A full revolution just completed and will be handed to the API with a single
+			// timestamp taken AFTER this returns (GPULidarSimple::updateOutput). The span below is
+			// how stale the oldest points in that cloud are relative to that stamp.
+			// NOTE: this is the GPU LiDAR (SensorType 8). The raycast LiDAR (SensorType 6) is
+			// instrumented separately in UnrealSensors/UnrealLidarSensor.cpp - both accumulate a
+			// sweep across ticks and share the same distortion.
+			if (refresh_pointcloud) {
+				if (CVarLogLidarSweep.GetValueOnGameThread() != 0) {
+					const uint64 now_ns = msr::airlib::ClockFactory::get()->nowNanos();
+					UE_LOG(LogTemp, Log,
+						   TEXT("[AirSim] GPU lidar '%s' sweep complete: span %.1f ms over %d slices, %d points; oldest points are ~that far behind the cloud's timestamp"),
+						   *GetName(),
+						   (double)((int64)now_ns - (int64)sweep_start_time_) * 1e-6,
+						   sweep_slice_count_,
+						   (int32)(point_cloud_final.size() / 3));
+				}
+				sweep_slice_count_ = 0;
+			}
 		}
 
 	
@@ -531,6 +600,28 @@ bool ALidarCamera::SampleRenders(float sensor_rotation_angle, float fov, msr::ai
 						// Else, save the completed pointcloud into the right array and clear the current one
 						else {
 							//UE_LOG(LogTemp, Warning, TEXT("REFRESH at angle: %f, with prev angle: %f"), h_cur_angle, h_prev_angle);
+
+							// De-skew: the accumulator holds world-space points (UE cm) gathered
+							// across several slices. Re-express them all in the sensor frame as it
+							// is NOW - the instant this cloud's timestamp and pose refer to - and
+							// apply the usual cm->m and Z-flip. Misses were stored as exact zeros;
+							// leave them, since transforming (0,0,0) would create a phantom return.
+							if (deskew_enabled_) {
+								const FTransform sweep_end_xform = this->GetActorTransform();
+								const size_t point_count = point_cloud.size() / 5;
+								for (size_t p = 0; p < point_count; ++p) {
+									const size_t base = p * 5;
+									if (point_cloud[base] == 0 && point_cloud[base + 1] == 0 && point_cloud[base + 2] == 0) {
+										continue;
+									}
+									const FVector world_point(point_cloud[base], point_cloud[base + 1], point_cloud[base + 2]);
+									const FVector local_point = sweep_end_xform.InverseTransformPosition(world_point);
+									point_cloud[base] = local_point.X / 100;
+									point_cloud[base + 1] = local_point.Y / 100;
+									point_cloud[base + 2] = -local_point.Z / 100;
+								}
+							}
+
 							point_cloud_final = point_cloud;
 							point_cloud.clear();
 							refresh_pointcloud = true;
@@ -628,9 +719,22 @@ bool ALidarCamera::SampleRenders(float sensor_rotation_angle, float fov, msr::ai
 
 					// If the point is not dropped based on the reflectance limit function of the sensor, add the final point data to the pointcloud, else place an empty point
 					if (threshold_enable && used_by_airsim_) {
-						point_cloud.emplace_back(point.X / 100);
-						point_cloud.emplace_back(point.Y / 100);
-						point_cloud.emplace_back(-point.Z / 100);
+						// De-skew: store the point in WORLD space (UE cm) and defer the conversion
+						// to sensor-local metres until the sweep is handed off, so every point in
+						// the cloud ends up in one frame - the one its timestamp refers to.
+						// Without this, each point keeps the actor frame of the slice that measured
+						// it. See AirSimSettings::lidar_deskew.
+						if (deskew_enabled_) {
+							const FVector world_point = this->GetActorTransform().TransformPosition(point);
+							point_cloud.emplace_back(world_point.X);
+							point_cloud.emplace_back(world_point.Y);
+							point_cloud.emplace_back(world_point.Z);
+						}
+						else {
+							point_cloud.emplace_back(point.X / 100);
+							point_cloud.emplace_back(point.Y / 100);
+							point_cloud.emplace_back(-point.Z / 100);
+						}
 						std::uint32_t rgb = ((std::uint32_t)value_segmentation.R << 16 | (std::uint32_t)value_segmentation.G << 8 | (std::uint32_t)value_segmentation.B);
 						point_cloud.emplace_back(rgb);
 						point_cloud.emplace_back(final_intensity);
