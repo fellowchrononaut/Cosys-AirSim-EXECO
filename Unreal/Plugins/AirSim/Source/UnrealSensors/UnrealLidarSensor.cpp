@@ -253,22 +253,42 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 			break;
 		}
 
+		// Both skip branches below must advance previous_horizontal_angle before continuing.
+		// Sweep completion is detected purely by the azimuth ramp stepping backwards (above), so a
+		// stale previous_ angle silently weakens that test: if a skip run begins at index 0 the
+		// frozen value is the array minimum, the wrap compares equal rather than greater, the
+		// completion is missed and the next revolution overwrites this one in place - one cloud
+		// spanning two revolutions, de-skewed into the wrong frame.
+		//
+		// Neither branch is currently reachable: horizontal_angles_ is generated from the same FOV
+		// bounds these checks test against, so every angle is in-FOV by construction, and the step
+		// (360/511 deg) never falls inside the duplicate epsilon. This is defensive hygiene that
+		// keeps the invariant true if the angle table or the FOV handling is ever changed - it is
+		// not a fix for observed behaviour. Matches upstream HERCULES.
+
 		// check if horizontal angle is a duplicate
 		if ((horizontal_angle - previous_horizontal_angle) <= 0.00005f && (horizontal_angle - 0) >= 0.00005f) {
 			UE_LOG(LogTemp, Display, TEXT("duplicate horizontal angle! angle! previous:%f current:%f"), previous_horizontal_angle, horizontal_angle);
+			previous_horizontal_angle = horizontal_angle;
 			continue;
 		}
 
 		// check if the laser is outside the requested horizontal FOV
 		if (!VectorMath::isAngleBetweenAngles(horizontal_angle, laser_start, laser_end)) {
 			UE_LOG(LogTemp, Display, TEXT("outside of FOV: %f "), horizontal_angle);
+			previous_horizontal_angle = horizontal_angle;
 			continue;
 		}
 
 		ParallelFor(number_of_lasers, [&](uint32 laser) {
 			float vertical_angle = laser_angles_[laser];
 			uint32 current_point_index = number_of_lasers * current_horizontal_angle_index_ + laser;
-			uint32 draw_index = number_of_lasers * i + laser;
+			// The loop counter i is 1-based, so `number_of_lasers * i` shifted the whole range one
+			// block up: slot [0, number_of_lasers) was never written and the final iteration wrote
+			// past the end of point_cloud_draw_, which is a std::vector - no bounds check, so this
+			// was a silent heap overrun of number_of_lasers * sizeof(FVector) bytes from inside a
+			// ParallelFor. Only reachable with DrawDebugPoints enabled. Matches upstream HERCULES.
+			uint32 draw_index = number_of_lasers * (i - 1) + laser;
 			Vector3r point;
 			FVector draw_point;
 			std::string label;
