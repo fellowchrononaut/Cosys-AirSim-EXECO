@@ -47,9 +47,52 @@ void UnrealLidarSensor::createLasers()
 
 	const auto number_of_lasers = params.number_of_channels;
 
-	float horizontal_delta = (params.horizontal_FOV_end - params.horizontal_FOV_start) / float(params.measurement_per_cycle - 1);
+	// Fencepost: dividing the span by (measurement_per_cycle - 1) makes the table INCLUSIVE of both
+	// endpoints, which is right for a bounded sector (-45..45 should sample both -45 and +45) but
+	// wrong for a full circle, where the two endpoints are the same bearing. With the common
+	// -180..180 setting that produced angles[0] = -180 and angles[511] = +180: 512 columns but only
+	// 511 distinct azimuths, one bearing sampled twice per revolution (64 redundant points in a
+	// 64-channel cloud), and a true resolution of 360/511 = 0.7045 deg rather than the 0.7031 deg
+	// that "512 per circle" implies.
+	//
+	// Divide by measurement_per_cycle when the span is a full circle so the last column stops one
+	// step short of wrapping onto the first.
+	const float horizontal_span = params.horizontal_FOV_end - params.horizontal_FOV_start;
+	const bool spans_full_circle = FMath::IsNearlyEqual(FMath::Abs(horizontal_span), 360.0f, 0.001f);
+	// measurement_per_cycle is unsigned, so compute the -1 branch with a comparison rather than
+	// FMath::Max, which would see an underflowed huge value instead of clamping it.
+	const uint32 horizontal_divisions = (spans_full_circle || params.measurement_per_cycle <= 1)
+		                                    ? FMath::Max(params.measurement_per_cycle, 1u)
+		                                    : params.measurement_per_cycle - 1;
+	const float horizontal_delta = horizontal_span / float(horizontal_divisions);
 	for (uint32 i = 0; i < params.measurement_per_cycle; i++) {
 		horizontal_angles_.Add(params.horizontal_FOV_start + i * horizontal_delta);
+	}
+
+	// The azimuth table is otherwise invisible, so the I-O fencepost could only be argued about,
+	// never measured. Report the endpoints and the distinct-bearing count. On a full circle, first
+	// and last must differ by one delta and distinct must equal measurement_per_cycle; before the
+	// fix last == first + 360 and distinct came out one short.
+	//
+	// Deliberately NOT gated on airsim.LogLidarSweep: createLasers() runs from the constructor,
+	// before any console variable could have been set, so gating it would guarantee it never
+	// prints. One line per LiDAR sensor at startup.
+	if (horizontal_angles_.Num() > 1) {
+		TSet<int32> distinct_bearings;
+		for (float a : horizontal_angles_)
+			distinct_bearings.Add(FMath::RoundToInt(FMath::Fmod(FMath::Fmod(a, 360.0f) + 360.0f, 360.0f) * 1000.0f));
+		// Include the actor: sensor names are not unique across vehicles (both vehicles here call
+		// their LiDAR 'CPULidar'), so a name-only line cannot be attributed to a vehicle.
+		UE_LOG(LogTemp, Log,
+			   TEXT("[AirSim] raycast lidar '%s' on '%s' azimuth table: %d columns, %d distinct bearings, delta %.6f deg, first %.4f, last %.4f, full_circle %d"),
+			   *FString(getName().c_str()),
+			   actor_ ? *actor_->GetName() : TEXT("?"),
+			   horizontal_angles_.Num(),
+			   distinct_bearings.Num(),
+			   horizontal_delta,
+			   horizontal_angles_[0],
+			   horizontal_angles_.Last(),
+			   spans_full_circle ? 1 : 0);
 	}
 
 	if (number_of_lasers <= 0)
@@ -246,11 +289,26 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 			groundtruth.assign(total_points, "out_of_range");
 			refresh = true;
 
-			// Stop here: one call yields exactly one revolution. Continuing would let a second
-			// sweep complete in this same call and overwrite point_cloud_final above, silently
-			// discarding the revolution we just finished. The remaining azimuth for this tick is
-			// simply picked up on the next call, since current_horizontal_angle_index_ persists.
-			break;
+			// Do NOT break unconditionally here. R-4's overrun guard above already caps this call
+			// at measurement_per_cycle azimuth steps - exactly one revolution - and the loop
+			// advances the index by one step per iteration, so the wrap can be crossed at most
+			// once. The double-completion this break was added to prevent is therefore already
+			// impossible whenever that cap is in force.
+			//
+			// Breaking anyway threw away the unused remainder of this tick's point budget. The
+			// angle index carries over, but the budget does not, so every revolution restarted
+			// from a fresh budget and cost ceil(steps_per_cycle / steps_per_tick) ticks instead of
+			// the true average. Measured: Car1 pinned at exactly 5 ticks/sweep (zero variance) for
+			// 512/123 = 4.16, i.e. 16.67 Hz against a configured 20 Hz.
+			//
+			// Continuing is safe: point_cloud has just been cleared, so the remaining points of
+			// this tick accumulate into the next sweep's buffer, which is where they belong.
+			//
+			// The one case where the original hazard is real is limit_points == false, when the
+			// cap does not apply and a single call can span more than one revolution. Keep the
+			// guard for exactly that case.
+			if (!params.limit_points)
+				break;
 		}
 
 		// Both skip branches below must advance previous_horizontal_angle before continuing.
@@ -260,11 +318,20 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 		// completion is missed and the next revolution overwrites this one in place - one cloud
 		// spanning two revolutions, de-skewed into the wrong frame.
 		//
-		// Neither branch is currently reachable: horizontal_angles_ is generated from the same FOV
-		// bounds these checks test against, so every angle is in-FOV by construction, and the step
-		// (360/511 deg) never falls inside the duplicate epsilon. This is defensive hygiene that
-		// keeps the invariant true if the angle table or the FOV handling is ever changed - it is
-		// not a fix for observed behaviour. Matches upstream HERCULES.
+		// The FOV branch is unreachable: horizontal_angles_ is generated from the same FOV bounds it
+		// tests against, so every angle is in-FOV by construction.
+		//
+		// The duplicate branch is now *evaluated* on the wrap iteration, because the completion
+		// block above no longer breaks out of the loop. Its first term, (h - prev) <= eps, is a
+		// backwards-step test rather than an equality test, so the wrap satisfies it; only the
+		// second term, h >= eps, stops it firing. That holds for the FOV in use (-180..180, so
+		// angles[0] == -180) and for the 0..360 default (angles[0] == 0), but a config with
+		// HorizontalFOVStart above ~0 would satisfy both terms and silently drop the first azimuth
+		// column of every revolution. The proper fix is to make this an equality test (fabs) -
+		// tracked as I-N.
+		//
+		// Advancing previous_horizontal_angle here is defensive hygiene that keeps the invariant
+		// true if the angle table or the FOV handling is ever changed. Matches upstream HERCULES.
 
 		// check if horizontal angle is a duplicate
 		if ((horizontal_angle - previous_horizontal_angle) <= 0.00005f && (horizontal_angle - 0) >= 0.00005f) {

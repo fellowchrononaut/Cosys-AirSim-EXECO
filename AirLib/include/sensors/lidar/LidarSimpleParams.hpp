@@ -15,8 +15,9 @@ namespace airlib
     struct LidarSimpleParams
     {
 
-        // Velodyne VLP-16 Puck config
-        // https://velodynelidar.com/vlp-16.html
+        // Loosely a Velodyne VLP-16 Puck (https://velodynelidar.com/vlp-16.html): the channel count,
+        // rotation rate and range below do match one. The azimuth resolution does NOT - see
+        // measurement_per_cycle. Do not cite these defaults as VLP-16 equivalent.
 
         // default settings
         // TODO: enable reading of these params from AirSim settings
@@ -35,6 +36,12 @@ namespace airlib
         bool external_ned = true;                 // define if the external sensor coordinates should be reported back by the API in local NED or Unreal coordinates
         bool draw_sensor = false;
 
+        // Azimuth columns per revolution. 512 is a power of two chosen for convenience, NOT a sensor
+        // figure: it arrived in upstream commit 830dfbab (2020-03-24), which replaced
+        // `points_per_second = 100000` with this and orphaned the PointsPerSecond setting in the
+        // process. At the defaults here (16 channels, 10 rev/s) the old value implied 625 columns,
+        // so the "rename" also dropped 18% of the sampling density. A real VLP-16 does 300000
+        // points/s = 1875 columns = 0.192 deg; 512 gives 0.703 deg, ~3.7x coarser.
         uint measurement_per_cycle = 512;
         uint horizontal_rotation_frequency = 10; // rotations/sec
         real_T horizontal_FOV_start = 0;
@@ -63,8 +70,50 @@ namespace airlib
             const auto& settings_json = settings.settings;
             number_of_channels = settings_json.getInt("NumberOfChannels", number_of_channels);
             range = settings_json.getFloat("Range", range);
-            measurement_per_cycle = settings_json.getInt("MeasurementsPerCycle", measurement_per_cycle);
+            // Sentinel 0 rather than the default, so that "not specified at all" is distinguishable
+            // from an explicit value. PointsPerSecond below may fill it in.
+            const int measurements_setting = settings_json.getInt("MeasurementsPerCycle", 0);
             horizontal_rotation_frequency = settings_json.getInt("RotationsPerSecond", horizontal_rotation_frequency);
+
+            // PointsPerSecond was previously read nowhere at all. A settings file could state a
+            // sampling rate that the sensor never honoured, and because the JSON parser does not
+            // warn about unrecognised keys it failed completely silently. That matters beyond
+            // tidiness: settings.json is archived alongside a dataset as its provenance record, so
+            // it was asserting a sensor property that described nothing. A stated-but-wrong number
+            // is worse than an absent one, because a reader has no reason to go and check it.
+            //
+            // Datasheets quote points/second (a VLP-16 is "300,000 points/sec"), so honour the key
+            // by deriving the azimuth resolution that actually drives the sweep:
+            //     measurements_per_cycle = points_per_second / (channels * rotations_per_second)
+            // An explicit MeasurementsPerCycle always wins, being the more direct statement of the
+            // same quantity, and a disagreement between the two is reported rather than silently
+            // resolved either way.
+            const int points_per_second = settings_json.getInt("PointsPerSecond", 0);
+            const uint points_per_cycle_divisor = number_of_channels * horizontal_rotation_frequency;
+            uint derived_measurement_per_cycle = 0;
+            if (points_per_second > 0 && points_per_cycle_divisor > 0)
+                derived_measurement_per_cycle = static_cast<uint>(points_per_second) / points_per_cycle_divisor;
+
+            if (measurements_setting > 0) {
+                measurement_per_cycle = static_cast<uint>(measurements_setting);
+                if (derived_measurement_per_cycle > 0 && derived_measurement_per_cycle != measurement_per_cycle)
+                    Utils::log(Utils::stringf(
+                                   "Lidar '%s': MeasurementsPerCycle=%d and PointsPerSecond=%d disagree - "
+                                   "PointsPerSecond implies %d measurements/cycle. Using MeasurementsPerCycle; "
+                                   "the effective rate is %d points/second.",
+                                   settings.sensor_name.c_str(), measurement_per_cycle, points_per_second,
+                                   derived_measurement_per_cycle, measurement_per_cycle * points_per_cycle_divisor),
+                               Utils::kLogLevelWarn);
+            }
+            else if (derived_measurement_per_cycle > 0) {
+                measurement_per_cycle = derived_measurement_per_cycle;
+                Utils::log(Utils::stringf(
+                               "Lidar '%s': derived MeasurementsPerCycle=%d from PointsPerSecond=%d "
+                               "(%d channels x %d rotations/second).",
+                               settings.sensor_name.c_str(), measurement_per_cycle, points_per_second,
+                               number_of_channels, horizontal_rotation_frequency),
+                           Utils::kLogLevelInfo);
+            }
             external_controller = settings_json.getBool("ExternalController", external_controller);
 		    update_frequency = settings_json.getFloat("UpdateFrequency", update_frequency);
             vertical_FOV_upper = settings_json.getFloat("VerticalFOVUpper", Utils::nan<float>());
