@@ -144,11 +144,24 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 		//UAirBlueprintLib::LogMessageString("Lidar: ", "No points requested this frame", LogDebugLevel::Failure);
 		return refresh;
 	}
-	constexpr float MAX_POINTS_IN_SCAN = 5000;
-	if (params.limit_points && points_to_scan_with_one_laser_temp * number_of_lasers > MAX_POINTS_IN_SCAN)
+	// Cap a tick at exactly ONE full revolution, derived from the sensor's own configuration
+	// rather than a fixed budget.
+	//
+	// This used to be a hardcoded `MAX_POINTS_IN_SCAN = 5000`, which is unrelated to how the
+	// sensor is configured and therefore acted as a RATE LIMITER: with 512 x 64 = 32768 points per
+	// revolution it allowed only 5000/64 = 78 azimuth steps per tick, so a sweep needed 7 ticks and
+	// RotationsPerSecond was silently not honoured (measured: a nominal 200 ms revolution took
+	// ~612 ms). Now it is an OVERRUN GUARD: the configured rate is respected, and the only thing
+	// prevented is a single tick producing more than one revolution.
+	//
+	// That matters because the completion block below overwrites point_cloud_final. Without this
+	// cap a fast sensor (e.g. 20 rev/s at ~87 ms ticks = 1.74 revolutions per tick) completes two
+	// sweeps in one call and the first is silently discarded. Paired with the `break` after a
+	// completed sweep, a call now yields exactly one revolution and leftover azimuth carries over.
+	const uint32 max_points_full_sweep = params.measurement_per_cycle * number_of_lasers;
+	if (params.limit_points && points_to_scan_with_one_laser_temp * number_of_lasers > max_points_full_sweep)
 	{
-		//UAirBlueprintLib::LogMessageString("Lidar Error: ", "Capping number of points to scan " + std::to_string(points_to_scan_with_one_laser_temp * number_of_lasers), LogDebugLevel::Failure);
-		points_to_scan_with_one_laser_temp = MAX_POINTS_IN_SCAN / number_of_lasers;
+		points_to_scan_with_one_laser_temp = max_points_full_sweep / number_of_lasers;
 	}
 	const uint32 points_to_scan_with_one_laser = points_to_scan_with_one_laser_temp;
 
@@ -190,10 +203,17 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 			// vehicle motion the cloud straddles, i.e. how stale the oldest points' frame is.
 			if (CVarLogLidarSweep.GetValueOnGameThread() != 0) {
 				const uint64 now_ns = msr::airlib::ClockFactory::get()->nowNanos();
+				// sweep_tick_count_ is reset on each completion, so a SECOND sweep finishing inside
+				// the same getPointCloud call sees 0 - which reads as "0 ticks" and is impossible.
+				// Report at least 1 and flag the case explicitly: it means this tick produced more
+				// than a full revolution of azimuth, which is the good outcome, not an error.
 				UE_LOG(LogTemp, Log,
-					   TEXT("[AirSim] raycast lidar sweep complete: span %.1f ms over %d ticks, %d points; oldest points use a vehicle frame ~that old"),
+					   TEXT("[AirSim] raycast lidar '%s' on '%s' sweep complete: span %.1f ms over %d tick(s)%s, %d points; oldest points use a vehicle frame ~that old"),
+					   *FString(getName().c_str()),
+					   actor_ ? *actor_->GetName() : TEXT("?"),
 					   (double)((int64)now_ns - (int64)sweep_start_time_) * 1e-6,
-					   sweep_tick_count_,
+					   FMath::Max(sweep_tick_count_, 1),
+					   sweep_tick_count_ == 0 ? TEXT(" [extra sweep completed within the same tick]") : TEXT(""),
 					   (int32)(point_cloud.size() / 3));
 			}
 			sweep_tick_count_ = 0;
@@ -225,6 +245,12 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 			point_cloud.assign(total_points * 3, 0);
 			groundtruth.assign(total_points, "out_of_range");
 			refresh = true;
+
+			// Stop here: one call yields exactly one revolution. Continuing would let a second
+			// sweep complete in this same call and overwrite point_cloud_final above, silently
+			// discarding the revolution we just finished. The remaining azimuth for this tick is
+			// simply picked up on the next call, since current_horizontal_angle_index_ persists.
+			break;
 		}
 
 		// check if horizontal angle is a duplicate

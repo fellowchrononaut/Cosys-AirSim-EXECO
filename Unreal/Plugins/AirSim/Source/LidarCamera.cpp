@@ -400,12 +400,15 @@ bool ALidarCamera::Update(float delta_time, msr::airlib::vector<msr::airlib::rea
 			if (refresh_pointcloud) {
 				if (CVarLogLidarSweep.GetValueOnGameThread() != 0) {
 					const uint64 now_ns = msr::airlib::ClockFactory::get()->nowNanos();
+					// See the raycast sensor's equivalent: a second sweep completing inside the
+					// same Update() sees a reset counter, so report at least 1 and say so.
 					UE_LOG(LogTemp, Log,
-						   TEXT("[AirSim] GPU lidar '%s' sweep complete: span %.1f ms over %d slices, %d points; oldest points are ~that far behind the cloud's timestamp"),
+						   TEXT("[AirSim] GPU lidar '%s' sweep complete: span %.1f ms over %d slice(s)%s, %d points; oldest points are ~that far behind the cloud's timestamp"),
 						   *GetName(),
 						   (double)((int64)now_ns - (int64)sweep_start_time_) * 1e-6,
-						   sweep_slice_count_,
-						   (int32)(point_cloud_final.size() / 3));
+						   FMath::Max(sweep_slice_count_, 1),
+						   sweep_slice_count_ == 0 ? TEXT(" [extra sweep completed within the same slice]") : TEXT(""),
+						   (int32)(point_cloud_final.size() / 5));
 				}
 				sweep_slice_count_ = 0;
 			}
