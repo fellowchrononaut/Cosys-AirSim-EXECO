@@ -328,6 +328,10 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
         const std::string topic_prefix = "~/" + curr_vehicle_name;
 
         vehicle_ros->odom_local_pub_  = nh_->create_publisher<nav_msgs::msg::Odometry>(topic_prefix + "/" + odom_frame_id_, 10);
+        // MAVLink vehicles only: the flight controller's own estimate, published alongside the
+        // ground truth on odom_local rather than instead of it. See I-V.
+        if (vehicle_ros->vehicle_mode_ == VehicleMode::DRONE)
+            vehicle_ros->odom_estimated_pub_ = nh_->create_publisher<nav_msgs::msg::Odometry>(topic_prefix + "/" + odom_frame_id_ + "_estimated", 10);
         vehicle_ros->env_pub_         = nh_->create_publisher<airsim_interfaces::msg::Environment>(topic_prefix + "/environment", 10);
         vehicle_ros->global_gps_pub_  = nh_->create_publisher<sensor_msgs::msg::NavSatFix>(topic_prefix + "/global_gps", 10);
 
@@ -539,8 +543,13 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
     reset_srvr_                = nh_->create_service<airsim_interfaces::srv::Reset>("~/reset", std::bind(&AirsimROSWrapperMultiAgent::reset_srv_cb, this, _1, _2));
     list_scene_object_tags_srvr_ = nh_->create_service<airsim_interfaces::srv::ListSceneObjectTags>("~/list_scene_object_tags", std::bind(&AirsimROSWrapperMultiAgent::list_scene_object_tags_srv_cb, this, _1, _2));
 
+    // Must be the ABSOLUTE topic "/clock". "~/clock" resolves to "/airsim_node/clock", which no
+    // ROS node ever reads: rclcpp's use_sim_time implementation subscribes to /clock and nothing
+    // else. Published privately, the sim clock was invisible to the graph, so every consumer fell
+    // back to wall time while every message carried a sim-time stamp - the two drift apart by the
+    // accumulated sim/wall deficit (measured: 274 s after a ~90 minute session). See I-J.
     if (publish_clock_)
-        clock_pub_ = nh_->create_publisher<rosgraph_msgs::msg::Clock>("~/clock", 1);
+        clock_pub_ = nh_->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 1);
 
     if (!airsim_img_request_vehicle_name_pair_vec_.empty()) {
         double update_airsim_img_response_every_n_sec;
@@ -657,7 +666,29 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
 
             vehicle_ros->gps_sensor_msg_ = get_gps_sensor_msg_from_airsim_geo_point(drone->curr_drone_state_.gps_location);
             vehicle_ros->gps_sensor_msg_.header.stamp = vehicle_time;
-            vehicle_ros->curr_odom_ = get_odom_msg_from_multirotor_state(drone->curr_drone_state_);
+
+            // I-V: for MAVLink vehicles, MultirotorState::kinematics_estimated is NOT simulator
+            // truth. MavLinkMultirotorApi::getKinematicsEstimated() returns
+            // current_state_.local_est - PX4's LOCAL_POSITION_NED - and updateState() only writes
+            // current_state_ when mav_vehicle_ != nullptr, so with PX4 not connected it returns a
+            // default-constructed struct: all zeros, silently, with no validity signal. The
+            // vehicle's TF (and therefore where its LiDAR cloud lands in the world) was being
+            // built from that.
+            //
+            // Cars and SimpleFlight are unaffected: PhysXCarApi reports physics directly, and
+            // AirSimSimpleFlightEstimator is a documented ground-truth pass-through. PX4Multirotor
+            // is the only type where the field means something else.
+            //
+            // Publish simulator ground truth on odom_local, consistent with every other vehicle
+            // type, and keep the flight-controller estimate on its own topic rather than discarding
+            // it - it is the useful signal for evaluating the estimator, just not for registering
+            // sensor data.
+            vehicle_ros->curr_odom_ = get_odom_msg_from_kinematic_state(
+                multirotor_client_->simGetGroundTruthKinematics(vname));
+            vehicle_ros->curr_odom_estimated_ = get_odom_msg_from_multirotor_state(drone->curr_drone_state_);
+            vehicle_ros->curr_odom_estimated_.header.frame_id = vname;
+            vehicle_ros->curr_odom_estimated_.child_frame_id  = vehicle_ros->odom_frame_id_;
+            vehicle_ros->curr_odom_estimated_.header.stamp    = vehicle_time;
 
         } else if (vmode == VehicleMode::CAR) {
             auto car = static_cast<CarROS*>(vehicle_ros.get());
@@ -727,7 +758,10 @@ void AirsimROSWrapperMultiAgent::publish_vehicle_state()
         }
 
         vehicle_ros->odom_local_pub_->publish(vehicle_ros->curr_odom_);
+        // TF is built from ground truth, so sensor data registers against the true pose (I-V).
         publish_odom_tf(vehicle_ros->curr_odom_);
+        if (vehicle_ros->odom_estimated_pub_)
+            vehicle_ros->odom_estimated_pub_->publish(vehicle_ros->curr_odom_estimated_);
         vehicle_ros->global_gps_pub_->publish(vehicle_ros->gps_sensor_msg_);
 
         const std::string& vname = vehicle_ros->vehicle_name_;

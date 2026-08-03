@@ -12,9 +12,12 @@ def generate_launch_description():
         "output",
         default_value='screen')
 
+    # Default ON. Every message this node publishes is stamped from AirSim's SteppableClock, so
+    # without /clock the graph runs on wall time while the data is in sim time, and the two drift
+    # apart by the sim/wall deficit. Consumers still need use_sim_time:=true to honour it. See I-J.
     publish_clock = DeclareLaunchArgument(
         "publish_clock",
-        default_value='False')
+        default_value='True')
 
     is_vulkan = DeclareLaunchArgument(
         "is_vulkan",

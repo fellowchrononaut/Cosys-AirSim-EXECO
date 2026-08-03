@@ -459,7 +459,9 @@ void AirsimROSWrapperLite::create_ros_pubs_from_settings_json()
     list_scene_object_tags_srvr_ = nh_->create_service<airsim_interfaces::srv::ListSceneObjectTags>("~/list_scene_object_tags", std::bind(&AirsimROSWrapperLite::list_scene_object_tags_srv_cb, this, _1, _2));
 
     if (publish_clock_) {
-        clock_pub_ = nh_->create_publisher<rosgraph_msgs::msg::Clock>("~/clock", 1);
+        // Absolute "/clock": "~/clock" resolves to a private topic that no use_sim_time
+        // implementation ever reads, so the sim clock was invisible to the graph. See I-J.
+        clock_pub_ = nh_->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 1);
     }
 
     // if >0 cameras, add one more thread for img_request_timer_cb

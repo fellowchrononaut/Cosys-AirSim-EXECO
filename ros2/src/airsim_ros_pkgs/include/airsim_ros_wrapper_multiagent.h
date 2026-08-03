@@ -199,6 +199,10 @@ private:
         VehicleMode vehicle_mode_;
 
         rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_local_pub_;
+        // MAVLink vehicles only. odom_local_pub_ carries simulator GROUND TRUTH for every vehicle
+        // type; this carries the flight controller's own estimate, which used to be published as
+        // if it were truth. See I-V.
+        rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_estimated_pub_;
         rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr global_gps_pub_;
         rclcpp::Publisher<airsim_interfaces::msg::Environment>::SharedPtr env_pub_;
         rclcpp::Publisher<airsim_interfaces::msg::InstanceSegmentationList>::SharedPtr instance_segmentation_pub_;
@@ -218,7 +222,8 @@ private:
         std::vector<SensorPublisherMA<sensor_msgs::msg::PointCloud2>> echo_passive_pubs_;
         std::vector<SensorPublisherMA<airsim_interfaces::msg::StringArray>> echo_passive_labels_pubs_;
 
-        nav_msgs::msg::Odometry curr_odom_;
+        nav_msgs::msg::Odometry curr_odom_;            // simulator ground truth, all vehicle types
+        nav_msgs::msg::Odometry curr_odom_estimated_;  // MAVLink vehicles: flight-controller estimate
         sensor_msgs::msg::NavSatFix gps_sensor_msg_;
 
         std::vector<geometry_msgs::msg::TransformStamped> static_tf_msg_vec_;
