@@ -3,6 +3,16 @@
 #include "physics/ExternalPhysicsEngine.hpp"
 #include <exception>
 #include "AirBlueprintLib.h"
+#include "PhysicsTiming.h"
+
+// I-R Phase 0. Non-static: also read by UnrealLidarSensor.cpp.
+TAutoConsoleVariable<int32> CVarLogPhysicsTiming(
+	TEXT("airsim.LogPhysicsTiming"),
+	0,
+	TEXT("I-R Phase 0: report physics-loop and game-thread timing every N seconds (0 = off).\n")
+	TEXT("Discriminates physics-thread occupancy from Chaos scene-lock contention - see\n")
+	TEXT("sim_issues/Lidar_Async_Architecture.md. Diagnostic only; changes no recorded data."),
+	ECVF_Default);
 
 void ASimModeWorldBase::BeginPlay()
 {
@@ -150,8 +160,25 @@ void ASimModeWorldBase::updateDebugReport(msr::airlib::StateReporterWrapper& deb
 
 void ASimModeWorldBase::Tick(float DeltaSeconds)
 {
+    // I-R Phase 0: the game-thread half of the discriminator. If the harm is Chaos scene-lock
+    // CONTENTION, this is where it shows - the wait to acquire physics_world_->lock() balloons
+    // because the physics thread is holding it while issuing scene queries. If the harm is mere
+    // OCCUPANCY, the wait stays small and only the physics loop's own period grows.
+    static AirSimPhysicsTiming::Window tick_window;
+    static AirSimPhysicsTiming::Window lock_window;
+    const int32 timing_period = AirSimPhysicsTiming::ReportPeriodSeconds();
+    const bool timing_on = timing_period > 0;
+
+    const auto tick_t0 = AirSimPhysicsTiming::Clock::now();
+    if (timing_on) tick_window.noteEntry(tick_t0);
+
     { //keep this lock as short as possible
+        const auto lock_t0 = AirSimPhysicsTiming::Clock::now();
         physics_world_->lock();
+        if (timing_on) {
+            lock_window.noteEntry(lock_t0);
+            lock_window.noteBusy(AirSimPhysicsTiming::ToMs(AirSimPhysicsTiming::Clock::now() - lock_t0));
+        }
 
         physics_world_->enableStateReport(EnableReport);
         physics_world_->updateStateReport();
@@ -160,6 +187,22 @@ void ASimModeWorldBase::Tick(float DeltaSeconds)
             api->updateRenderedState(DeltaSeconds);
 
         physics_world_->unlock();
+    }
+
+    if (timing_on) {
+        tick_window.noteBusy(AirSimPhysicsTiming::ToMs(AirSimPhysicsTiming::Clock::now() - tick_t0));
+        const auto now = AirSimPhysicsTiming::Clock::now();
+        if (tick_window.shouldReport(now, timing_period)) {
+            UE_LOG(LogTemp, Log,
+                   TEXT("[AirSim][timing] GAME thread: tick %.2f ms avg (max %.2f) every %.2f ms avg (max %.2f) | waiting on physics lock %.3f ms avg (max %.3f) = %.1f%% of tick | n=%llu"),
+                   tick_window.busy_ms / tick_window.calls, tick_window.busy_max,
+                   tick_window.gap_ms / FMath::Max<uint64>(tick_window.calls - 1, 1), tick_window.gap_max,
+                   lock_window.busy_ms / FMath::Max<uint64>(lock_window.calls, 1), lock_window.busy_max,
+                   100.0 * lock_window.busy_ms / FMath::Max(tick_window.busy_ms, KINDA_SMALL_NUMBER),
+                   tick_window.calls);
+            tick_window.reset();
+            lock_window.reset();
+        }
     }
 
     //perform any expensive rendering update outside of lock region

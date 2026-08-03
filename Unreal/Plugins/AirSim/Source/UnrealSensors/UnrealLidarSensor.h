@@ -8,6 +8,7 @@
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "sensors/lidar/LidarSimple.hpp"
 #include "NedTransform.h"
+#include "PhysicsTiming.h"
 
 // UnrealLidarSensor implementation that uses Ray Tracing in Unreal.
 // The implementation uses a model similar to CARLA Lidar implementation.
@@ -20,6 +21,11 @@ public:
 public:
     UnrealLidarSensor(const AirSimSettings::LidarSetting& setting,
                       AActor* actor, const NedTransform* ned_transform);
+
+    // I-R Phase 0 only: times the TRUE physics loop, then defers to the base. Called once per
+    // World::update() per sensor, ahead of the FrequencyLimiter, so its interval is the loop period
+    // rather than the limiter period.
+    virtual void update(float delta = 0) override;
 
 protected:
     virtual bool getPointCloud(const msr::airlib::Pose& lidar_pose, const msr::airlib::Pose& vehicle_pose,
@@ -48,6 +54,18 @@ private:
     msr::airlib::vector<msr::airlib::real_T> laser_angles_;
     msr::airlib::vector<FVector> point_cloud_draw_;
 	uint32 current_horizontal_angle_index_ = 0;
+	// I-R Phase 0 (airsim.LogPhysicsTiming). Both touched only from the physics thread, so they need
+	// no synchronisation and cannot perturb the contention they measure. The local TimingExit struct
+	// in getPointCloud reads timing_window_ directly - a class local to a member function inherits
+	// that function's access rights, so no friend declaration is required.
+	//
+	// timing_window_ : the raycast BURST - cost of getPointCloud, and the interval between bursts.
+	//                  That interval is gated by the FrequencyLimiter (UpdateFrequency), NOT the
+	//                  physics loop, which is what the first version of this probe got wrong.
+	// loop_window_   : the TRUE physics loop period. update() is called once per World::update()
+	//                  for every sensor, before the limiter decides whether to do any work.
+	AirSimPhysicsTiming::Window timing_window_;
+	AirSimPhysicsTiming::Window loop_window_;
 	// airsim.LogLidarSweep diagnostic. A sweep is accumulated across several ticks, each tick's
 	// points expressed in the vehicle frame AT THAT TICK (shootLaser ends with
 	// transformToBodyFrame(..., lidar_pose + vehicle_pose)), then handed out as one cloud with one

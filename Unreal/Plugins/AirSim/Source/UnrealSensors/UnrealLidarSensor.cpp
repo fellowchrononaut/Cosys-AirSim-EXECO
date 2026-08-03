@@ -10,6 +10,7 @@
 #include "Engine/Engine.h"
 #include "HAL/IConsoleManager.h"
 #include "common/ClockFactory.hpp"
+#include "PhysicsTiming.h"
 #include <random>
 
 /** Shared with LidarCamera.cpp (GPU LiDAR, SensorType 8); this is the raycast LiDAR
@@ -115,6 +116,41 @@ void UnrealLidarSensor::createLasers()
 	current_horizontal_angle_index_ = horizontal_angles_.Num()-1;
 }
 
+// I-R Phase 0. This runs once per World::update() per sensor, BEFORE the FrequencyLimiter decides
+// whether any raycasting happens, so the interval between calls is the true physics loop period.
+// The busy figure covers the whole update, so it is ~0 on limiter-suppressed iterations and jumps
+// to the raycast burst cost on the ones that do work - which is exactly the duty cycle we want.
+void UnrealLidarSensor::update(float delta)
+{
+	const int32 period = AirSimPhysicsTiming::ReportPeriodSeconds();
+	if (period <= 0) {
+		LidarSimple::update(delta);
+		return;
+	}
+
+	const auto t0 = AirSimPhysicsTiming::Clock::now();
+	loop_window_.noteEntry(t0);
+	LidarSimple::update(delta);
+	const auto now = AirSimPhysicsTiming::Clock::now();
+	loop_window_.noteBusy(AirSimPhysicsTiming::ToMs(now - t0));
+
+	if (loop_window_.shouldReport(now, period)) {
+		const double avg_gap  = loop_window_.gap_ms / FMath::Max<uint64>(loop_window_.calls - 1, 1);
+		const double avg_busy = loop_window_.busy_ms / loop_window_.calls;
+		// Duty = share of wall time this sensor's update consumes on the physics thread. This is
+		// the number that should match the real-time deficit (1 - sim/wall).
+		const double duty = 100.0 * loop_window_.busy_ms
+		                    / FMath::Max(loop_window_.gap_ms, KINDA_SMALL_NUMBER);
+		UE_LOG(LogTemp, Log,
+			   TEXT("[AirSim][timing] PHYSICS LOOP via '%s' on '%s': period %.2f ms avg (max %.2f) | update() %.3f ms avg (max %.2f) | DUTY %.1f%% of wall | n=%llu"),
+			   *FString(getName().c_str()),
+			   actor_ ? *actor_->GetName() : TEXT("?"),
+			   avg_gap, loop_window_.gap_max, avg_busy, loop_window_.busy_max, duty,
+			   loop_window_.calls);
+		loop_window_.reset();
+	}
+}
+
 // Set echo object in correct pose in physical world
 void UnrealLidarSensor::updatePose(const msr::airlib::Pose& sensor_pose, const msr::airlib::Pose& vehicle_pose)
 {
@@ -156,6 +192,40 @@ void UnrealLidarSensor::pause(const bool is_paused) {
 bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const msr::airlib::Pose& vehicle_pose,
 	const msr::airlib::TTimeDelta delta_time, msr::airlib::vector<msr::airlib::real_T>& point_cloud, msr::airlib::vector<std::string>& groundtruth, msr::airlib::vector<msr::airlib::real_T>& point_cloud_final, msr::airlib::vector<std::string>& groundtruth_final)
 {
+
+	// I-R Phase 0: cost of one raycast BURST.
+	//
+	// ⚠ The interval reported here is NOT the physics loop period. getPointCloud runs from
+	// updateOutput(), which the FrequencyLimiter gates, so this interval is the UpdateFrequency
+	// period. The first version of this probe claimed otherwise and its "% of the loop" figure was
+	// meaningless as a result. For the real loop period and duty cycle, see the PHYSICS LOOP line
+	// emitted by update() above.
+	//
+	// What this line is good for: how long the physics thread is blocked in one uninterruptible
+	// stretch. That stall is what the game thread waits out on physics_world_->lock().
+	const int32 timing_period = AirSimPhysicsTiming::ReportPeriodSeconds();
+	const bool timing_on = timing_period > 0;
+	const auto timing_t0 = AirSimPhysicsTiming::Clock::now();
+	if (timing_on) timing_window_.noteEntry(timing_t0);
+	struct TimingExit {
+		UnrealLidarSensor* self; bool on; AirSimPhysicsTiming::Clock::time_point t0; int32 period;
+		~TimingExit() {
+			if (!on) return;
+			const auto now = AirSimPhysicsTiming::Clock::now();
+			self->timing_window_.noteBusy(AirSimPhysicsTiming::ToMs(now - t0));
+			auto& w = self->timing_window_;
+			if (w.shouldReport(now, period)) {
+				const double avg_busy = w.busy_ms / w.calls;
+				const double avg_gap  = w.gap_ms / FMath::Max<uint64>(w.calls - 1, 1);
+				UE_LOG(LogTemp, Log,
+					   TEXT("[AirSim][timing] RAYCAST BURST '%s' on '%s': getPointCloud %.2f ms avg (max %.2f) | every %.2f ms (limiter-gated, NOT the loop period) | n=%llu"),
+					   *FString(self->getName().c_str()),
+					   self->actor_ ? *self->actor_->GetName() : TEXT("?"),
+					   avg_busy, w.busy_max, avg_gap, w.calls);
+				w.reset();
+			}
+		}
+	} timing_exit{ this, timing_on, timing_t0, timing_period };
 
 	updatePose(lidar_pose, vehicle_pose);
 
