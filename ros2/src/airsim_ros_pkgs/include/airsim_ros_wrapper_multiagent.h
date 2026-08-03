@@ -138,6 +138,9 @@ struct SensorPublisherMA
     msr::airlib::SensorBase::SensorType sensor_type;
     std::string sensor_name;
     typename rclcpp::Publisher<T>::SharedPtr publisher;
+    // I-F: last source timestamp published, so an unchanged sample is not re-sent. 0 = nothing
+    // published yet. The sensor produces at 5-20 Hz while the timer fires at 100 Hz.
+    uint64_t last_published_stamp = 0;
 };
 
 class AirsimROSWrapperMultiAgent

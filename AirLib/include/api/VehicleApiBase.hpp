@@ -116,7 +116,11 @@ Some methods may not be applicable to specific vehicle in which case an exceptio
         }
 
         // Lidar APIs
-        virtual const LidarData& getLidarData(const std::string& lidar_name) const
+        // I-S: returns BY VALUE, not by const reference. The sensor is written from the physics
+        // thread while this is read from the RPC thread; handing out a reference to the live member
+        // let the caller read it after any synchronisation had been released, which corrupted the
+        // heap. LidarBase::getOutput() now hands back an immutable snapshot.
+        virtual LidarData getLidarData(const std::string& lidar_name) const
         {
             auto* lidar = static_cast<const LidarBase*>(findSensorByName(lidar_name, SensorBase::SensorType::Lidar));
             if (lidar == nullptr)

@@ -366,7 +366,9 @@ namespace airlib
         });
 
         pimpl_->server.bind("getLidarData", [&](const std::string& lidar_name, const std::string& vehicle_name) -> RpcLibAdaptorsBase::LidarData {
-            const auto& lidar_data = getVehicleApi(vehicle_name)->getLidarData(lidar_name);
+            // I-S: value, not reference - this is a snapshot the RPC thread owns while it
+            // serialises. Binding a reference here is what raced with the physics thread.
+            const auto lidar_data = getVehicleApi(vehicle_name)->getLidarData(lidar_name);
             return RpcLibAdaptorsBase::LidarData(lidar_data);
         });
 

@@ -864,14 +864,29 @@ void AirsimROSWrapperMultiAgent::lidar_timer_cb()
 
             std::unordered_map<std::string, msr::airlib::LidarData> sensor_cache;
 
+            // I-F: this timer fires at 100 Hz (update_lidar_every_n_sec: 0.01) while the sensor
+            // completes a revolution at 5-20 Hz, so most ticks re-sent an identical cloud under an
+            // identical header stamp: ~39 MB/s per LiDAR of pure duplication, against ~2-8 MB/s of
+            // real data. Publish only when the source timestamp advances.
+            //
+            // NOTE this does NOT reduce the RPC read rate - the data must be fetched to learn its
+            // timestamp - so it is a bandwidth fix, not a concurrency one. The concurrency problem
+            // (I-S) is fixed in LidarBase by handing out an immutable snapshot. To cut RPC load as
+            // well, raise update_lidar_every_n_sec toward the sensor's actual rate.
             for (auto& pub : vehicle_ros->lidar_pubs_) {
                 auto data  = lidar_client.getLidarData(pub.sensor_name, vname);
                 sensor_cache[pub.sensor_name] = data;
+                if (data.time_stamp == pub.last_published_stamp)
+                    continue;
+                pub.last_published_stamp = data.time_stamp;
                 pub.publisher->publish(get_lidar_msg_from_airsim(data, vname, pub.sensor_name));
             }
             for (auto& pub : vehicle_ros->lidar_labels_pubs_) {
                 auto it = sensor_cache.find(pub.sensor_name);
                 msr::airlib::LidarData data = (it != sensor_cache.end()) ? it->second : lidar_client.getLidarData(pub.sensor_name, vname);
+                if (data.time_stamp == pub.last_published_stamp)
+                    continue;
+                pub.last_published_stamp = data.time_stamp;
                 pub.publisher->publish(get_lidar_labels_msg_from_airsim(data, vname, pub.sensor_name));
             }
         }
