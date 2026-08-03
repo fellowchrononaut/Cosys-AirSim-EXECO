@@ -58,13 +58,25 @@ void SkidVehiclePawnApi::updateMovement(const msr::airlib::CarApiBase::CarContro
 		}
 		if (turn_started_) {
 			if (controls.throttle == 0) {
-				// For some reason ChaosVehicles when setting Yaw input with negative value requires a velocity on the vehicle
-				if((FMath::Abs(movement_->GetForwardSpeed() / 100)) < 0.02 && controls.steering > 0) {					
-					to_set_controls_.throttle = pawn_->fixed_turn_rate_;	
+				// ChaosVehicles ignores a yaw input applied to a stationary vehicle, so a small
+				// throttle is injected to give it the velocity it needs to respond.
+				//
+				// This used to be gated on `controls.steering > 0`, which is the opposite of what
+				// the original comment here described ("negative value requires a velocity"): the
+				// nudge fired for RIGHT turns, which do not need it, and was skipped for LEFT
+				// turns, which do. Result: a stationary Husky would not turn left at all unless
+				// throttle was held at the same time, while right worked. Steering still reached
+				// Chaos as -1, so the on-screen value looked correct - the vehicle simply ignored
+				// it.
+				//
+				// Applied to both directions: the nudge is harmless where it is not needed, and
+				// gating on sign is what caused the asymmetry in the first place.
+				if((FMath::Abs(movement_->GetForwardSpeed() / 100)) < 0.02 && controls.steering != 0) {
+					to_set_controls_.throttle = pawn_->fixed_turn_rate_;
 					set_throttle = true;
 				}
 			}
-		}			
+		}
 		if (controls.steering != 0 && pawn_->stop_turn_) {
 			to_set_controls_.steering = FMath::Lerp(controls.steering, 0, pawn_->fixed_turn_rate_);
 			set_steering = true;
