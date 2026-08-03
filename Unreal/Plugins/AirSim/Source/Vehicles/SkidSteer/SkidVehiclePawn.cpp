@@ -355,9 +355,27 @@ void ASkidVehiclePawn::setupInputBindings()
 	UAirBlueprintLib::BindActionToKey("Handbrake", EKeys::End, this, &ASkidVehiclePawn::onHandbrakePressed, true);
 	UAirBlueprintLib::BindActionToKey("Handbrake", EKeys::End, this, &ASkidVehiclePawn::onHandbrakeReleased, false);
 	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("Footbrake", EKeys::SpaceBar, 1), this, this, &ASkidVehiclePawn::onFootBrake);
-	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("MoveRight", EKeys::Gamepad_LeftX, 1), this, this, &ASkidVehiclePawn::onMoveRight);
+	// --- Gamepad ------------------------------------------------------------------------------
+	// Keyboard bindings above are deliberately left alone.
+	//
+	// RT = forward, LT = reverse, LB/RB = turn left/right.
+	//
+	// ⚠ LT is bound to MoveForward with scale -1, NOT to Footbrake. Reverse on this vehicle is a
+	// negative throttle, which updateMovement converts into a brake input - and Chaos, with
+	// bReverseAsBrake effectively true, reads brake as the reverse command. Binding LT to Footbrake
+	// instead would send raw brake and also reverse, but by a different route that bypasses the
+	// throttle state machine (move_started_ / move_completed_). Route it through MoveForward so the
+	// gamepad and the Down arrow behave identically. See U-5.
 	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("MoveForward", EKeys::Gamepad_RightTriggerAxis, 1), this, this, &ASkidVehiclePawn::onMoveForward);
-	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("Footbrake", EKeys::Gamepad_LeftTriggerAxis, 1), this, this, &ASkidVehiclePawn::onFootBrake);
+	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("MoveForward", EKeys::Gamepad_LeftTriggerAxis, -1), this, this, &ASkidVehiclePawn::onMoveForward);
+
+	// Shoulder buttons steer. Same scales as the Left/Right arrow keys, so they share the U-1
+	// stationary-turn path.
+	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("MoveRight", EKeys::Gamepad_RightShoulder, 1), this, this, &ASkidVehiclePawn::onMoveRight);
+	UAirBlueprintLib::BindAxisToKey(FInputAxisKeyMapping("MoveRight", EKeys::Gamepad_LeftShoulder, -1), this, this, &ASkidVehiclePawn::onMoveRight);
+
+	// ⚠ The analog sticks are deliberately NOT bound. They are reserved for flying the drone, and a
+	// stick binding here would steer the Husky at the same time. Steering is on LB/RB only.
 }
 
 void ASkidVehiclePawn::onMoveForward(float Val)
