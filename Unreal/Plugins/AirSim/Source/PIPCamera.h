@@ -68,6 +68,12 @@ public:
     bool getCameraTypeEnabled(ImageType type, std::string annotation_name = "") const;
     AirSimSettings::CameraSetting getParams() const;
     void setCaptureUpdate(USceneCaptureComponent2D* capture, bool nodisplay);
+
+    // I-G. Force bCaptureEveryFrame on every capture component this camera owns, without touching
+    // viewport rendering the way the NoDisplay view mode does. Driven by airsim.CaptureEveryFrame;
+    // see PIPCamera.cpp. simGetImages does not need per-frame capture - it issues its own
+    // CaptureSceneDeferred - so turning this off is a candidate fix, not only a diagnostic.
+    void setAllCapturesEveryFrame(bool enabled);
     void setCameraTypeUpdate(ImageType type, bool nodisplay, std::string annotation_name = "");
     void setCameraOrientation(const FRotator& rotator);
     void updateInstanceSegmentationAnnotation(TArray<TWeakObjectPtr<UPrimitiveComponent> >& ComponentList, bool only_hide=false);

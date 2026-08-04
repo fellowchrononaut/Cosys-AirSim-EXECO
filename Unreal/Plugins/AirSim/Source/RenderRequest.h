@@ -7,6 +7,7 @@
 #include "Engine/GameViewportClient.h"
 #include <memory>
 #include "common/Common.hpp"
+#include "ImageTiming.h"
 
 
 class RenderRequest : public FRenderCommand
@@ -58,6 +59,9 @@ private:
     // serial GPU render and readback take. Written game thread -> read render thread, ordered by
     // the ENQUEUE_RENDER_COMMAND that follows. See airsim.BatchImageTimestamp.
     msr::airlib::TTimePoint batch_time_stamp_ = 0;
+
+    // I-G Step 0a. Segment boundaries for one getScreenshot call; see ImageTiming.h.
+    AirSimImageTiming::Call timing_{};
 
 public:
     RenderRequest(UGameViewportClient * game_viewport, std::function<void()>&& query_camera_pose_cb);

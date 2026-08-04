@@ -10,6 +10,90 @@
 #include <string>
 #include <exception>
 #include "AirBlueprintLib.h"
+#include "HAL/IConsoleManager.h"
+#include "EngineUtils.h"
+#include "Engine/Engine.h"
+
+/** I-G diagnostic and candidate fix.
+ *
+ *  A 1-image simGetImages call costs ~215 ms of render+readback on a 6-vehicle / 24-camera rig,
+ *  while `b wait-draw` stays at ~6 ms. Small b with huge c+d means the GAME thread is not blocked
+ *  but the RENDER thread is deep - the signature of per-frame capture work piling up in the render
+ *  queue, with our readback command waiting behind it.
+ *
+ *  setCaptureUpdate() sets bCaptureEveryFrame = !nodisplay, so every capture component that has
+ *  ever been enabled keeps re-rendering the scene each frame. simGetImages does NOT need that: it
+ *  issues its own CaptureSceneDeferred() for exactly the components requested.
+ *
+ *  The NoDisplay view mode ('-') would clear the flag, but it also disables viewport world
+ *  rendering, which confounds the measurement - and the key is relocated on non-QWERTY layouts
+ *  anyway (see ui_issues U-10). This CVar isolates the flag alone.
+ *
+ *   -1 = leave alone (default, current behaviour)
+ *    0 = force OFF on every capture component of every camera
+ *    1 = force ON
+ *
+ *  ⚠ Turning it off makes SubWindows and anything else relying on continuous capture go stale.
+ *  The main viewport is unaffected: it renders through the UCineCameraComponent, not a capture. */
+static TAutoConsoleVariable<int32> CVarCaptureEveryFrame(
+    TEXT("airsim.CaptureEveryFrame"),
+    -1,
+    TEXT("I-G: force bCaptureEveryFrame on all camera capture components.\n")
+    TEXT(" -1: leave alone (default)\n")
+    TEXT("  0: force off - simGetImages still works, it captures on demand\n")
+    TEXT("  1: force on"),
+    ECVF_Default);
+
+namespace
+{
+    // Applies the CVar to every APIPCamera in the running game world. Registered as an on-changed
+    // callback so it takes effect the moment the value is set from the console.
+    void ApplyCaptureEveryFrameCVar(IConsoleVariable* var)
+    {
+        const int32 value = var->GetInt();
+        if (value < 0 || GEngine == nullptr)
+            return;
+
+        UWorld* world = nullptr;
+        for (const FWorldContext& ctx : GEngine->GetWorldContexts()) {
+            if (ctx.World() != nullptr &&
+                (ctx.WorldType == EWorldType::Game || ctx.WorldType == EWorldType::PIE)) {
+                world = ctx.World();
+                break;
+            }
+        }
+        if (world == nullptr)
+            return;
+
+        int32 cameras = 0;
+        for (TActorIterator<APIPCamera> it(world); it; ++it) {
+            it->setAllCapturesEveryFrame(value != 0);
+            ++cameras;
+        }
+        UE_LOG(LogTemp, Log, TEXT("[AirSim] airsim.CaptureEveryFrame=%d applied to %d cameras"),
+               value, cameras);
+    }
+
+    struct FCaptureEveryFrameCVarBinder
+    {
+        FCaptureEveryFrameCVarBinder()
+        {
+            CVarCaptureEveryFrame.AsVariable()->SetOnChangedCallback(
+                FConsoleVariableDelegate::CreateStatic(&ApplyCaptureEveryFrameCVar));
+        }
+    };
+    FCaptureEveryFrameCVarBinder g_capture_every_frame_binder;
+}
+
+void APIPCamera::setAllCapturesEveryFrame(bool enabled)
+{
+    for (USceneCaptureComponent2D* capture : captures_) {
+        if (capture != nullptr) {
+            capture->bCaptureEveryFrame = enabled;
+            capture->bCaptureOnMovement = enabled;
+        }
+    }
+}
 
 //CinemAirSim
 APIPCamera::APIPCamera(const FObjectInitializer& ObjectInitializer)
@@ -1131,14 +1215,32 @@ void APIPCamera::onViewModeChanged(bool nodisplay)
         }
         else
         {
-            if (Utils::toEnum<ImageType>(image_type) != ImageType::Scene)
-            {
-                USceneCaptureComponent2D* capture = getCaptureComponent(static_cast<ImageType>(image_type), false);
-                if (capture) {
-                    setCaptureUpdate(capture, nodisplay);
-                }
-            }           
-        }                
+            // I-G root cause. ImageType::Scene used to be excluded here, with no comment saying
+            // why, so Scene capture components never got bCaptureEveryFrame = false and kept
+            // re-rendering the whole scene EVERY FRAME - even though the caller ten lines up says:
+            //
+            //     "We set all cameras to start as nodisplay. This improves performance because the
+            //      capture components are no longer updating every frame and only update while
+            //      requesting an image"
+            //
+            // With 6 vehicles x 9 cameras that is 55 scene renders per frame, and a simGetImages
+            // readback ends up queued behind all of them: measured c+d 215 ms with b wait-draw only
+            // 6 ms - the game thread was fine, the render thread was 200 ms deep.
+            //
+            // Including Scene here cuts a fleet cycle 1535 -> 242 ms (6.35x), images verified
+            // unchanged. Nothing needs Scene to capture every frame:
+            //   - the main viewport renders through camera_ (UCineCameraComponent) + SetViewTarget,
+            //     not through this capture component - see showToScreen()
+            //   - simGetImages issues its own CaptureSceneDeferred() for what it requests
+            //   - SubWindows DO need it, and set it themselves in
+            //     ASimHUD::updateWidgetSubwindowVisibility via setCameraTypeUpdate(type, false)
+            //
+            // airsim.CaptureEveryFrame still forces either state at runtime for A/B.
+            USceneCaptureComponent2D* capture = getCaptureComponent(static_cast<ImageType>(image_type), false);
+            if (capture) {
+                setCaptureUpdate(capture, nodisplay);
+            }
+        }
     }
 }
 

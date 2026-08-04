@@ -37,6 +37,25 @@ static TAutoConsoleVariable<int32> CVarBatchImageTimestamp(
     TEXT("  1: Force the shared capture instant, sampled with the camera poses in OnEndDraw"),
     ECVF_Default);
 
+// I-G Step 0a. Non-static: read by ImageTiming.h's ReportPeriodSeconds().
+TAutoConsoleVariable<int32> CVarLogImageTiming(
+    TEXT("airsim.LogImageTiming"),
+    0,
+    TEXT("I-G Step 0: break simGetImages wall time into segments, every N seconds (0 = off).\n")
+    TEXT("Reports a=wait for game thread, b=wait for OnEndDraw, c+d=render+readback, e=compress.\n")
+    TEXT("Flat in image count => latency-bound => build D9 batching.\n")
+    TEXT("Linear in image count => readback-bound => D9 will disappoint. Diagnostic only."),
+    ECVF_Default);
+
+namespace
+{
+    // Accumulates across every RenderRequest instance; one is constructed per capture call, so the
+    // window cannot live on the object. Guarded because the MultiAgent build runs three RPC servers
+    // (41451/41452/41453) whose handlers can capture concurrently.
+    FCriticalSection g_image_timing_mutex;
+    AirSimImageTiming::Window g_image_timing_window;
+}
+
 /** Resolve the setting against the debug override. */
 static bool ShouldStampAtCaptureInstant()
 {
@@ -74,6 +93,14 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
     //make sure we are not on the rendering thread
     CheckNotBlockedOnRenderThread();
 
+    // I-G Step 0a: segment (a) starts here, on the RPC thread.
+    const bool timing_on = AirSimImageTiming::ReportPeriodSeconds() > 0;
+    if (timing_on) {
+        timing_ = AirSimImageTiming::Call();
+        timing_.t_rpc_enter = AirSimImageTiming::Clock::now();
+        timing_.images = req_size;
+    }
+
     if (use_safe_method) {
         for (unsigned int i = 0; i < req_size; ++i) {
             if (params[i]->render_target != nullptr && params[i]->render_component != nullptr) {
@@ -101,13 +128,22 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
         req_size_ = req_size;
 
         // Queue up the task of querying camera pose in the game thread and synchronizing render thread with camera pose
-        AsyncTask(ENamedThreads::GameThread, [this]() {
+        AsyncTask(ENamedThreads::GameThread, [this, timing_on]() {
             check(IsInGameThread());
+
+            // I-G Step 0a: end of segment (a) - how long the game thread took to pick this up.
+            if (timing_on)
+                timing_.t_game_task = AirSimImageTiming::Clock::now();
 
             saved_DisableWorldRendering_ = game_viewport_->bDisableWorldRendering;
             game_viewport_->bDisableWorldRendering = 0;
-            end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this] {
+            end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this, timing_on] {
                 check(IsInGameThread());
+
+                // I-G Step 0a: end of segment (b) - the wait for the next rendered frame. This is
+                // the boundary that decides latency-bound vs readback-bound.
+                if (timing_on)
+                    timing_.t_end_draw = AirSimImageTiming::Clock::now();
 
                 // Capture instant for the whole batch, taken with the poses so time and pose agree.
                 // This is the moment every image in the batch actually corresponds to; the serial
@@ -174,6 +210,39 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
                     *ptr++ = item.R.GetFloat();
                 }
             }
+        }
+    }
+
+    // I-G Step 0a: end of segment (e), and the window report. The safe-method path never reaches
+    // OnEndDraw, so only the deferred path is measured - which is the one in use.
+    if (timing_on && !use_safe_method &&
+        timing_.t_game_task != AirSimImageTiming::Clock::time_point{} &&
+        timing_.t_end_draw != AirSimImageTiming::Clock::time_point{} &&
+        timing_.t_readback_done != AirSimImageTiming::Clock::time_point{}) {
+
+        timing_.valid = true;
+        const auto t_return = AirSimImageTiming::Clock::now();
+        const int32 period = AirSimImageTiming::ReportPeriodSeconds();
+
+        FScopeLock lock(&g_image_timing_mutex);
+        g_image_timing_window.note(timing_, t_return);
+
+        if (g_image_timing_window.shouldReport(t_return, period)) {
+            const AirSimImageTiming::Window& w = g_image_timing_window;
+            const double n = static_cast<double>(w.calls);
+            UE_LOG(LogTemp, Log,
+                   TEXT("[AirSim][imgtiming] %llu calls, %.2f img/call | total %.2f ms avg (max %.2f) | ")
+                   TEXT("a wait-game %.2f (max %.2f) | b wait-draw %.2f (max %.2f) | ")
+                   TEXT("c+d render+readback %.2f (max %.2f) | e compress %.2f (max %.2f) | ")
+                   TEXT("latency a+b = %.0f%% of total"),
+                   w.calls, w.images / n,
+                   w.total_ms / n, w.total_max,
+                   w.a_ms / n, w.a_max,
+                   w.b_ms / n, w.b_max,
+                   w.cd_ms / n, w.cd_max,
+                   w.e_ms / n, w.e_max,
+                   100.0 * (w.a_ms + w.b_ms) / FMath::Max(w.total_ms, KINDA_SMALL_NUMBER));
+            g_image_timing_window.reset();
         }
     }
 }
@@ -253,6 +322,11 @@ void RenderRequest::ExecuteTask()
                    req_size_, (unsigned long long)batch_time_stamp_,
                    (double)(last - first) * 1e-6, *offsets);
         }
+
+        // I-G Step 0a: end of segment (c+d) - scene render plus the serial blocking readback.
+        // Sampled before the signal so it excludes the RPC thread's wake-up.
+        if (AirSimImageTiming::ReportPeriodSeconds() > 0)
+            timing_.t_readback_done = AirSimImageTiming::Clock::now();
 
         req_size_ = 0;
         params_ = nullptr;
