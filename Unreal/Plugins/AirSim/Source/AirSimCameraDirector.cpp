@@ -48,6 +48,202 @@ ECameraDirectorMode AAirSimCameraDirector::getMode()
     return mode_;
 }
 
+// ---------------------------------------------------------------------------------------------
+// U-9: vehicle and camera cycling.
+//
+// One global "current vehicle" shared by every mode, so switching mode never moves you to a
+// different vehicle. A mode key enters the mode; pressing it again while already in that mode
+// advances to the next vehicle. Shift+key advances the camera within the current vehicle, which
+// only means anything in the modes that look through a vehicle camera.
+// ---------------------------------------------------------------------------------------------
+
+void AAirSimCameraDirector::registerVehicle(AActor* pawn, const FString& vehicle_name,
+                                            const TArray<APIPCamera*>& cameras, const TArray<FString>& camera_names)
+{
+    if (pawn == nullptr)
+        return;
+
+    FDirectorVehicle entry;
+    entry.pawn = pawn;
+    entry.name = vehicle_name;
+    entry.cameras = cameras;
+    entry.camera_names = camera_names;
+    vehicles_.Add(MoveTemp(entry));
+}
+
+bool AAirSimCameraDirector::isShiftHeld() const
+{
+    // Read the modifier rather than binding a second Shift+key action. Two action mappings that
+    // differ only by modifier rely on UE's chord masking to not both fire; reading the key state
+    // is deterministic and needs one binding per mode instead of two.
+    const APlayerController* pc = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+    if (pc == nullptr)
+        return false;
+
+    return pc->IsInputKeyDown(EKeys::LeftShift) || pc->IsInputKeyDown(EKeys::RightShift);
+}
+
+bool AAirSimCameraDirector::modeUsesVehicleCamera(ECameraDirectorMode mode) const
+{
+    return mode == ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FPV ||
+           mode == ECameraDirectorMode::CAMERA_DIRECTOR_MODE_BACKUP ||
+           mode == ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FRONT;
+}
+
+APIPCamera* AAirSimCameraDirector::currentCamera() const
+{
+    if (!vehicles_.IsValidIndex(current_vehicle_))
+        return nullptr;
+
+    const FDirectorVehicle& vehicle = vehicles_[current_vehicle_];
+    return vehicle.cameras.IsValidIndex(current_camera_) ? vehicle.cameras[current_camera_] : nullptr;
+}
+
+void AAirSimCameraDirector::announceSelection(ECameraDirectorMode mode) const
+{
+    if (!vehicles_.IsValidIndex(current_vehicle_))
+        return;
+
+    const FDirectorVehicle& vehicle = vehicles_[current_vehicle_];
+
+    FString message = FString::Printf(TEXT("%s  [vehicle %d/%d]"),
+                                      *vehicle.name, current_vehicle_ + 1, vehicles_.Num());
+
+    if (modeUsesVehicleCamera(mode)) {
+        const FString camera_name = vehicle.camera_names.IsValidIndex(current_camera_)
+                                        ? vehicle.camera_names[current_camera_]
+                                        : TEXT("<none>");
+        message += FString::Printf(TEXT("  camera %s  [%d/%d]"),
+                                   *camera_name, current_camera_ + 1, vehicle.cameras.Num());
+    }
+
+    //5s rather than the 60s default: this is a transient confirmation, not a status line
+    UAirBlueprintLib::LogMessageString("View: ", TCHAR_TO_UTF8(*message), LogDebugLevel::Informational, 5);
+    UE_LOG(LogTemp, Log, TEXT("CameraDirector view: %s"), *message);
+}
+
+void AAirSimCameraDirector::selectCameraByName(const FString& preferred)
+{
+    if (!vehicles_.IsValidIndex(current_vehicle_))
+        return;
+
+    const FDirectorVehicle& vehicle = vehicles_[current_vehicle_];
+    const int32 found = vehicle.camera_names.IndexOfByKey(preferred);
+    if (found != INDEX_NONE)
+        current_camera_ = found;
+    else if (!vehicle.cameras.IsValidIndex(current_camera_))
+        current_camera_ = 0; //this vehicle has no camera by that name; fall back to its first
+}
+
+// Each camera mode has a default viewpoint. Entering the mode, or arriving at a new vehicle, snaps
+// to it; Shift+key then walks away from it through the rest of the vehicle's cameras.
+void AAirSimCameraDirector::selectPreferredCamera(ECameraDirectorMode mode)
+{
+    switch (mode) {
+    case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FPV:
+        selectCameraByName(TEXT("fpv"));
+        break;
+    case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_BACKUP:
+        selectCameraByName(TEXT("back_center"));
+        break;
+    case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FRONT:
+        selectCameraByName(TEXT("front_center"));
+        break;
+    default:
+        //external-camera mode: no vehicle camera in use, just keep the index valid
+        if (vehicles_.IsValidIndex(current_vehicle_) &&
+            !vehicles_[current_vehicle_].cameras.IsValidIndex(current_camera_))
+            current_camera_ = 0;
+        break;
+    }
+}
+
+void AAirSimCameraDirector::advanceVehicle()
+{
+    if (vehicles_.Num() < 2)
+        return;
+
+    if (APIPCamera* outgoing = currentCamera())
+        outgoing->disableMain();
+
+    current_vehicle_ = (current_vehicle_ + 1) % vehicles_.Num();
+}
+
+void AAirSimCameraDirector::advanceCamera()
+{
+    if (!vehicles_.IsValidIndex(current_vehicle_))
+        return;
+
+    const FDirectorVehicle& vehicle = vehicles_[current_vehicle_];
+    if (vehicle.cameras.Num() < 2)
+        return;
+
+    // Once cycling has moved off a mode's default camera, the outgoing one is no longer in any of
+    // the three tracked slots, so disableCameras() will not turn it off. Do it explicitly.
+    if (APIPCamera* outgoing = currentCamera())
+        outgoing->disableMain();
+
+    current_camera_ = (current_camera_ + 1) % vehicle.cameras.Num();
+}
+
+// Point whichever camera slot the target mode reads at the current selection, so cycling reuses the
+// existing show/disable machinery in the input handlers rather than duplicating it.
+void AAirSimCameraDirector::applySelection(ECameraDirectorMode target_mode)
+{
+    if (!vehicles_.IsValidIndex(current_vehicle_))
+        return;
+
+    APIPCamera* selected = currentCamera();
+    follow_actor_ = vehicles_[current_vehicle_].pawn;
+
+    switch (target_mode) {
+    case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FPV:
+        fpv_camera_ = selected;
+        break;
+    case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_BACKUP:
+        backup_camera_ = selected;
+        break;
+    case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FRONT:
+        front_camera_ = selected;
+        break;
+    default:
+        break; //external-camera modes follow follow_actor_, no slot to set
+    }
+
+    // Staying in SpringArmChase while changing vehicle: setMode() will not re-run the attach,
+    // because neither its detach condition (mode changed) nor the attach guard (camera not already
+    // on the arm) is met. Re-parent explicitly or the arm keeps hanging off the old vehicle.
+    if (target_mode == ECameraDirectorMode::CAMERA_DIRECTOR_MODE_SPRINGARM_CHASE &&
+        mode_ == ECameraDirectorMode::CAMERA_DIRECTOR_MODE_SPRINGARM_CHASE) {
+        attachSpringArm(false);
+        attachSpringArm(true);
+    }
+}
+
+void AAirSimCameraDirector::handleModeKey(ECameraDirectorMode mode)
+{
+    if (vehicles_.Num() == 0)
+        return;
+
+    const bool cycling = !suppress_cycle_;
+
+    if (cycling && isShiftHeld()) {
+        if (modeUsesVehicleCamera(mode))
+            advanceCamera();
+        //else: external-camera mode has no vehicle cameras to cycle
+    }
+    else if (cycling && mode_ == mode) {
+        advanceVehicle();
+        selectPreferredCamera(mode); //a new vehicle starts at this mode's default viewpoint
+    }
+    else {
+        selectPreferredCamera(mode); //entering the mode, or initial setup
+    }
+
+    applySelection(mode);
+    announceSelection(mode);
+}
+
 void AAirSimCameraDirector::initializeForBeginPlay(ECameraDirectorMode view_mode,
                                              AActor* follow_actor, APIPCamera* fpv_camera, APIPCamera* front_camera, APIPCamera* back_camera)
 {
@@ -67,7 +263,20 @@ void AAirSimCameraDirector::initializeForBeginPlay(ECameraDirectorMode view_mode
     initial_ground_obs_offset_ = camera_start_location_ -
                                  (follow_actor_ ? follow_actor_->GetActorLocation() : FVector::ZeroVector);
 
-    //set initial view mode
+    // U-9: start the cycle on whichever vehicle was chosen as the default, so the first press of a
+    // mode key advances from what is actually on screen rather than jumping to vehicle 1.
+    current_vehicle_ = 0;
+    current_camera_ = 0;
+    if (follow_actor_ != nullptr) {
+        const int32 found = vehicles_.IndexOfByPredicate(
+            [this](const FDirectorVehicle& v) { return v.pawn == follow_actor_; });
+        if (found != INDEX_NONE)
+            current_vehicle_ = found;
+    }
+
+    //set initial view mode. suppress_cycle_ keeps these calls from reading as keypresses.
+    TGuardValue<bool> no_cycle(suppress_cycle_, true);
+
     switch (mode_) {
     case ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FLY_WITH_ME:
         inputEventFlyWithView();
@@ -111,6 +320,15 @@ void AAirSimCameraDirector::attachSpringArm(bool attach)
             //attach spring arm to actor
             SpringArm->AttachToComponent(follow_actor_->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
             SpringArm->SetRelativeLocation(FVector(0.0f, 0.0f, 34.0f));
+
+            // Reset the arm's orientation relative to the new parent, not just its position.
+            // Detaching uses KeepWorldTransform (so the free camera stays put when leaving this
+            // mode, U-7b), which bakes the old parent's world rotation into the arm's RELATIVE
+            // rotation. Re-attaching with KeepRelativeTransform then carries that stale attitude
+            // onto the new vehicle: after chasing a pitched-up drone, switching to the ground robot
+            // left the arm still pitched up, putting the camera under the floor looking upward.
+            // -20 pitch matches the value the constructor gives the arm while it is unparented.
+            SpringArm->SetRelativeRotation(FRotator(-20.0f, 0.0f, 0.0f));
 
             //remember current parent for external camera. Later when we remove external
             //camera from spring arm, we will attach it back to its last parent
@@ -224,6 +442,7 @@ void AAirSimCameraDirector::setupInputBindings()
 
 void AAirSimCameraDirector::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    vehicles_.Empty();
     manual_pose_controller_ = nullptr;
     SpringArm = nullptr;
     ExternalCamera = nullptr;
@@ -257,6 +476,8 @@ APIPCamera* AAirSimCameraDirector::getFrontCamera() const
 
 void AAirSimCameraDirector::inputEventSpringArmChaseView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_SPRINGARM_CHASE);
+
     if (ExternalCamera) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_SPRINGARM_CHASE);
         ExternalCamera->showToScreen();
@@ -270,6 +491,8 @@ void AAirSimCameraDirector::inputEventSpringArmChaseView()
 
 void AAirSimCameraDirector::inputEventGroundView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_GROUND_OBSERVER);
+
     if (ExternalCamera) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_GROUND_OBSERVER);
         ExternalCamera->showToScreen();
@@ -284,6 +507,8 @@ void AAirSimCameraDirector::inputEventGroundView()
 
 void AAirSimCameraDirector::inputEventManualView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_MANUAL);
+
     if (ExternalCamera) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_MANUAL);
         ExternalCamera->showToScreen();
@@ -297,6 +522,8 @@ void AAirSimCameraDirector::inputEventManualView()
 
 void AAirSimCameraDirector::inputEventNoDisplayView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_NODISPLAY);
+
     if (ExternalCamera) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_NODISPLAY);
         disableCameras(true, true, true);
@@ -309,6 +536,8 @@ void AAirSimCameraDirector::inputEventNoDisplayView()
 
 void AAirSimCameraDirector::inputEventBackupView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_BACKUP);
+
     if (backup_camera_) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_BACKUP);
         backup_camera_->showToScreen();
@@ -322,6 +551,8 @@ void AAirSimCameraDirector::inputEventBackupView()
 
 void AAirSimCameraDirector::inputEventFrontView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FRONT);
+
     if (front_camera_) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FRONT);
         front_camera_->showToScreen();
@@ -335,6 +566,8 @@ void AAirSimCameraDirector::inputEventFrontView()
 
 void AAirSimCameraDirector::inputEventFlyWithView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FLY_WITH_ME);
+
     if (ExternalCamera) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FLY_WITH_ME);
         ExternalCamera->showToScreen();
@@ -353,6 +586,8 @@ void AAirSimCameraDirector::inputEventFlyWithView()
 
 void AAirSimCameraDirector::inputEventFpvView()
 {
+    handleModeKey(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FPV);
+
     if (fpv_camera_) {
         setMode(ECameraDirectorMode::CAMERA_DIRECTOR_MODE_FPV);
         fpv_camera_->showToScreen();

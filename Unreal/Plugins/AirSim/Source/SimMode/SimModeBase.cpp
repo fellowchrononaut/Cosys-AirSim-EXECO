@@ -10,6 +10,8 @@
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Misc/FileHelper.h"
 #include <memory>
+#include <algorithm>
+#include <cctype>
 #include "AirBlueprintLib.h"
 #include "Annotation/ObjectAnnotator.h"
 #include "LidarCamera.h"
@@ -2143,15 +2145,62 @@ void ASimModeBase::setupVehiclesAndCamera()
         }
     }
 
+    registerVehiclesWithCameraDirector();
+
     if (getApiProvider()->hasDefaultVehicle()) {
         //TODO: better handle no FPV vehicles scenario
         getVehicleSimApi()->possess();
-        CameraDirector->initializeForBeginPlay(getInitialViewMode(), getVehicleSimApi()->getPawn(), getVehicleSimApi()->getCamera("fpv"), getVehicleSimApi()->getCamera("back_center"), nullptr);
+        CameraDirector->initializeForBeginPlay(getInitialViewMode(), getVehicleSimApi()->getPawn(), getVehicleSimApi()->getCamera("fpv"), getVehicleSimApi()->getCamera("back_center"), getVehicleSimApi()->getCamera("front_center"));
     }
     else
         CameraDirector->initializeForBeginPlay(getInitialViewMode(), nullptr, nullptr, nullptr, nullptr);
 
     checkVehicleReady();
+}
+
+// U-9. Hand the camera director every vehicle and the cameras it can be viewed through, in spawn
+// order, so mode keys can cycle between them.
+//
+// Each pawn exposes a standard set (fpv/front_center/front_left/front_right/back_center) and
+// PawnSimApi adds any camera declared in settings.json on top. The numeric aliases "0".."4" and ""
+// point at cameras already listed under a real name, so they are skipped - otherwise the same
+// camera would appear several times in the cycle.
+void ASimModeBase::registerVehiclesWithCameraDirector()
+{
+    if (CameraDirector == nullptr)
+        return;
+
+    for (auto& sim_api : vehicle_sim_apis_) {
+        PawnSimApi* pawn_sim_api = static_cast<PawnSimApi*>(sim_api.get());
+        if (pawn_sim_api == nullptr || pawn_sim_api->getPawn() == nullptr)
+            continue;
+
+        TArray<APIPCamera*> cameras;
+        TArray<FString> camera_names;
+
+        for (const auto& pair : pawn_sim_api->getCameras().getMap()) {
+            const std::string& name = pair.first;
+            APIPCamera* camera = pair.second;
+            if (camera == nullptr)
+                continue;
+
+            const bool is_alias = name.empty() ||
+                                  std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+            if (is_alias)
+                continue;
+
+            if (cameras.Contains(camera))
+                continue; //already listed under another name
+
+            cameras.Add(camera);
+            camera_names.Add(FString(name.c_str()));
+        }
+
+        CameraDirector->registerVehicle(pawn_sim_api->getPawn(),
+                                        FString(pawn_sim_api->getVehicleName().c_str()),
+                                        cameras,
+                                        camera_names);
+    }
 }
 
 void ASimModeBase::registerPhysicsBody(msr::airlib::VehicleSimApiBase* physicsBody)

@@ -257,6 +257,9 @@ protected: //must overrides
                                                        const PawnSimApi* sim_api) const;
     virtual void registerPhysicsBody(msr::airlib::VehicleSimApiBase* physicsBody);
 
+    //U-9: give the camera director the vehicle/camera list it cycles through
+    void registerVehiclesWithCameraDirector();
+
 protected: //optional overrides
     virtual APawn* createVehiclePawn(const AirSimSettings::VehicleSetting& vehicle_setting);
     virtual std::unique_ptr<PawnSimApi> createVehicleApi(APawn* vehicle_pawn);

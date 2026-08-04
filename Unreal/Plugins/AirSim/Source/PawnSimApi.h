@@ -127,6 +127,13 @@ public: //Unreal specific methods
     APIPCamera* getCamera(const std::string& camera_name);
     int getCameraCount();
 
+    //full name->camera map: the pawn's built-in cameras plus any declared in settings.json.
+    //Used by the camera director to enumerate what a vehicle can be viewed through (U-9).
+    const common_utils::UniqueValueMap<std::string, APIPCamera*>& getCameras() const
+    {
+        return cameras_;
+    }
+
     const ALight* getLight(const std::string& light_name) const;
     ALight* getLight(const std::string& light_name);
     

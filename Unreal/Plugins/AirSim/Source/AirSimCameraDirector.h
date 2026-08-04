@@ -66,11 +66,36 @@ public:
     void setFollowDistance(const int follow_distance) { this->follow_distance_ = follow_distance; }
     void setCameraRotationLagEnabled(const bool lag_enabled) { this->camera_rotation_lag_enabled_ = lag_enabled; }
 
+    // U-9. Called once per vehicle by ASimModeBase before initializeForBeginPlay, in spawn order.
+    // Cycling order follows registration order.
+    void registerVehicle(AActor* pawn, const FString& vehicle_name,
+                         const TArray<APIPCamera*>& cameras, const TArray<FString>& camera_names);
+
 private:
     void setupInputBindings();
     void attachSpringArm(bool attach);
     void disableCameras(bool fpv, bool backup, bool front);
     void notifyViewModeChanged();
+
+    // U-9 vehicle / camera cycling.
+    struct FDirectorVehicle
+    {
+        AActor* pawn = nullptr;
+        FString name;
+        TArray<APIPCamera*> cameras;
+        TArray<FString> camera_names;
+    };
+
+    void handleModeKey(ECameraDirectorMode mode);
+    bool isShiftHeld() const;
+    void advanceVehicle();
+    void advanceCamera();
+    void applySelection(ECameraDirectorMode target_mode);
+    void selectPreferredCamera(ECameraDirectorMode mode);
+    void selectCameraByName(const FString& preferred);
+    APIPCamera* currentCamera() const;
+    void announceSelection(ECameraDirectorMode mode) const;
+    bool modeUsesVehicleCamera(ECameraDirectorMode mode) const;
 
 private:
     typedef common_utils::Utils Utils;
@@ -92,4 +117,11 @@ private:
     bool ext_obs_fixed_z_;
     int follow_distance_;
     bool camera_rotation_lag_enabled_;
+
+    TArray<FDirectorVehicle> vehicles_;
+    int32 current_vehicle_ = 0;
+    int32 current_camera_ = 0;
+    // Set while initializeForBeginPlay drives the mode handlers, so entering the initial mode does
+    // not read as a keypress and advance the vehicle.
+    bool suppress_cycle_ = false;
 };
