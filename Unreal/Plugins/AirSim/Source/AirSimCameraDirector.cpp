@@ -127,10 +127,28 @@ void AAirSimCameraDirector::attachSpringArm(bool attach)
         //ExternalCamera->bUsePawnControlRotation = false;
     }
     else { //detach
-        if (last_parent_ && ExternalCamera->GetRootComponent()->GetAttachParent() == SpringArm) {
-            ExternalCamera->DetachFromActor(FDetachmentTransformRules::KeepRelativeTransform);
-            ExternalCamera->AttachToComponent(last_parent_, FAttachmentTransformRules::KeepRelativeTransform);
+        // The detach used to be gated on `last_parent_` being non-null, which made it dead code:
+        // ExternalCamera is spawned standalone (SimModeBase::initializeCameraDirector) so it has no
+        // attach parent, and `last_parent_` above therefore captures nullptr. Once SpringArmChase
+        // had been entered - which is the DEFAULT startup mode for every non-multirotor sim, see
+        // AirSimSettings::loadViewModeSettings - the camera stayed parented to the spring arm, and
+        // so to the followed vehicle, for the rest of the session. In Manual mode that meant the
+        // free camera was still dragged around by vehicle 1: you could move it, but it kept the
+        // offset you gave it and travelled with the vehicle.
+        //
+        // Detach whenever we are attached to the spring arm; re-parent only if there was a real
+        // parent to go back to. KeepWorldTransform so the camera stays where the user last put it
+        // instead of snapping.
+        if (ExternalCamera->GetRootComponent()->GetAttachParent() == SpringArm) {
+            ExternalCamera->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+            if (last_parent_)
+                ExternalCamera->AttachToComponent(last_parent_, FAttachmentTransformRules::KeepRelativeTransform);
         }
+
+        // The spring arm is this actor's root and stays attached to the followed vehicle otherwise,
+        // which keeps dragging the director around and would misdirect U-9 vehicle cycling.
+        if (GetAttachParentActor() != nullptr)
+            DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
     }
 }
 
@@ -192,7 +210,10 @@ void AAirSimCameraDirector::setupInputBindings()
     UAirBlueprintLib::BindActionToKey("inputEventFlyWithView", EKeys::B, this, &AAirSimCameraDirector::inputEventFlyWithView);
     UAirBlueprintLib::BindActionToKey("inputEventGroundView", EKeys::Backslash, this, &AAirSimCameraDirector::inputEventGroundView);
     UAirBlueprintLib::BindActionToKey("inputEventManualView", EKeys::M, this, &AAirSimCameraDirector::inputEventManualView);
-    UAirBlueprintLib::BindActionToKey("inputEventSpringArmChaseView", EKeys::Slash, this, &AAirSimCameraDirector::inputEventSpringArmChaseView);
+    // Was EKeys::Slash. Moved to G because '/' is relocated or a modifier combination on non-QWERTY
+    // layouts (U-10). G is free: no other EKeys::G in the C++ source, and F10 is the only input-key
+    // event in any Blueprint asset under the plugin or Blocks content.
+    UAirBlueprintLib::BindActionToKey("inputEventSpringArmChaseView", EKeys::G, this, &AAirSimCameraDirector::inputEventSpringArmChaseView);
     UAirBlueprintLib::BindActionToKey("inputEventBackupView", EKeys::K, this, &AAirSimCameraDirector::inputEventBackupView);
     UAirBlueprintLib::BindActionToKey("inputEventNoDisplayView", EKeys::Hyphen, this, &AAirSimCameraDirector::inputEventNoDisplayView);
     UAirBlueprintLib::BindActionToKey("inputEventFrontView", EKeys::I, this, &AAirSimCameraDirector::inputEventFrontView);

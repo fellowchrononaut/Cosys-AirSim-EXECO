@@ -4,6 +4,7 @@
 #include "Runtime/Engine/Classes/Kismet/GameplayStatics.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
+#include "ManualPoseController.h"
 
 AExponentialHeightFog* UWeatherLib::weather_fog_ = nullptr;
 
@@ -174,6 +175,11 @@ void UWeatherLib::showWeatherMenu(UWorld* World)
 
         APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0);
         if (PC) {
+            // Manual camera mode locks and hides the cursor for mouse look. bShowMouseCursor alone
+            // does not undo that, so the input mode has to be released too or the menu is unclickable.
+            if (UManualPoseController::isMouseCaptureActive())
+                UManualPoseController::applyMouseCapture(World, false);
+
             PC->bShowMouseCursor = true;
             PC->DisableInput(PC);
         }
@@ -206,6 +212,10 @@ void UWeatherLib::hideWeatherMenu(UWorld* World)
             if (PC) {
                 PC->bShowMouseCursor = false;
                 PC->EnableInput(PC);
+
+                // Hand the cursor back to the free camera if it was the one holding it.
+                if (UManualPoseController::isMouseCaptureActive())
+                    UManualPoseController::applyMouseCapture(World, true);
             }
         }
     }
