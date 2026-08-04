@@ -177,6 +177,9 @@ void UWeatherLib::showWeatherMenu(UWorld* World)
         if (PC) {
             // Manual camera mode locks and hides the cursor for mouse look. bShowMouseCursor alone
             // does not undo that, so the input mode has to be released too or the menu is unclickable.
+            // The suspend also stops cursor-recentring, which would otherwise warp the pointer back
+            // to the middle of the screen every frame while the menu is open.
+            UManualPoseController::setMouseInputSuspended(true);
             if (UManualPoseController::isMouseCaptureActive())
                 UManualPoseController::applyMouseCapture(World, false);
 
@@ -216,6 +219,8 @@ void UWeatherLib::hideWeatherMenu(UWorld* World)
                 // Hand the cursor back to the free camera if it was the one holding it.
                 if (UManualPoseController::isMouseCaptureActive())
                     UManualPoseController::applyMouseCapture(World, true);
+
+                UManualPoseController::setMouseInputSuspended(false);
             }
         }
     }

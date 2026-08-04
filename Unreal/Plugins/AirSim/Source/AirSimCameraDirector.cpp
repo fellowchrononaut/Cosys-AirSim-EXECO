@@ -214,9 +214,12 @@ void AAirSimCameraDirector::setupInputBindings()
     // layouts (U-10). G is free: no other EKeys::G in the C++ source, and F10 is the only input-key
     // event in any Blueprint asset under the plugin or Blocks content.
     UAirBlueprintLib::BindActionToKey("inputEventSpringArmChaseView", EKeys::G, this, &AAirSimCameraDirector::inputEventSpringArmChaseView);
-    UAirBlueprintLib::BindActionToKey("inputEventBackupView", EKeys::K, this, &AAirSimCameraDirector::inputEventBackupView);
+    // Was EKeys::K, moved to free K for Manual-mode camera look (IJKL). The director's bindings are
+    // always active, so K would have switched view mode mid-look.
+    UAirBlueprintLib::BindActionToKey("inputEventBackupView", EKeys::C, this, &AAirSimCameraDirector::inputEventBackupView);
     UAirBlueprintLib::BindActionToKey("inputEventNoDisplayView", EKeys::Hyphen, this, &AAirSimCameraDirector::inputEventNoDisplayView);
-    UAirBlueprintLib::BindActionToKey("inputEventFrontView", EKeys::I, this, &AAirSimCameraDirector::inputEventFrontView);
+    // Was EKeys::I, moved to free I for Manual-mode camera look (IJKL). Same reason as Backup above.
+    UAirBlueprintLib::BindActionToKey("inputEventFrontView", EKeys::V, this, &AAirSimCameraDirector::inputEventFrontView);
 }
 
 void AAirSimCameraDirector::EndPlay(const EEndPlayReason::Type EndPlayReason)

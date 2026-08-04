@@ -3,6 +3,8 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "HAL/IConsoleManager.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/World.h"
 
 // Mouse look, U-7/U-8. The camera is driven WASD-to-move + mouse-to-look; the arrow keys are left
 // free for the vehicle, which is what removes the Manual-mode input conflict.
@@ -30,14 +32,39 @@ static TAutoConsoleVariable<int32> CVarManualCamCaptureMouse(
     TEXT("1 to lock/hide the cursor while the Manual-mode free camera is active."),
     ECVF_Default);
 
+static TAutoConsoleVariable<float> CVarManualCamKeyLookRate(
+    TEXT("airsim.ManualCamKeyLookRate"),
+    90.0f,
+    TEXT("Turn rate in degrees/second for the IJKL Manual-mode camera look keys."),
+    ECVF_Default);
+
+// Fallback for platforms where mouse capture will not hold and the cursor still clamps at the
+// screen edge. Poll the cursor's offset from the viewport centre and warp it back each frame,
+// instead of reading the MouseX/MouseY axes. Intended to be used with ManualCamCaptureMouse 0.
+static TAutoConsoleVariable<int32> CVarManualCamRecenterCursor(
+    TEXT("airsim.ManualCamRecenterCursor"),
+    0,
+    TEXT("1 to drive Manual-mode mouse look by recentring the cursor each frame instead of reading the mouse axes. Use with airsim.ManualCamCaptureMouse 0 if look still stops at the screen edge."),
+    ECVF_Default);
+
 namespace
 {
     bool g_manual_mouse_capture_active = false;
+    bool g_manual_mouse_input_suspended = false;
+
+    // Matches the MouseX/MouseY Sensitivity in Blocks/Config/DefaultInput.ini, so that the polled
+    // path and the axis path feel identical at the same ManualCamMouseSensitivity value.
+    constexpr float kRecenterSensitivityScale = 0.07f;
 }
 
 bool UManualPoseController::isMouseCaptureActive()
 {
     return g_manual_mouse_capture_active;
+}
+
+void UManualPoseController::setMouseInputSuspended(bool suspended)
+{
+    g_manual_mouse_input_suspended = suspended;
 }
 
 void UManualPoseController::applyMouseCapture(UWorld* world, bool capture)
@@ -49,13 +76,82 @@ void UManualPoseController::applyMouseCapture(UWorld* world, bool capture)
     if (pc == nullptr)
         return;
 
+    UGameViewportClient* viewport = world->GetGameViewport();
+
     if (capture) {
+        // SetInputMode(FInputModeGameOnly) alone is not enough: its lock mode is LockOnCapture, and
+        // capture itself never happens without a click, so the cursor stays a free desktop cursor
+        // and a look sweep dies at the screen edge. The viewport client also starts from
+        // DefaultInput.ini's NoCapture / DoNotLock. Set it directly so the pointer is locked from
+        // the moment Manual mode starts rather than from the first click.
+        if (viewport) {
+            viewport->SetMouseLockMode(EMouseLockMode::LockAlways);
+            viewport->SetMouseCaptureMode(EMouseCaptureMode::CapturePermanently_IncludingInitialMouseDown);
+            viewport->SetHideCursorDuringCapture(true);
+        }
         pc->bShowMouseCursor = false;
         pc->SetInputMode(FInputModeGameOnly());
     }
     else {
+        if (viewport) {
+            viewport->SetMouseLockMode(EMouseLockMode::DoNotLock);
+            viewport->SetMouseCaptureMode(EMouseCaptureMode::NoCapture);
+            viewport->SetHideCursorDuringCapture(false);
+        }
         pc->SetInputMode(FInputModeGameAndUI().SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock));
     }
+}
+
+bool UManualPoseController::useRecenterMode()
+{
+    return CVarManualCamRecenterCursor.GetValueOnGameThread() != 0;
+}
+
+// Fallback for when platform mouse capture will not hold. Instead of reading the MouseX/MouseY
+// axes - which are OS cursor deltas and therefore stop at the desktop edge - measure how far the
+// cursor has moved from the viewport centre, then warp it back. Movement is unbounded because the
+// cursor never travels more than half a viewport from the middle.
+//
+// The absolute-position read is what makes the warp safe: the warp's own motion is not counted,
+// since each frame measures against the centre rather than accumulating deltas.
+void UManualPoseController::pollRecenteredMouse()
+{
+    if (actor_ == nullptr || g_manual_mouse_input_suspended)
+        return;
+
+    APlayerController* pc = UGameplayStatics::GetPlayerController(actor_->GetWorld(), 0);
+    if (pc == nullptr)
+        return;
+
+    int32 size_x = 0, size_y = 0;
+    pc->GetViewportSize(size_x, size_y);
+    if (size_x <= 0 || size_y <= 0)
+        return;
+
+    const int32 center_x = size_x / 2;
+    const int32 center_y = size_y / 2;
+
+    float mouse_x = 0.f, mouse_y = 0.f;
+    if (!pc->GetMousePosition(mouse_x, mouse_y)) {
+        // Cursor is outside the viewport - recentre and skip this frame rather than apply a jump.
+        pc->SetMouseLocation(center_x, center_y);
+        return;
+    }
+
+    const float dx = mouse_x - static_cast<float>(center_x);
+    const float dy = mouse_y - static_cast<float>(center_y);
+
+    if (!FMath::IsNearlyZero(dx) || !FMath::IsNearlyZero(dy)) {
+        // kRecenterSensitivityScale mirrors the engine's own MouseX/MouseY sensitivity from
+        // DefaultInput.ini, so this path feels the same as the axis path at the same CVar value.
+        const float sens = CVarManualCamMouseSensitivity.GetValueOnGameThread() * kRecenterSensitivityScale;
+        const float invert = (CVarManualCamInvertY.GetValueOnGameThread() != 0) ? -1.f : 1.f;
+
+        // Screen Y grows downward, so moving the mouse up must pitch up: negate.
+        delta_rotation_.Add(-dy * sens * invert, dx * sens, 0);
+    }
+
+    pc->SetMouseLocation(center_x, center_y);
 }
 
 void UManualPoseController::initializeForPlay()
@@ -71,11 +167,18 @@ void UManualPoseController::initializeForPlay()
     down_mapping_ = FInputAxisKeyMapping("inputManualDown", EKeys::PageDown);
     mouse_yaw_mapping_ = FInputAxisKeyMapping("inputManualMouseYaw", EKeys::MouseX);
     mouse_pitch_mapping_ = FInputAxisKeyMapping("inputManualMousePitch", EKeys::MouseY);
+    // IJKL mirrors the mouse for anyone without one to spare. Front and Backup view moved off I/K
+    // to make room - see AirSimCameraDirector::setupInputBindings.
+    key_left_yaw_mapping_ = FInputAxisKeyMapping("inputManualKeyLeftYaw", EKeys::J);
+    key_right_yaw_mapping_ = FInputAxisKeyMapping("inputManualKeyRightYaw", EKeys::L);
+    key_up_pitch_mapping_ = FInputAxisKeyMapping("inputManualKeyUpPitch", EKeys::I);
+    key_down_pitch_mapping_ = FInputAxisKeyMapping("inputManualKeyDownPitch", EKeys::K);
     left_roll_mapping_ = FInputAxisKeyMapping("inputManualLefRoll", EKeys::Q);
     right_roll_mapping_ = FInputAxisKeyMapping("inputManualRightRoll", EKeys::E);
     inc_speed_mapping_ = FInputAxisKeyMapping("inputManualSpeedIncrease", EKeys::LeftShift);
     dec_speed_mapping_ = FInputAxisKeyMapping("inputManualSpeedDecrease", EKeys::LeftControl);
     input_positive_ = inpute_negative_ = last_velocity_ = FVector::ZeroVector;
+    key_yaw_positive_ = key_yaw_negative_ = key_pitch_positive_ = key_pitch_negative_ = 0.f;
 }
 
 void UManualPoseController::clearBindings()
@@ -83,6 +186,8 @@ void UManualPoseController::clearBindings()
     left_binding_ = right_binding_ = up_binding_ = down_binding_ = nullptr;
     forward_binding_ = backward_binding_ = nullptr;
     mouse_yaw_binding_ = mouse_pitch_binding_ = nullptr;
+    key_left_yaw_binding_ = key_right_yaw_binding_ = nullptr;
+    key_up_pitch_binding_ = key_down_pitch_binding_ = nullptr;
     left_roll_binding_ = right_roll_binding_ = nullptr;
     inc_speed_binding_ = dec_speed_binding_ = nullptr;
 }
@@ -120,6 +225,16 @@ AActor* UManualPoseController::getActor() const
 void UManualPoseController::updateActorPose(float dt)
 {
     if (actor_ != nullptr) {
+        if (useRecenterMode())
+            pollRecenteredMouse();
+
+        const float key_yaw = key_yaw_positive_ - key_yaw_negative_;
+        const float key_pitch = key_pitch_positive_ - key_pitch_negative_;
+        if (!FMath::IsNearlyZero(key_yaw) || !FMath::IsNearlyZero(key_pitch)) {
+            const float step = CVarManualCamKeyLookRate.GetValueOnGameThread() * dt;
+            delta_rotation_.Add(key_pitch * step, key_yaw * step, 0);
+        }
+
         updateDeltaPosition(dt);
 
         FVector location = actor_->GetActorLocation();
@@ -168,6 +283,14 @@ void UManualPoseController::removeInputBindings()
         UAirBlueprintLib::RemoveAxisBinding(mouse_yaw_mapping_, mouse_yaw_binding_, actor_);
     if (mouse_pitch_binding_)
         UAirBlueprintLib::RemoveAxisBinding(mouse_pitch_mapping_, mouse_pitch_binding_, actor_);
+    if (key_left_yaw_binding_)
+        UAirBlueprintLib::RemoveAxisBinding(key_left_yaw_mapping_, key_left_yaw_binding_, actor_);
+    if (key_right_yaw_binding_)
+        UAirBlueprintLib::RemoveAxisBinding(key_right_yaw_mapping_, key_right_yaw_binding_, actor_);
+    if (key_up_pitch_binding_)
+        UAirBlueprintLib::RemoveAxisBinding(key_up_pitch_mapping_, key_up_pitch_binding_, actor_);
+    if (key_down_pitch_binding_)
+        UAirBlueprintLib::RemoveAxisBinding(key_down_pitch_mapping_, key_down_pitch_binding_, actor_);
     if (left_roll_binding_)
         UAirBlueprintLib::RemoveAxisBinding(left_roll_mapping_, left_roll_binding_, actor_);
     if (right_roll_binding_)
@@ -192,6 +315,10 @@ void UManualPoseController::setupInputBindings()
     down_binding_ = &UAirBlueprintLib::BindAxisToKey(down_mapping_, actor_, this, &UManualPoseController::inputManualDown);
     mouse_yaw_binding_ = &UAirBlueprintLib::BindAxisToKey(mouse_yaw_mapping_, actor_, this, &UManualPoseController::inputManualMouseYaw);
     mouse_pitch_binding_ = &UAirBlueprintLib::BindAxisToKey(mouse_pitch_mapping_, actor_, this, &UManualPoseController::inputManualMousePitch);
+    key_left_yaw_binding_ = &UAirBlueprintLib::BindAxisToKey(key_left_yaw_mapping_, actor_, this, &UManualPoseController::inputManualKeyLeftYaw);
+    key_right_yaw_binding_ = &UAirBlueprintLib::BindAxisToKey(key_right_yaw_mapping_, actor_, this, &UManualPoseController::inputManualKeyRightYaw);
+    key_up_pitch_binding_ = &UAirBlueprintLib::BindAxisToKey(key_up_pitch_mapping_, actor_, this, &UManualPoseController::inputManualKeyUpPitch);
+    key_down_pitch_binding_ = &UAirBlueprintLib::BindAxisToKey(key_down_pitch_mapping_, actor_, this, &UManualPoseController::inputManualKeyDownPitch);
     left_roll_binding_ = &UAirBlueprintLib::BindAxisToKey(left_roll_mapping_, actor_, this, &UManualPoseController::inputManualLeftRoll);
     right_roll_binding_ = &UAirBlueprintLib::BindAxisToKey(right_roll_mapping_, actor_, this, &UManualPoseController::inputManualRightRoll);
     inc_speed_binding_ = &UAirBlueprintLib::BindAxisToKey(inc_speed_mapping_, actor_, this, &UManualPoseController::inputManualSpeedIncrease);
@@ -255,15 +382,40 @@ void UManualPoseController::inputManualDown(float val)
 // these must NOT be scaled by dt - the delta already carries the magnitude of the movement.
 void UManualPoseController::inputManualMouseYaw(float val)
 {
+    if (useRecenterMode())
+        return; //polled in updateActorPose instead; applying both would double-count
+
     if (!FMath::IsNearlyEqual(val, 0.f))
         delta_rotation_.Add(0, val * CVarManualCamMouseSensitivity.GetValueOnGameThread(), 0);
 }
 void UManualPoseController::inputManualMousePitch(float val)
 {
+    if (useRecenterMode())
+        return; //polled in updateActorPose instead; applying both would double-count
+
     if (!FMath::IsNearlyEqual(val, 0.f)) {
         const float sign = (CVarManualCamInvertY.GetValueOnGameThread() != 0) ? -1.f : 1.f;
         delta_rotation_.Add(val * CVarManualCamMouseSensitivity.GetValueOnGameThread() * sign, 0, 0);
     }
+}
+// IJKL look. Unlike the mouse these are a held state, so they are accumulated here and applied
+// dt-scaled in updateActorPose - otherwise the turn rate would track the frame rate, which is the
+// flaw the old A/D/W/S rotation had.
+void UManualPoseController::inputManualKeyLeftYaw(float val)
+{
+    key_yaw_negative_ = val;
+}
+void UManualPoseController::inputManualKeyRightYaw(float val)
+{
+    key_yaw_positive_ = val;
+}
+void UManualPoseController::inputManualKeyUpPitch(float val)
+{
+    key_pitch_positive_ = val;
+}
+void UManualPoseController::inputManualKeyDownPitch(float val)
+{
+    key_pitch_negative_ = val;
 }
 void UManualPoseController::inputManualLeftRoll(float val)
 {
