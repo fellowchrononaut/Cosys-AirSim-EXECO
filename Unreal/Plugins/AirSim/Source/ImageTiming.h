@@ -66,6 +66,14 @@ namespace AirSimImageTiming
         Clock::time_point t_readback_done{};
         unsigned int images = 0;
         bool valid = false;
+
+        // Only filled by the batched readback path (airsim.GpuReadback 1), which is the one place
+        // we own the split. Design #4 gave no speed-up, but it remains a useful INSTRUMENT: it
+        // separates the GPU-completion wait from the CPU copy out of staging memory, and those two
+        // want opposite fixes. A wait cannot be parallelised away; a copy can.
+        double lock_ms = 0.0;   // sum of Lock() across the batch - GPU wait + mapping
+        double copy_ms = 0.0;   // sum of the row memcpy out of mapped staging memory
+        bool have_split = false;
     };
 
     // Aggregates calls over a reporting window. Owned by the RPC-serving side; simGetImages is
@@ -78,6 +86,10 @@ namespace AirSimImageTiming
 
         double a_ms = 0.0, b_ms = 0.0, cd_ms = 0.0, e_ms = 0.0, total_ms = 0.0;
         double a_max = 0.0, b_max = 0.0, cd_max = 0.0, e_max = 0.0, total_max = 0.0;
+
+        // c+d broken down, when the batched path supplied it
+        double lock_ms = 0.0, copy_ms = 0.0;
+        uint64 split_calls = 0;
 
         Clock::time_point window_start{};
         bool started = false;
@@ -101,6 +113,12 @@ namespace AirSimImageTiming
             cd_ms += cd; cd_max = FMath::Max(cd_max, cd);
             e_ms += e;   e_max = FMath::Max(e_max, e);
             total_ms += total; total_max = FMath::Max(total_max, total);
+
+            if (c.have_split) {
+                lock_ms += c.lock_ms;
+                copy_ms += c.copy_ms;
+                ++split_calls;
+            }
         }
 
         bool shouldReport(Clock::time_point now, double period_s) const
