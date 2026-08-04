@@ -7,6 +7,7 @@
 #include "AirBlueprintLib.h"
 #include "Async/Async.h"
 #include "HAL/IConsoleManager.h"
+#include "RHIGPUReadback.h"
 #include "common/AirSimSettings.hpp"
 
 /** Diagnostic: log the batch capture instant against each result's own timestamp, plus the spread.
@@ -45,6 +46,19 @@ TAutoConsoleVariable<int32> CVarLogImageTiming(
     TEXT("Reports a=wait for game thread, b=wait for OnEndDraw, c+d=render+readback, e=compress.\n")
     TEXT("Flat in image count => latency-bound => build D9 batching.\n")
     TEXT("Linear in image count => readback-bound => D9 will disappoint. Diagnostic only."),
+    ECVF_Default);
+
+/** I-G design #4 A/B switch. Both readback paths are compiled in so one build answers the
+ *  question; flipping this needs no rebuild, which matters because a rebuild here is expensive.
+ *   0 = legacy per-image blocking RHICmdList.ReadSurfaceData (current shipped behaviour)
+ *   1 = batched FRHIGPUTextureReadback: all EnqueueCopy submitted, then Lock each
+ *  Default 0 so behaviour is unchanged until the measurement says otherwise. */
+static TAutoConsoleVariable<int32> CVarGpuReadback(
+    TEXT("airsim.GpuReadback"),
+    0,
+    TEXT("I-G: image readback path.\n")
+    TEXT(" 0: legacy ReadSurfaceData per image, one GPU sync point each (default)\n")
+    TEXT(" 1: batched FRHIGPUTextureReadback - submit all copies, then drain"),
     ECVF_Default);
 
 namespace
@@ -258,6 +272,170 @@ FReadSurfaceDataFlags RenderRequest::setupRenderResource(const FTextureRenderTar
     return flags;
 }
 
+// One log line per unique pixel format, not per frame: a batch that hits an unsupported format
+// would otherwise spam the log every capture.
+void RenderRequest::warnUnsupportedFormatOnce(unsigned int index, EPixelFormat format)
+{
+    static FCriticalSection mutex;
+    static TSet<int32> warned;
+
+    FScopeLock lock(&mutex);
+    if (warned.Contains((int32)format))
+        return;
+    warned.Add((int32)format);
+
+    UE_LOG(LogTemp, Warning,
+           TEXT("[AirSim] airsim.GpuReadback: unsupported pixel format %d on request %u - ")
+           TEXT("falling back to an empty result for it. Add a case in executeBatchedGpuReadback, ")
+           TEXT("or set airsim.GpuReadback 0 to use the legacy path."),
+           (int32)format, index);
+}
+
+// Legacy path: one blocking RHICmdList.ReadSurfaceData per image. Each call carries its own GPU
+// sync point, which is why measured throughput COLLAPSES as images grow - 4941 MB/s at 320x240
+// down to 320 MB/s at 1920x1080, ~30x below PCIe. Kept as the A/B control for I-G.
+void RenderRequest::executeLegacyReadback(TArray<msr::airlib::TTimePoint>& readback_stamps)
+{
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
+            FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
+            auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
+            if (rt_resource != nullptr) {
+                const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
+                FIntPoint size;
+                auto flags = setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
+
+                if (!params_[i]->pixels_as_float) {
+                    //below is undocumented method that avoids flushing, but it seems to segfault every 2000 or so calls
+                    RHICmdList.ReadSurfaceData(
+                        rhi_texture,
+                        FIntRect(0, 0, size.X, size.Y),
+                        results_[i]->bmp,
+                        flags);
+                }
+                else {
+                    RHICmdList.ReadSurfaceFloatData(
+                        rhi_texture,
+                        FIntRect(0, 0, size.X, size.Y),
+                        results_[i]->bmp_float,
+                        CubeFace_PosX,
+                        0,
+                        0);
+                }
+            }
+        }
+        readback_stamps[(int32)i] = msr::airlib::ClockFactory::get()->nowNanos();
+    }
+}
+
+// I-G design #4 (ported from the execosim branch, commit 76b843e9, and re-measured here rather
+// than taken on trust).
+//
+// NOT asynchronous - Lock() still blocks the render thread. The win is ordering: every
+// EnqueueCopy is submitted BEFORE the first Lock, so the GPU pipelines the N DMAs instead of
+// servicing them one sync point at a time. Total should approach the slowest single copy rather
+// than the sum.
+//
+// ❌ MEASURED 2026-08-04: IT DOES NOT HELP. Do not enable this.
+//
+// Predicted 1080p marginal 26 -> 1-2 ms. Actual, over 3 interleaved rounds of 25 samples per arm:
+// legacy 19.88 ms/img vs batched 19.93 ms/img = 1.00x, a 0.05 ms difference against a 2 ms
+// within-arm spread. Removing N-1 GPU sync points changed NOTHING, so the cost was never sync
+// serialisation.
+//
+// It is the CPU copy out of GPU-visible staging memory: 8.29 MB in ~19 ms is ~436 MB/s, the
+// signature of reading uncached/write-combined memory. BOTH paths do that copy per image, which is
+// why batching cannot win - and why async could not either, since it would relocate the copy, not
+// remove it. The lever is parallelising the per-image CPU work, not restructuring the readback.
+//
+// ⚠ It also CORRUPTS float image types: DepthPlanar sample mean 0.339 (legacy) vs 131.642 (this
+// path), with no format warning - so the target really was PF_FloatRGBA. ReadSurfaceFloatData is
+// therefore NOT equivalent to a raw staging copy; it applies a conversion this memcpy does not
+// reproduce. Scene/BGRA content did match exactly.
+//
+// Kept, defaulted off, as the control for any future attempt. See I-G in sim_issues plan.
+void RenderRequest::executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& readback_stamps)
+{
+    FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
+
+    readbacks_.Reset();
+    readbacks_.SetNum(req_size_);
+    enqueued_.Reset();
+    enqueued_.SetNumZeroed(req_size_);
+    formats_.Reset();
+    formats_.SetNumZeroed(req_size_);
+
+    // Phase 1 - submit every copy first. No Lock in this loop; that is the whole point.
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (params_[i]->render_target == nullptr || params_[i]->render_component == nullptr)
+            continue;
+
+        auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
+        if (rt_resource == nullptr)
+            continue;
+
+        const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
+        if (!rhi_texture.IsValid())
+            continue;
+
+        FIntPoint size;
+        setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
+
+        const EPixelFormat format = rhi_texture->GetFormat();
+        if (format != PF_B8G8R8A8 && format != PF_FloatRGBA) {
+            // Unknown GPU layout: decoding it would produce garbage. Mark the result invalid so
+            // the caller's formatting pass skips it, and warn once rather than every frame.
+            warnUnsupportedFormatOnce(i, format);
+            results_[i]->width = 0;
+            results_[i]->height = 0;
+            continue;
+        }
+        formats_[(int32)i] = format;
+
+        readbacks_[(int32)i] = MakeUnique<FRHIGPUTextureReadback>(
+            FName(*FString::Printf(TEXT("AirSimReadback_%u"), i)));
+        readbacks_[(int32)i]->EnqueueCopy(RHICmdList, rhi_texture);
+        enqueued_[(int32)i] = true;
+    }
+
+    // Phase 2 - now drain. The first Lock waits on its fence; later ones usually return
+    // immediately because their copies were submitted alongside the first.
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (!enqueued_[(int32)i] || results_[i]->width <= 0 || results_[i]->height <= 0) {
+            readback_stamps[(int32)i] = msr::airlib::ClockFactory::get()->nowNanos();
+            continue;
+        }
+
+        int32 row_pitch_in_pixels = 0;
+        void* raw = readbacks_[(int32)i]->Lock(row_pitch_in_pixels);
+        if (raw != nullptr) {
+            const int32 w = results_[i]->width;
+            const int32 h = results_[i]->height;
+
+            // Dispatch on the ACTUAL GPU format, not the client's pixels_as_float request - those
+            // can disagree, and trusting the request is how you get garbage pixels.
+            if (formats_[(int32)i] == PF_B8G8R8A8) {
+                results_[i]->bmp.SetNumUninitialized(w * h, false);
+                const FColor* src = static_cast<const FColor*>(raw);
+                FColor* dst = results_[i]->bmp.GetData();
+                for (int32 y = 0; y < h; ++y)
+                    FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FColor));
+            }
+            else { //PF_FloatRGBA, guaranteed by phase 1
+                results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+                const FFloat16Color* src = static_cast<const FFloat16Color*>(raw);
+                FFloat16Color* dst = results_[i]->bmp_float.GetData();
+                for (int32 y = 0; y < h; ++y)
+                    FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FFloat16Color));
+            }
+        }
+        readbacks_[(int32)i]->Unlock();
+        readback_stamps[(int32)i] = msr::airlib::ClockFactory::get()->nowNanos();
+    }
+
+    readbacks_.Reset();
+}
+
 void RenderRequest::ExecuteTask()
 {
     if (params_ != nullptr && req_size_ > 0) {
@@ -266,45 +444,19 @@ void RenderRequest::ExecuteTask()
         TArray<msr::airlib::TTimePoint> readback_stamps;
         readback_stamps.SetNumZeroed(req_size_);
 
-        for (unsigned int i = 0; i < req_size_; ++i) {
-            if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
-                FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
-                auto rt_resource = params_[i]->render_target->GetRenderTargetResource();
-                if (rt_resource != nullptr) {
-                    const FTexture2DRHIRef& rhi_texture = rt_resource->GetRenderTargetTexture();
-                    FIntPoint size;
-                    auto flags = setupRenderResource(rt_resource, params_[i].get(), results_[i].get(), size);
+        if (CVarGpuReadback.GetValueOnRenderThread() != 0)
+            executeBatchedGpuReadback(readback_stamps);
+        else
+            executeLegacyReadback(readback_stamps);
 
-                    //should we be using ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER which was in original commit by @saihv
-                    //https://github.com/Microsoft/AirSim/pull/162/commits/63e80c43812300a8570b04ed42714a3f6949e63f#diff-56b790f9394f7ca1949ddbb320d8456fR64
-                    if (!params_[i]->pixels_as_float) {
-                        //below is undocumented method that avoids flushing, but it seems to segfault every 2000 or so calls
-                        RHICmdList.ReadSurfaceData(
-                            rhi_texture,
-                            FIntRect(0, 0, size.X, size.Y),
-                            results_[i]->bmp,
-                            flags);
-                    }
-                    else {
-                        RHICmdList.ReadSurfaceFloatData(
-                            rhi_texture,
-                            FIntRect(0, 0, size.X, size.Y),
-                            results_[i]->bmp_float,
-                            CubeFace_PosX,
-                            0,
-                            0);
-                    }
-                }
-            }
+        for (unsigned int i = 0; i < req_size_; ++i) {
             // Readback-completion time for this image. Sampled per result, so under the legacy
             // convention a batch of images that all depict batch_time_stamp_ ends up with stamps
             // spread by the readback duration - and, worse, lagged 48-69 ms behind the instant
             // they depict. See ImageTimestampAtCapture in settings.json.
-            const msr::airlib::TTimePoint readback_stamp = msr::airlib::ClockFactory::get()->nowNanos();
             results_[i]->time_stamp = (ShouldStampAtCaptureInstant() && batch_time_stamp_ != 0)
                                           ? batch_time_stamp_
-                                          : readback_stamp;
-            readback_stamps[(int32)i] = readback_stamp;
+                                          : readback_stamps[(int32)i];
         }
 
         if (CVarLogImageTimestamps.GetValueOnRenderThread() != 0) {

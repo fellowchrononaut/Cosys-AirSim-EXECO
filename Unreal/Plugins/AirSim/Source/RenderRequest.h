@@ -41,6 +41,17 @@ public:
 private:
     static FReadSurfaceDataFlags setupRenderResource(const FTextureRenderTargetResource* rt_resource, const RenderParams* params, RenderResult* result, FIntPoint& size);
 
+    // I-G: the two readback paths, selected at runtime by airsim.GpuReadback. Both fill
+    // results_[i]->bmp / bmp_float and record a completion stamp per image.
+    void executeLegacyReadback(TArray<msr::airlib::TTimePoint>& readback_stamps);
+    void executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& readback_stamps);
+    void warnUnsupportedFormatOnce(unsigned int index, EPixelFormat format);
+
+    // Batched-readback scratch, valid only inside executeBatchedGpuReadback.
+    TArray<TUniquePtr<class FRHIGPUTextureReadback>> readbacks_;
+    TArray<bool> enqueued_;
+    TArray<EPixelFormat> formats_;
+
     std::shared_ptr<RenderParams>* params_;
     std::shared_ptr<RenderResult>* results_;
     unsigned int req_size_;
