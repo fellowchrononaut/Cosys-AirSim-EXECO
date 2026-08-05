@@ -35,6 +35,8 @@ private:
     void inputManualBackward(float val);
     void inputManualMoveUp(float val);
     void inputManualDown(float val);
+    void inputManualRightMouseButtonPressed();
+    void inputManualRightMouseButtonReleased();
     void inputManualMouseYaw(float val);
     void inputManualMousePitch(float val);
     void inputManualKeyLeftYaw(float val);
@@ -52,6 +54,7 @@ private:
 
     static bool useRecenterMode();
     void pollRecenteredMouse();
+    void updateMouseCaptureState();
 
 private:
     FInputAxisBinding *left_binding_, *right_binding_, *up_binding_, *down_binding_;
@@ -65,6 +68,7 @@ private:
     FInputAxisKeyMapping left_mapping_, right_mapping_, up_mapping_, down_mapping_;
     FInputAxisKeyMapping forward_mapping_, backward_mapping_;
     FInputAxisKeyMapping mouse_yaw_mapping_, mouse_pitch_mapping_;
+    FInputActionKeyMapping right_mouse_button_mapping_;
     FInputAxisKeyMapping key_left_yaw_mapping_, key_right_yaw_mapping_;
     FInputAxisKeyMapping key_up_pitch_mapping_, key_down_pitch_mapping_;
     FInputAxisKeyMapping left_roll_mapping_, right_roll_mapping_;
@@ -74,6 +78,7 @@ private:
     FRotator delta_rotation_;
 
     AActor* actor_;
+    bool right_mouse_button_down_ = false;
 
     float key_yaw_positive_ = 0, key_yaw_negative_ = 0;
     float key_pitch_positive_ = 0, key_pitch_negative_ = 0;

@@ -29,7 +29,13 @@ static TAutoConsoleVariable<int32> CVarManualCamInvertY(
 static TAutoConsoleVariable<int32> CVarManualCamCaptureMouse(
     TEXT("airsim.ManualCamCaptureMouse"),
     1,
-    TEXT("1 to lock/hide the cursor while the Manual-mode free camera is active."),
+    TEXT("1 to lock/hide the cursor while RMB free-look is active in Manual mode."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarManualCamLogInput(
+    TEXT("airsim.ManualCamLogInput"),
+    0,
+    TEXT("1 to log Manual-mode RMB, mouse-axis and capture-state input diagnostics."),
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarManualCamKeyLookRate(
@@ -83,7 +89,7 @@ void UManualPoseController::applyMouseCapture(UWorld* world, bool capture)
         // capture itself never happens without a click, so the cursor stays a free desktop cursor
         // and a look sweep dies at the screen edge. The viewport client also starts from
         // DefaultInput.ini's NoCapture / DoNotLock. Set it directly so the pointer is locked from
-        // the moment Manual mode starts rather than from the first click.
+        // the moment RMB free-look starts rather than from a later click.
         if (viewport) {
             viewport->SetMouseLockMode(EMouseLockMode::LockAlways);
             viewport->SetMouseCaptureMode(EMouseCaptureMode::CapturePermanently_IncludingInitialMouseDown);
@@ -98,13 +104,41 @@ void UManualPoseController::applyMouseCapture(UWorld* world, bool capture)
             viewport->SetMouseCaptureMode(EMouseCaptureMode::NoCapture);
             viewport->SetHideCursorDuringCapture(false);
         }
+        pc->bShowMouseCursor = true;
         pc->SetInputMode(FInputModeGameAndUI().SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock));
     }
+
+    g_manual_mouse_capture_active = capture;
 }
 
 bool UManualPoseController::useRecenterMode()
 {
     return CVarManualCamRecenterCursor.GetValueOnGameThread() != 0;
+}
+
+void UManualPoseController::updateMouseCaptureState()
+{
+    if (actor_ == nullptr)
+        return;
+
+    APlayerController* pc = UGameplayStatics::GetPlayerController(actor_->GetWorld(), 0);
+    if (pc == nullptr)
+        return;
+
+    const bool capture_enabled = CVarManualCamCaptureMouse.GetValueOnGameThread() != 0;
+    const bool should_capture = right_mouse_button_down_ && capture_enabled && !g_manual_mouse_input_suspended;
+
+    if (should_capture != g_manual_mouse_capture_active) {
+        if (CVarManualCamLogInput.GetValueOnGameThread() != 0) {
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[ManualCamInput] capture transition: RMB=%d enabled=%d suspended=%d active=%d -> %d"),
+                   right_mouse_button_down_, capture_enabled, g_manual_mouse_input_suspended,
+                   g_manual_mouse_capture_active, should_capture);
+        }
+        applyMouseCapture(actor_->GetWorld(), should_capture);
+    }
+    else if (!should_capture && !g_manual_mouse_input_suspended)
+        pc->bShowMouseCursor = true;
 }
 
 // Fallback for when platform mouse capture will not hold. Instead of reading the MouseX/MouseY
@@ -116,7 +150,7 @@ bool UManualPoseController::useRecenterMode()
 // since each frame measures against the centre rather than accumulating deltas.
 void UManualPoseController::pollRecenteredMouse()
 {
-    if (actor_ == nullptr || g_manual_mouse_input_suspended)
+    if (actor_ == nullptr || g_manual_mouse_input_suspended || !right_mouse_button_down_)
         return;
 
     APlayerController* pc = UGameplayStatics::GetPlayerController(actor_->GetWorld(), 0);
@@ -167,6 +201,7 @@ void UManualPoseController::initializeForPlay()
     down_mapping_ = FInputAxisKeyMapping("inputManualDown", EKeys::PageDown);
     mouse_yaw_mapping_ = FInputAxisKeyMapping("inputManualMouseYaw", EKeys::MouseX);
     mouse_pitch_mapping_ = FInputAxisKeyMapping("inputManualMousePitch", EKeys::MouseY);
+    right_mouse_button_mapping_ = FInputActionKeyMapping("inputManualRightMouseButton", EKeys::RightMouseButton);
     // IJKL mirrors the mouse for anyone without one to spare. Front and Backup view moved off I/K
     // to make room - see AirSimCameraDirector::setupInputBindings.
     key_left_yaw_mapping_ = FInputAxisKeyMapping("inputManualKeyLeftYaw", EKeys::J);
@@ -203,17 +238,19 @@ void UManualPoseController::setActor(AActor* actor)
 
     actor_ = actor;
 
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0)
+        UE_LOG(LogTemp, Warning, TEXT("[ManualCamInput] setActor: %s"), actor_ ? *actor_->GetName() : TEXT("null"));
+
     if (actor_ != nullptr) {
         resetDelta();
+        right_mouse_button_down_ = false;
         setupInputBindings();
-        if (CVarManualCamCaptureMouse.GetValueOnGameThread() != 0) {
-            applyMouseCapture(world, true);
-            g_manual_mouse_capture_active = true;
-        }
     }
-    else if (g_manual_mouse_capture_active) {
-        applyMouseCapture(world, false);
-        g_manual_mouse_capture_active = false;
+    else {
+        if (g_manual_mouse_capture_active) {
+            applyMouseCapture(world, false);
+        }
+        right_mouse_button_down_ = false;
     }
 }
 
@@ -225,6 +262,8 @@ AActor* UManualPoseController::getActor() const
 void UManualPoseController::updateActorPose(float dt)
 {
     if (actor_ != nullptr) {
+        updateMouseCaptureState();
+
         if (useRecenterMode())
             pollRecenteredMouse();
 
@@ -267,6 +306,14 @@ void UManualPoseController::resetDelta()
 
 void UManualPoseController::removeInputBindings()
 {
+    APlayerController* controller = actor_->GetWorld()->GetFirstPlayerController();
+    controller->InputComponent->RemoveActionBinding(right_mouse_button_mapping_.ActionName, IE_Pressed);
+    controller->InputComponent->RemoveActionBinding(right_mouse_button_mapping_.ActionName, IE_Released);
+    controller->PlayerInput->RemoveActionMapping(right_mouse_button_mapping_);
+
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0)
+        UE_LOG(LogTemp, Warning, TEXT("[ManualCamInput] removed RMB press/release bindings"));
+
     if (left_binding_)
         UAirBlueprintLib::RemoveAxisBinding(left_mapping_, left_binding_, actor_);
     if (right_binding_)
@@ -306,6 +353,18 @@ void UManualPoseController::removeInputBindings()
 void UManualPoseController::setupInputBindings()
 {
     UAirBlueprintLib::EnableInput(actor_);
+
+    APlayerController* controller = actor_->GetWorld()->GetFirstPlayerController();
+    controller->PlayerInput->AddActionMapping(right_mouse_button_mapping_);
+    controller->InputComponent->BindAction(right_mouse_button_mapping_.ActionName, IE_Pressed, this, &UManualPoseController::inputManualRightMouseButtonPressed);
+    controller->InputComponent->BindAction(right_mouse_button_mapping_.ActionName, IE_Released, this, &UManualPoseController::inputManualRightMouseButtonReleased);
+
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0) {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[ManualCamInput] bound RMB action: input-enabled=%d action-mappings=%d action-bindings=%d"),
+               controller->InputEnabled(), controller->PlayerInput->ActionMappings.Num(),
+               controller->InputComponent->GetNumActionBindings());
+    }
 
     left_binding_ = &UAirBlueprintLib::BindAxisToKey(left_mapping_, actor_, this, &UManualPoseController::inputManualLeft);
     right_binding_ = &UAirBlueprintLib::BindAxisToKey(right_mapping_, actor_, this, &UManualPoseController::inputManualRight);
@@ -380,18 +439,46 @@ void UManualPoseController::inputManualDown(float val)
 }
 // Mouse axes deliver a per-frame displacement, not a held state, so unlike the keyboard rotations
 // these must NOT be scaled by dt - the delta already carries the magnitude of the movement.
+void UManualPoseController::inputManualRightMouseButtonPressed()
+{
+    right_mouse_button_down_ = true;
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0)
+        UE_LOG(LogTemp, Warning, TEXT("[ManualCamInput] RMB pressed"));
+    updateMouseCaptureState();
+}
+void UManualPoseController::inputManualRightMouseButtonReleased()
+{
+    right_mouse_button_down_ = false;
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0)
+        UE_LOG(LogTemp, Warning, TEXT("[ManualCamInput] RMB released"));
+    updateMouseCaptureState();
+}
 void UManualPoseController::inputManualMouseYaw(float val)
 {
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0 && !FMath::IsNearlyZero(val)) {
+        UE_LOG(LogTemp, Warning, TEXT("[ManualCamInput] MouseX=%f RMB=%d recenter=%d suspended=%d"),
+               val, right_mouse_button_down_, useRecenterMode(), g_manual_mouse_input_suspended);
+    }
+
     if (useRecenterMode())
         return; //polled in updateActorPose instead; applying both would double-count
+    if (!right_mouse_button_down_)
+        return;
 
     if (!FMath::IsNearlyEqual(val, 0.f))
         delta_rotation_.Add(0, val * CVarManualCamMouseSensitivity.GetValueOnGameThread(), 0);
 }
 void UManualPoseController::inputManualMousePitch(float val)
 {
+    if (CVarManualCamLogInput.GetValueOnGameThread() != 0 && !FMath::IsNearlyZero(val)) {
+        UE_LOG(LogTemp, Warning, TEXT("[ManualCamInput] MouseY=%f RMB=%d recenter=%d suspended=%d"),
+               val, right_mouse_button_down_, useRecenterMode(), g_manual_mouse_input_suspended);
+    }
+
     if (useRecenterMode())
         return; //polled in updateActorPose instead; applying both would double-count
+    if (!right_mouse_button_down_)
+        return;
 
     if (!FMath::IsNearlyEqual(val, 0.f)) {
         const float sign = (CVarManualCamInvertY.GetValueOnGameThread() != 0) ? -1.f : 1.f;

@@ -216,10 +216,7 @@ void UWeatherLib::hideWeatherMenu(UWorld* World)
                 PC->bShowMouseCursor = false;
                 PC->EnableInput(PC);
 
-                // Hand the cursor back to the free camera if it was the one holding it.
-                if (UManualPoseController::isMouseCaptureActive())
-                    UManualPoseController::applyMouseCapture(World, true);
-
+                // Manual mode will recapture on its next tick only if RMB is still held.
                 UManualPoseController::setMouseInputSuspended(false);
             }
         }
