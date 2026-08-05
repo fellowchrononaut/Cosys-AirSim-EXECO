@@ -1285,6 +1285,20 @@ void APIPCamera::ensureFaceRig(const ImageType type)
     if (type == ImageType::Annotation)
         return; //annotation cameras stay on the pinhole path
 
+    //NewObject and RegisterComponent are game-thread only, and this function is reached from an
+    //rpclib worker: WorldSimApi::getImages -> UnrealImageCapture::updateCameraVisibility ->
+    //setCameraTypeEnabled -> setFaceRigEnabled. The pinhole path survives that because it only
+    //toggles components that already exist; building them off-thread does not. Measured
+    //2026-08-05 - USceneCaptureComponent::RegisterDelegates ensures on the race, then the frame
+    //dies on "Assertion failed: !bPostTickComponentUpdate [LevelTick.cpp:905]".
+    //
+    //It went unnoticed until now only because every earlier session ran airsim.CubeFaceDump - a
+    //console command, so game thread - before its first image request, which warmed the rig.
+    if (!IsInGameThread()) {
+        UAirBlueprintLib::RunCommandOnGameThread([this, type]() { ensureFaceRig(type); }, true);
+        return;
+    }
+
     const unsigned int image_type = Utils::toNumeric(type);
     if (image_type >= imageTypeCount())
         return;
@@ -1345,6 +1359,31 @@ void APIPCamera::ensureFaceRig(const ImageType type)
         capture->HiddenActors = parent->HiddenActors;
         capture->PostProcessSettings = parent->PostProcessSettings; //carries the blendables, so depth and segmentation materials come with it
         capture->PostProcessBlendWeight = parent->PostProcessBlendWeight;
+
+        //C3, measured 2026-08-05: kill the screen-space lens effects on the FACE captures only.
+        //Each of these is computed per view, radially about ITS OWN frame centre, so a 90-degree
+        //cube face applies a full lens vignette inside what is really one patch of a wider image -
+        //and the darkening peaks exactly at the face boundary, i.e. exactly at the seams. The
+        //argument is the same one that keeps lens distortion off the faces; the difference is that
+        //vignette is on by default, so it was already in every non-pinhole image.
+        //
+        //Numbers behind this: the pinhole-through-cube test (test 1) reads 1.047 LSB mean with
+        //these on and 0.047 with them off, 97.6 percent of pixels bit-exact; the projection gate
+        //(test 2) moved 1.260 -> 0.449 px on the yaw -70 reference. Vignette is the large term,
+        //bloom about 0.09 LSB. Ambient occlusion, screen-space reflections and diffuse indirect
+        //were measured and are NOT contributors, so they are deliberately left alone.
+        //
+        //This is a copy: PostProcessSettings is a value member, and these components exist only
+        //for a camera with a CameraModel block. captures_[image_type] - every ordinary pinhole
+        //camera in AirSim - is not touched, and neither is the parent's own struct.
+        capture->PostProcessSettings.bOverride_VignetteIntensity = true;
+        capture->PostProcessSettings.VignetteIntensity = 0.0f;
+        capture->PostProcessSettings.bOverride_BloomIntensity = true;
+        capture->PostProcessSettings.BloomIntensity = 0.0f;
+        capture->PostProcessSettings.bOverride_SceneFringeIntensity = true;
+        capture->PostProcessSettings.SceneFringeIntensity = 0.0f; //chromatic aberration: radial, same argument
+        capture->PostProcessSettings.bOverride_FilmGrainIntensity = true;
+        capture->PostProcessSettings.FilmGrainIntensity = 0.0f; //per-face grain would not even be consistent between faces
         capture->bUseRayTracingIfEnabled = parent->bUseRayTracingIfEnabled;
         capture->MaxViewDistanceOverride = parent->MaxViewDistanceOverride;
         capture->LODDistanceFactor = parent->LODDistanceFactor;

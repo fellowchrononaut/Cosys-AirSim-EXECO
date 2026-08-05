@@ -47,7 +47,15 @@ Usage:
   /tmp/raymap_dump --settings ~/Documents/AirSim/settings.json \
       --camera fisheye_front --out /tmp/fisheye.raymap
 
-  # then, with the simulator running
+  # then, with the simulator running.  BOTH of these first, every time:
+  #   r.Tonemapper.Quality 0
+  #   r.BloomQuality 0
+  # Not optional since 2026-08-05.  APIPCamera::ensureFaceRig pins vignette, bloom,
+  # chromatic aberration and film grain to zero on the CUBE FACES (they are per-view
+  # radial effects and a face is not a view).  The reference is an ordinary AirSim
+  # pinhole camera, so it still has all four.  Without these two commands the tests
+  # measure the REFERENCE'S lens effects: test 1 reads 4.230 with them and 0.050
+  # without, from the identical build.
   cube_resample_check.py test1 --vehicle CamPlayer --model-cam model_pinhole --ref-cam pinhole_ref
   cube_resample_check.py test2 --vehicle CamPlayer --model-cam fisheye_front --ref-cam pinhole_ref \
                                --raymap /tmp/fisheye.raymap
@@ -164,14 +172,16 @@ def select_faces(d_ue):
 # --------------------------------------------------------------------------
 # simulator access
 # --------------------------------------------------------------------------
-def connect():
+def connect(port=41451):
     try:
         import cosysairsim as airsim
     except ImportError:
         print("cosysairsim is not importable. Install PythonClient first:\n"
               "  pip install -e PythonClient", file=sys.stderr)
         raise
-    client = airsim.VehicleClient()
+    # MultiAgent SimMode does not serve the single-vehicle default port: each vehicle gets
+    # its own, so a rig that answers on 41453 is normal and 41451 simply times out.
+    client = airsim.VehicleClient(port=port)
     client.confirmConnection()
     return client, airsim
 
@@ -239,7 +249,7 @@ def describe(diff, label):
 # test 1 - pure resampling error
 # --------------------------------------------------------------------------
 def test1(args):
-    client, airsim = connect()
+    client, airsim = connect(args.port)
     images, _ = grab(client, airsim, args.vehicle, [args.model_cam, args.ref_cam])
     a, b = images[args.model_cam], images[args.ref_cam]
     if a.shape != b.shape:
@@ -264,11 +274,18 @@ def test1(args):
 # --------------------------------------------------------------------------
 # test 2 - dense analytic projection, the phase gate
 # --------------------------------------------------------------------------
-def subpixel_shift(actual, predicted, radius=4):
+def subpixel_shift(actual, predicted, radius=4, min_texture=5.0):
     """Shift, in pixels, that best aligns predicted onto actual.  SSD over integer
     shifts then a parabola through the minimum in each axis.  Both patches are
     mean-subtracted and variance-normalised, so a brightness or exposure difference
-    does not move the answer."""
+    does not move the answer.
+
+    min_texture is not a nicety.  Variance normalisation happily amplifies a patch whose
+    whole contrast is sensor noise, and the SSD minimum then lands somewhere arbitrary -
+    so a site with nothing in it does not fail, it returns a plausible wrong number.
+    Measured 2026-08-05 on Blocks: sites with patch std 0.2-1.5 returned a median 1.4 px
+    of pure noise, while sites with std > 30 in the same frame returned 0.081 px.  Scoring
+    them together turned a passing gate into a failing one."""
     def norm(p):
         p = p - p.mean()
         s = p.std()
@@ -276,6 +293,8 @@ def subpixel_shift(actual, predicted, radius=4):
 
     n = 2 * radius + 1
     inner = actual[radius:-radius, radius:-radius]
+    if inner.std() < min_texture:
+        return None  # too little contrast to locate anything
     a = norm(inner)
     if a is None:
         return None  # flat patch: carries no positional information at all
@@ -301,6 +320,11 @@ def subpixel_shift(actual, predicted, radius=4):
         return None  # the minimum ran off the search window: no reliable answer
 
     def refine(m0, m1, m2):
+        # A neighbour of the minimum can still be inf: those shifts had a flat reference
+        # patch and were skipped.  inf - inf is nan, and one nan poisons every statistic
+        # downstream, so refuse to interpolate rather than propagate it.
+        if not (np.isfinite(m0) and np.isfinite(m1) and np.isfinite(m2)):
+            return 0.0
         denom = m0 - 2 * m1 + m2
         return 0.0 if abs(denom) < 1e-12 else 0.5 * (m0 - m2) / denom
 
@@ -315,7 +339,7 @@ def test2(args):
     d_opt, valid = optical_dirs(rm)
     h, w = rm["height"], rm["width"]
 
-    client, airsim = connect()
+    client, airsim = connect(args.port)
     images, metas = grab(client, airsim, args.vehicle, [args.model_cam, args.ref_cam])
     model_img, ref_img = images[args.model_cam], images[args.ref_cam]
     if model_img.shape[:2] != (h, w):
@@ -349,41 +373,52 @@ def test2(args):
     max_r = np.hypot(cx_img, cy_img)
 
     results = []
+    # Site accounting.  A gate that silently scores 4 sites out of 576 is not a gate, so
+    # every rejection is counted and the reasons are printed with the verdict.
+    reject = {"invalid ray": 0, "behind reference": 0, "outside reference": 0,
+              "too little texture": 0}
     for y in ys:
         for x in xs:
             oy = slice(y - pad, y + pad + 1)
             ox = slice(x - pad, x + pad + 1)
             if not np.all(valid[oy, ox]):
+                reject["invalid ray"] += 1
                 continue
 
             d_ref = ned_body_to_optical(
                 (r_model_to_ref @ optical_to_ned_body(d_opt[oy, ox]).reshape(-1, 3).T).T
             ).reshape(2 * pad + 1, 2 * pad + 1, 3)
             if np.any(d_ref[..., 2] <= 1e-6):
+                reject["behind reference"] += 1
                 continue  # outside the reference camera's hemisphere
 
             u = ref_fx * d_ref[..., 0] / d_ref[..., 2] + ref_cx
             v = ref_fy * d_ref[..., 1] / d_ref[..., 2] + ref_cy
             if u.min() < 0 or v.min() < 0 or u.max() > ref_w - 1 or v.max() > ref_h - 1:
+                reject["outside reference"] += 1
                 continue  # outside the reference camera's field of view
 
             predicted = luma(sample_bilinear(ref_img, u, v))
             actual = luma(model_img[oy, ox])
-            shift = subpixel_shift(actual, predicted, radius=radius)
+            shift = subpixel_shift(actual, predicted, radius=radius,
+                                   min_texture=args.min_texture)
             if shift is None:
+                reject["too little texture"] += 1
                 continue
             dx, dy = shift
             r = np.hypot(x - cx_img, y - cy_img) / max_r
             results.append((r, np.hypot(dx, dy), dx, dy))
 
     if not results:
-        raise SystemExit("no usable sample sites. Widen --ref-fov, add reference cameras "
-                         "pointing off-axis, or aim at a scene with more texture.")
+        raise SystemExit("no usable sample sites (%s). Widen --ref-fov, add reference "
+                         "cameras pointing off-axis, or aim at a scene with more texture."
+                         % ", ".join("%s %d" % kv for kv in reject.items()))
 
     results = np.array(results)
     print("test 2 - dense analytic projection against a native pinhole reference")
-    print("  %d usable sites of %d. Error in GENERIC-CAMERA PIXELS." %
-          (len(results), args.grid * args.grid))
+    print("  %d usable sites of %d, min texture %.1f LSB. Error in GENERIC-CAMERA PIXELS." %
+          (len(results), args.grid * args.grid, args.min_texture))
+    print("  rejected: " + ", ".join("%s %d" % kv for kv in reject.items()))
     for name, lo, hi in [("centre  (r<0.33)", 0.0, 0.33),
                          ("mid     (0.33-0.66)", 0.33, 0.66),
                          ("PERIPHERY (r>0.66)", 0.66, 1.01)]:
@@ -400,6 +435,71 @@ def test2(args):
           (overall, "PASS" if overall < 1.0 else "FAIL"))
 
 
+
+# --------------------------------------------------------------------------
+# control - two native pinholes against each other, no camera model involved
+# --------------------------------------------------------------------------
+def control(args):
+    """Test 2's noise floor.
+
+    Runs test 2's exact machinery on two NATIVE PINHOLE cameras: rays of camera A,
+    rotated by the two reported poses, projected into camera B.  No raymap, no cube
+    capture, no resample - so whatever this reports is what the harness cannot resolve,
+    and a test 2 arm is only meaningful to the extent it beats it.
+
+    Measured 2026-08-05 on Blocks: ref_fwd vs ref_left 0.302 px, ref_fwd vs ref_up
+    1.103 px.  The fisheye scored 0.36-0.48 and 1.29-1.45 against those same two
+    references - i.e. it tracked the floor, and the arm that "failed" the gate failed
+    against a reference that disagrees with another pinhole by just as much.  Run this
+    for any reference before believing a test 2 failure.
+    """
+    client, airsim = connect(args.port)
+    images, metas = grab(client, airsim, args.vehicle, [args.cam_a, args.cam_b])
+    A, B = images[args.cam_a], images[args.cam_b]
+    h, w = A.shape[:2]
+    if B.shape[:2] != (h, w):
+        raise SystemExit("both cameras must have the same Width/Height")
+    fx = (w / 2.0) / np.tan(np.radians(args.fov) / 2.0)
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    r_a_to_b = quat_matrix(metas[args.cam_b].camera_orientation).T @ \
+               quat_matrix(metas[args.cam_a].camera_orientation)
+
+    radius = 5
+    pad = args.patch // 2 + radius
+    yy, xx = np.mgrid[0:2 * pad + 1, 0:2 * pad + 1].astype(np.float64)
+    results = []
+    for y in np.linspace(pad, h - 1 - pad, args.grid).astype(int):
+        for x in np.linspace(pad, w - 1 - pad, args.grid).astype(int):
+            d = np.stack([(x - pad + xx - cx) / fx, (y - pad + yy - cy) / fx,
+                          np.ones_like(xx)], axis=-1)
+            d /= np.linalg.norm(d, axis=-1, keepdims=True)
+            d_b = ned_body_to_optical(
+                (r_a_to_b @ optical_to_ned_body(d).reshape(-1, 3).T).T).reshape(d.shape)
+            if np.any(d_b[..., 2] <= 1e-6):
+                continue
+            u = fx * d_b[..., 0] / d_b[..., 2] + cx
+            v = fx * d_b[..., 1] / d_b[..., 2] + cy
+            if u.min() < 0 or v.min() < 0 or u.max() > w - 1 or v.max() > h - 1:
+                continue
+            oy, ox = slice(y - pad, y + pad + 1), slice(x - pad, x + pad + 1)
+            shift = subpixel_shift(luma(A[oy, ox]), luma(sample_bilinear(B, u, v)),
+                                   radius=radius, min_texture=args.min_texture)
+            if shift is None:
+                continue
+            results.append((np.hypot(*shift), shift[0], shift[1]))
+
+    if not results:
+        raise SystemExit("no overlapping textured sites for %s vs %s - the two frusta "
+                         "may not overlap on anything with contrast" % (args.cam_a, args.cam_b))
+    a = np.array(results)
+    print("control - %s vs %s, both native pinholes. THE HARNESS NOISE FLOOR." %
+          (args.cam_a, args.cam_b))
+    print("  n=%d  median %.3f px  mean %.3f px  p95 %.3f px  mean dx %+.3f dy %+.3f" %
+          (len(a), np.median(a[:, 0]), a[:, 0].mean(), np.percentile(a[:, 0], 95),
+           a[:, 1].mean(), a[:, 2].mean()))
+    print("  A test 2 arm against %s is only meaningful below this." % args.cam_b)
+
+
 # --------------------------------------------------------------------------
 # test 3 - seams in the output image
 # --------------------------------------------------------------------------
@@ -409,7 +509,7 @@ def test3(args):
     face, _ = select_faces(optical_to_unreal(d_opt))
     h, w = rm["height"], rm["width"]
 
-    client, airsim = connect()
+    client, airsim = connect(args.port)
     images, _ = grab(client, airsim, args.vehicle, [args.model_cam])
     img = luma(images[args.model_cam])
     if img.shape != (h, w):
@@ -478,6 +578,9 @@ def main():
 
     def common(p):
         p.add_argument("--vehicle", default="CamPlayer")
+        p.add_argument("--port", type=int, default=41451,
+                       help="RPC port. MultiAgent gives each vehicle its own; "
+                            "the CamPlayer rig used for these tests answers on 41453")
         p.add_argument("--model-cam", required=True,
                        help="camera carrying the CameraModel block")
 
@@ -494,7 +597,22 @@ def main():
     p2.add_argument("--raymap", required=True)
     p2.add_argument("--grid", type=int, default=24)
     p2.add_argument("--patch", type=int, default=25)
+    p2.add_argument("--min-texture", type=float, default=5.0,
+                    help="minimum patch std (0-255 luma) for a site to be scored. Below "
+                         "this the correlation locks onto noise and returns a confident "
+                         "wrong shift - it is what made this gate read FAIL on Blocks")
     p2.set_defaults(func=test2)
+
+    pc = sub.add_parser("control", help="test 2's noise floor: two native pinholes")
+    pc.add_argument("--vehicle", default="CamPlayer")
+    pc.add_argument("--port", type=int, default=41451)
+    pc.add_argument("--cam-a", required=True)
+    pc.add_argument("--cam-b", required=True)
+    pc.add_argument("--fov", type=float, default=90.0)
+    pc.add_argument("--grid", type=int, default=40)
+    pc.add_argument("--patch", type=int, default=25)
+    pc.add_argument("--min-texture", type=float, default=10.0)
+    pc.set_defaults(func=control)
 
     p3 = sub.add_parser("test3", help="face-boundary seam check")
     common(p3)

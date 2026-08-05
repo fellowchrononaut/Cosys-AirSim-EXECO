@@ -10,7 +10,12 @@
 //
 // Builds with one command and no build-system change (run from the repository root):
 //
-//   g++ -std=c++17 -I AirLib/include -I AirLib/deps/eigen3 tools/raymap_dump.cpp -o /tmp/raymap_dump
+//   g++ -std=c++17 -I AirLib/include -I AirLib/deps/eigen3 tools/raymap_dump.cpp \
+//       AirLib/src/common/common_utils/FileSystem.cpp -o /tmp/raymap_dump
+//
+// FileSystem.cpp is not optional: AirSimSettings::load reaches Settings::getExecutableFullPath
+// and FileSystem::ensureFolder, so without it the link fails on undefined references rather
+// than the compile failing on a missing header.
 //
 // Usage:
 //   raymap_dump --out FILE [--f64]
