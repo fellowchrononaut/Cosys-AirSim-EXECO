@@ -13,6 +13,7 @@
 #include "HAL/IConsoleManager.h"
 #include "EngineUtils.h"
 #include "Engine/Engine.h"
+#include "cameras/Raymap.hpp"
 
 /** I-G diagnostic and candidate fix.
  *
@@ -484,6 +485,17 @@ void APIPCamera::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	render_targets_.Empty();
 	detections_.Empty();
 
+    //empty already for every camera without a CameraModel block, so this loop does not run
+    for (int32 face_index = 0; face_index < face_captures_.Num(); ++face_index) {
+        face_captures_[face_index] = nullptr;
+        face_render_targets_[face_index] = nullptr;
+    }
+    face_captures_.Empty();
+    face_render_targets_.Empty();
+
+    //null already for every camera without a CameraModel block, so this returns immediately
+    AirSimReleaseRaymap(raymap_);
+
     Super::EndPlay(EndPlayReason);
 }
 
@@ -822,6 +834,10 @@ void APIPCamera::setupCameraFromSettings(const APIPCamera::CameraSetting& camera
         setCameraTypeEnabled(ImageType::Scene, true);
         setCameraTypeUpdate(ImageType::Scene, false);
     }
+
+    //C2 / step 4: configuration time is the only time the raymap is built. Returns immediately
+    //for a camera with no CameraModel block.
+    buildRaymapResource();
 }
 
 void APIPCamera::updateCaptureComponentSetting(USceneCaptureComponent2D* capture, UTextureRenderTarget2D* render_target,
@@ -1124,12 +1140,410 @@ void APIPCamera::enableCaptureComponent(const APIPCamera::ImageType type, bool i
                 }
             }
         }
+        //C2 / F5: the cube face rig follows camera_type_enabled_ exactly rather than inventing a
+        //second mechanism. Without a CameraModel block this is one bool test and returns.
+        setFaceRigEnabled(type, is_enabled);
+
         if (type == ImageType::Annotation)
 			camera_type_enabled_[annotator_name_to_index_map_[FString(annotation_name.c_str())]] = is_enabled;
         else
             camera_type_enabled_[Utils::toNumeric(type)] = is_enabled;
     }
     //else nothing to enable
+}
+
+// -------------------------------------------------------------------------------------------
+// Generic (non-pinhole) camera cube face rig - Phase 3b step 3.
+//
+// D13: six USceneCaptureComponent2D, not one USceneCaptureComponentCube. The cube component
+// renders all six faces and cannot skip one, has a locked 90 degree field of view and a
+// hardcoded near plane, and on Vulkan cannot be read back per face as uint8 at all. Six 2D
+// captures cost more components and buy back all four.
+//
+// FACE ORIENTATION CONVENTION - stated here because getting it wrong produces a plausible
+// image that is wrong everywhere, and the error is then blamed on the camera model or on the
+// resample. Step 2 measured a cube component's faces arriving rotated 90 degrees against a 2D
+// capture of the same pose; that is the failure this convention and the shared-edge check exist
+// to rule out.
+//
+// All axes below are Unreal component axes: +X forward, +Y right, +Z up. A scene capture looks
+// down its own +X, its image right is its own +Y and its image up is its own +Z. Faces are
+// defined in the CAMERA frame and attached to camera_ at zero relative offset, so every face
+// shares the pinhole capture's origin and a face's world pose is the camera pose composed with
+// the fixed relative rotation below.
+//
+//   idx  name    forward   image right   image up   relative rotator (pitch, yaw, roll)
+//    0   Front     +X          +Y           +Z         (  0,    0, 0)
+//    1   Right     +Y          -X           +Z         (  0,   90, 0)
+//    2   Left      -Y          +X           +Z         (  0,  -90, 0)
+//    3   Up        +Z          +Y           -X         ( 90,    0, 0)
+//    4   Down      -Z          +Y           +X         (-90,    0, 0)
+//    5   Back      -X          -Y           +Z         (  0,  180, 0)
+//
+// In words: the four side faces keep camera-up as image up, and Up and Down are reached by
+// pitching the front face, so the front face's image right (+Y) remains image right on all six.
+// Back is deliberately last, so "Faces": 5 - legal for a camera whose field of view is at most
+// 180 degrees, since no ray of such a camera reaches the rear face - is exactly the first five
+// rows of the same table and needs no second ordering.
+//
+// The convention is checkable, not assumed: each face is an exact pinhole render sharing one
+// origin, so along a shared cube edge two faces sample the same directions to within half a
+// face texel. A discontinuity there means wrong orientation, wrong field of view, or a
+// non-shared origin. airsim.CubeFaceDump measures all twelve edges - see CubeFaceDump.cpp.
+//
+// Nothing here is agnostic-hostile to a later cube-backed equirectangular path: the faces are
+// handed out through getFaceCaptureComponent / getFaceRenderTarget, which say nothing about
+// where a face came from.
+// -------------------------------------------------------------------------------------------
+
+const TCHAR* APIPCamera::getCubeFaceName(int face)
+{
+    switch (face) {
+    case 0:
+        return TEXT("Front");
+    case 1:
+        return TEXT("Right");
+    case 2:
+        return TEXT("Left");
+    case 3:
+        return TEXT("Up");
+    case 4:
+        return TEXT("Down");
+    case 5:
+        return TEXT("Back");
+    default:
+        return TEXT("Invalid");
+    }
+}
+
+FRotator APIPCamera::getCubeFaceRotation(int face)
+{
+    switch (face) {
+    case 0:
+        return FRotator(0.0f, 0.0f, 0.0f); //Front, +X
+    case 1:
+        return FRotator(0.0f, 90.0f, 0.0f); //Right, +Y
+    case 2:
+        return FRotator(0.0f, -90.0f, 0.0f); //Left, -Y
+    case 3:
+        return FRotator(90.0f, 0.0f, 0.0f); //Up, +Z
+    case 4:
+        return FRotator(-90.0f, 0.0f, 0.0f); //Down, -Z
+    default:
+        return FRotator(0.0f, 180.0f, 0.0f); //Back, -X
+    }
+}
+
+bool APIPCamera::hasCameraModel() const
+{
+    return sensor_params_.camera_model.enabled;
+}
+
+int APIPCamera::getCubeFaceCount() const
+{
+    if (!sensor_params_.camera_model.enabled)
+        return 0;
+
+    //"Faces": Auto resolves to six here. Choosing five automatically needs the model's largest
+    //incidence angle, which is the same computation the automatic face resolution of design
+    //section 6 needs - both belong to step 7. An explicit "Faces": 5 is honoured now.
+    return sensor_params_.camera_model.faces == 5 ? 5 : kCubeFaceCount;
+}
+
+int APIPCamera::getCubeFaceResolution() const
+{
+    if (!sensor_params_.camera_model.enabled)
+        return 0;
+
+    if (sensor_params_.camera_model.cube_face_resolution > 0)
+        return sensor_params_.camera_model.cube_face_resolution;
+
+    //Documented default for "CubeFaceResolution": 0, until step 7 derives it from the angular
+    //density at the face centre (design section 6). The rule is one face texel per output texel
+    //along the longer output axis. Section 6's value is width * (pi/2) / fov, so this default is
+    //at or above it for every field of view of 90 degrees or more - it therefore never
+    //undersamples a camera wide enough to need this path at all - and it oversamples a 180
+    //degree lens by 2x linear. Oversampling costs render and readback time, undersampling costs
+    //image quality that cannot be recovered later, so the default errs the way section 6 says to
+    //err. Set CubeFaceResolution explicitly to trade it back.
+    //
+    //A Raymap model carries no Width or Height in settings, so it lands on the 64 floor and must
+    //set CubeFaceResolution explicitly until step 4 loads the map itself.
+    const int widest = FMath::Max(static_cast<int>(sensor_params_.camera_model.model.width),
+                                  static_cast<int>(sensor_params_.camera_model.model.height));
+    return FMath::Clamp(widest, 64, 2048);
+}
+
+void APIPCamera::ensureFaceRig(const ImageType type)
+{
+    //A naive rig is imageTypeCount() * 6 = 66 components per camera. This builds a face set only
+    //for a camera that asked for a camera model, and only for the ImageTypes that camera is
+    //actually asked for - which UnrealImageCapture::updateCameraVisibility does exactly once per
+    //(camera, ImageType), on the first image request.
+    if (!sensor_params_.camera_model.enabled)
+        return;
+    if (type == ImageType::Annotation)
+        return; //annotation cameras stay on the pinhole path
+
+    const unsigned int image_type = Utils::toNumeric(type);
+    if (image_type >= imageTypeCount())
+        return;
+
+    if (face_captures_.Num() == 0) {
+        face_captures_.Init(nullptr, static_cast<int32>(imageTypeCount()) * kCubeFaceCount);
+        face_render_targets_.Init(nullptr, static_cast<int32>(imageTypeCount()) * kCubeFaceCount);
+    }
+
+    const int32 base = static_cast<int32>(image_type) * kCubeFaceCount;
+    if (face_captures_[base] != nullptr)
+        return; //already built for this ImageType
+
+    USceneCaptureComponent2D* parent = captures_[image_type];
+    UTextureRenderTarget2D* parent_target = render_targets_[image_type];
+    if (parent == nullptr || parent_target == nullptr)
+        return;
+
+    //Mirror whatever the pinhole target ended up as, rather than repeating the auto-format /
+    //custom-format switch of setupCameraFromSettings: GetFormat() resolves OverrideFormat or
+    //RenderTargetFormat, so this stays correct if that switch changes.
+    const EPixelFormat parent_format = parent_target->GetFormat();
+    if (parent_format == EPixelFormat::PF_Unknown) {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[AirSim] cube face rig skipped for %s image type %d: pinhole render target has no format yet"),
+               *GetName(), static_cast<int32>(image_type));
+        return;
+    }
+
+    const int resolution = getCubeFaceResolution();
+    const int face_count = getCubeFaceCount();
+    //camera_ is what copyCameraSettingsToSceneCapture aligns every pinhole capture to, so
+    //attaching there is what makes "shared origin" true rather than approximately true
+    USceneComponent* attach_to = camera_;
+    if (attach_to == nullptr)
+        attach_to = this->RootComponent;
+
+    for (int face = 0; face < face_count; ++face) {
+        const FString component_name = FString::Printf(TEXT("CubeFace_%d_%s"), static_cast<int32>(image_type), getCubeFaceName(face));
+        USceneCaptureComponent2D* capture = NewObject<USceneCaptureComponent2D>(this, USceneCaptureComponent2D::StaticClass(), *component_name);
+
+        capture->bAutoActivate = false;
+        capture->SetRelativeLocation(FVector::ZeroVector); //shared origin with the pinhole capture
+        capture->SetRelativeRotation(getCubeFaceRotation(face));
+        capture->AttachToComponent(attach_to, FAttachmentTransformRules::KeepRelativeTransform);
+        capture->RegisterComponent();
+
+        //After RegisterComponent, never before: USceneCaptureComponent::OnRegister calls
+        //UpdateShowFlags, which overwrites ShowFlags wholesale from the archetype. Assigned
+        //earlier, Segmentation's annotation show flags and Lighting's would be silently lost and
+        //those faces would render the wrong thing while looking fine.
+        capture->ShowFlags = parent->ShowFlags;
+        capture->CaptureSource = parent->CaptureSource;
+        capture->PrimitiveRenderMode = parent->PrimitiveRenderMode;
+        capture->ShowOnlyComponents = parent->ShowOnlyComponents;
+        capture->HiddenComponents = parent->HiddenComponents;
+        capture->ShowOnlyActors = parent->ShowOnlyActors;
+        capture->HiddenActors = parent->HiddenActors;
+        capture->PostProcessSettings = parent->PostProcessSettings; //carries the blendables, so depth and segmentation materials come with it
+        capture->PostProcessBlendWeight = parent->PostProcessBlendWeight;
+        capture->bUseRayTracingIfEnabled = parent->bUseRayTracingIfEnabled;
+        capture->MaxViewDistanceOverride = parent->MaxViewDistanceOverride;
+        capture->LODDistanceFactor = parent->LODDistanceFactor;
+
+        //a cube face is exactly 90 degrees on a square target, whatever the output camera is
+        capture->ProjectionType = ECameraProjectionMode::Perspective;
+        capture->FOVAngle = 90.0f;
+
+        //never per frame: re-rendering capture components every frame was the I-G defect
+        capture->bCaptureEveryFrame = false;
+        capture->bCaptureOnMovement = false;
+        capture->bAlwaysPersistRenderingState = true;
+        capture->SetVisibility(true); //CaptureScene and CaptureSceneDeferred both test IsVisible()
+        capture->Deactivate();
+
+        UTextureRenderTarget2D* target = NewObject<UTextureRenderTarget2D>();
+        target->ClearColor = parent_target->ClearColor;
+        target->InitCustomFormat(static_cast<uint32>(resolution), static_cast<uint32>(resolution),
+                                 parent_format, parent_target->bForceLinearGamma);
+        target->TargetGamma = parent_target->TargetGamma;
+
+        face_captures_[base + face] = capture;
+        face_render_targets_[base + face] = target;
+    }
+
+    //One line per rig actually built. Its absence is the runtime half of the non-invasiveness
+    //check: no CameraModel block, no line, no components.
+    UE_LOG(LogTemp, Log,
+           TEXT("[AirSim] cube face rig built: %s image type %d, %d faces at %dx%d, format %d"),
+           *GetName(), static_cast<int32>(image_type), face_count, resolution, resolution,
+           static_cast<int32>(parent_format));
+}
+
+void APIPCamera::setFaceRigEnabled(const ImageType type, bool is_enabled)
+{
+    if (!sensor_params_.camera_model.enabled)
+        return; //no CameraModel block: one bool test, and nothing is ever built
+    if (type == ImageType::Annotation)
+        return;
+
+    if (is_enabled)
+        ensureFaceRig(type);
+
+    if (face_captures_.Num() == 0)
+        return;
+
+    const unsigned int image_type = Utils::toNumeric(type);
+    if (image_type >= imageTypeCount())
+        return;
+
+    const int32 base = static_cast<int32>(image_type) * kCubeFaceCount;
+    for (int face = 0; face < kCubeFaceCount; ++face) {
+        USceneCaptureComponent2D* capture = face_captures_[base + face];
+        if (capture == nullptr)
+            continue; //a five-face rig leaves the last slot empty
+
+        //the same activation dance enableCaptureComponent does for the pinhole capture, for the
+        //same reason: repeated Activate() calls crash Unreal
+        if (is_enabled) {
+            if (!capture->IsActive() || capture->TextureTarget == nullptr) {
+                capture->TextureTarget = face_render_targets_[base + face];
+                capture->Activate();
+            }
+        }
+        else if (capture->IsActive() || capture->TextureTarget != nullptr) {
+            capture->Deactivate();
+            capture->TextureTarget = nullptr;
+        }
+    }
+}
+
+USceneCaptureComponent2D* APIPCamera::getFaceCaptureComponent(const ImageType type, int face)
+{
+    if (face_captures_.Num() == 0 || face < 0 || face >= kCubeFaceCount || type == ImageType::Annotation)
+        return nullptr;
+
+    const unsigned int image_type = Utils::toNumeric(type);
+    if (image_type >= imageTypeCount())
+        return nullptr;
+
+    return face_captures_[static_cast<int32>(image_type) * kCubeFaceCount + face];
+}
+
+UTextureRenderTarget2D* APIPCamera::getFaceRenderTarget(const ImageType type, int face)
+{
+    if (face_render_targets_.Num() == 0 || face < 0 || face >= kCubeFaceCount || type == ImageType::Annotation)
+        return nullptr;
+
+    const unsigned int image_type = Utils::toNumeric(type);
+    if (image_type >= imageTypeCount())
+        return nullptr;
+
+    return face_render_targets_[static_cast<int32>(image_type) * kCubeFaceCount + face];
+}
+
+const FAirSimRaymapResourcePtr& APIPCamera::getRaymapResource() const
+{
+    return raymap_;
+}
+
+// -------------------------------------------------------------------------------------------
+// The raymap on the GPU - and the ONE place the optical to Unreal axis change happens.
+//
+// AirLib builds the raymap in the calibration's own frame: the right-handed OPTICAL frame,
+// +x right along an image row, +y down an image column, +z forward out of the lens. That is the
+// frame OpenCV, Kalibr and ScanNet++ express cx, cy and k1..k4 in, and staying in it is what
+// lets tools/raymap_check.py check our rays against those tools rather than against ourselves.
+// The conventions block at the top of AirLib/include/cameras/CameraModel.hpp is authoritative.
+//
+// The cube faces are in the Unreal CAMERA frame: +X forward, +Y right, +Z up. So
+//
+//     Unreal X (forward)  =  optical  z
+//     Unreal Y (right)    =  optical  x
+//     Unreal Z (up)       =  optical -y
+//
+// which is a handedness flip, as it must be - the optical frame is right handed and Unreal's is
+// left handed. It is applied here, once, as each ray is copied into the GPU buffer, and nothing
+// downstream re-applies it: CubeResample.usf assumes the buffer is already in the Unreal camera
+// frame and uses the face table stated above getCubeFaceRotation() in this file. If an image
+// ever comes out mirrored or rotated, this function and that table are the two places to look,
+// and they must agree.
+//
+// Origins take the same change of basis plus the metres to centimetres scale Unreal works in.
+// Every camera model in the v1 set is central, so every origin is exactly zero and the scale is
+// unobservable today. It is applied anyway: the first non-central raymap would otherwise be
+// wrong by a factor of 100 in a way that reads like a calibration error. Per ADR-001 the origin
+// channels are stored whether or not anything reads them - and the cube path does not, because
+// all six faces share one origin by construction, so a non-central model needs the native
+// raymap path rather than this one.
+// -------------------------------------------------------------------------------------------
+
+void APIPCamera::buildRaymapResource()
+{
+    //setupCameraFromSettings can run more than once for a camera; never leak the previous one
+    if (raymap_.IsValid())
+        AirSimReleaseRaymap(raymap_);
+
+    if (!sensor_params_.camera_model.enabled)
+        return; //no CameraModel block: nothing allocated, no render command enqueued, no log line
+
+    msr::airlib::cameras::Raymap map;
+    msr::airlib::cameras::RaymapStats stats;
+    std::string error;
+    if (!msr::airlib::cameras::buildRaymap(sensor_params_.camera_model.model, map, stats, error)) {
+        UE_LOG(LogTemp, Error,
+               TEXT("[AirSim] %s: raymap build failed (%s). Camera stays on the pinhole path."),
+               *GetName(), UTF8_TO_TCHAR(error.c_str()));
+        return;
+    }
+
+    //The output image IS the camera model's image: fx, fy, cx and cy are expressed in the
+    //model's own pixels, so a Scene target of a different size is a different camera. Rescaling
+    //the raymap to fit would publish plausible, wrong intrinsics - the exact silent failure
+    //design section 7.3 warns about - so refuse instead, loudly, and leave the camera pinhole.
+    const CaptureSetting& scene_setting = sensor_params_.capture_settings.at(Utils::toNumeric(ImageType::Scene));
+    if (map.width != scene_setting.width || map.height != scene_setting.height) {
+        UE_LOG(LogTemp, Error,
+               TEXT("[AirSim] %s: CameraModel is %ux%u but its Scene CaptureSettings is %ux%u. ")
+               TEXT("These must match. Camera stays on the pinhole path until they do."),
+               *GetName(), map.width, map.height, scene_setting.width, scene_setting.height);
+        return;
+    }
+
+    const int32 channels = static_cast<int32>(msr::airlib::cameras::Raymap::kChannels);
+    TArray<float> values;
+    values.SetNumUninitialized(static_cast<int32>(map.width) * static_cast<int32>(map.height) * channels);
+
+    for (unsigned int y = 0; y < map.height; ++y) {
+        for (unsigned int x = 0; x < map.width; ++x) {
+            const msr::airlib::cameras::Ray ray = map.at(x, y);
+            const int32 base = (static_cast<int32>(y) * static_cast<int32>(map.width) + static_cast<int32>(x)) * channels;
+
+            values[base + 0] = static_cast<float>(ray.oz * 100.0);
+            values[base + 1] = static_cast<float>(ray.ox * 100.0);
+            values[base + 2] = static_cast<float>(-ray.oy * 100.0);
+            //a texel the model could not unproject keeps its all-zero direction, which is what
+            //the shader tests for; do not normalise or otherwise repair it here
+            values[base + 3] = static_cast<float>(ray.dz);
+            values[base + 4] = static_cast<float>(ray.dx);
+            values[base + 5] = static_cast<float>(-ray.dy);
+        }
+    }
+
+    const double megabytes = static_cast<double>(values.Num()) * sizeof(float) / (1024.0 * 1024.0);
+
+    raymap_ = AirSimCreateRaymapResource();
+    AirSimUploadRaymap(raymap_, MoveTemp(values), map.width, map.height, map.central);
+
+    //One line per raymap actually uploaded. Its absence is the other half of the runtime
+    //non-invasiveness check, alongside the cube face rig line: no CameraModel block, no line.
+    UE_LOG(LogTemp, Log,
+           TEXT("[AirSim] raymap uploaded: %s model %s %ux%u, 6 floats/texel, %.1f MB, ")
+           TEXT("%llu of %llu texels outside the model's valid domain, central=%s"),
+           *GetName(),
+           UTF8_TO_TCHAR(msr::airlib::cameras::toString(sensor_params_.camera_model.model.type)),
+           map.width, map.height, megabytes,
+           static_cast<unsigned long long>(stats.invalid),
+           static_cast<unsigned long long>(stats.texels),
+           map.central ? TEXT("true") : TEXT("false"));
 }
 
 UTextureRenderTarget2D* APIPCamera::getRenderTarget(const APIPCamera::ImageType type, bool if_active, std::string annotation_name)

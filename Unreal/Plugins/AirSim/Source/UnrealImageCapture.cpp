@@ -100,7 +100,53 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
         
         bool disable_gamma = false;
         if (requests[i].image_type == ImageCaptureBase::ImageType::Segmentation || requests[i].image_type == ImageCaptureBase::ImageType::Annotation)disable_gamma = true;
-        render_params.push_back(std::make_shared<RenderRequest::RenderParams>(capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma));
+        auto params = std::make_shared<RenderRequest::RenderParams>(capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma);
+
+        //Generic (non-pinhole) camera - Phase 3b step 4. Everything below is skipped by the
+        //first condition for every camera that has no CameraModel block, which leaves params
+        //exactly the object this line used to push: two empty TArrays and a null raymap, which
+        //RenderRequest reads as "pinhole, behave as before".
+        //
+        //Scene only in step 4, deliberately. Design section 5: Segmentation and Annotation are ID
+        //buffers that must be sampled nearest, depth must be converted to range along the ray
+        //BEFORE it is filtered because per-face planar depth is measured against that face's own
+        //axis, and optical flow cannot be resampled at all. Bilinear on any of those produces a
+        //buffer that looks right and is wrong. Those are step 5. Until then a non-Scene request
+        //on a generic camera returns the ordinary pinhole render, which is honest: it is what
+        //that ImageType has always returned, not a silently mis-filtered fisheye.
+        if (capture != nullptr && textureTarget != nullptr && camera->hasCameraModel() &&
+            requests[i].image_type == ImageType::Scene) {
+
+            const FAirSimRaymapResourcePtr& raymap = camera->getRaymapResource();
+            const int face_count = camera->getCubeFaceCount();
+            if (raymap.IsValid() && face_count > 0) {
+                TArray<USceneCaptureComponent2D*> face_components;
+                TArray<UTextureRenderTarget2D*> face_targets;
+                face_components.Reserve(face_count);
+                face_targets.Reserve(face_count);
+
+                for (int face = 0; face < face_count; ++face) {
+                    USceneCaptureComponent2D* face_capture = camera->getFaceCaptureComponent(requests[i].image_type, face);
+                    UTextureRenderTarget2D* face_target = camera->getFaceRenderTarget(requests[i].image_type, face);
+                    if (face_capture == nullptr || face_target == nullptr) {
+                        face_components.Reset();
+                        face_targets.Reset();
+                        break;
+                    }
+                    face_components.Add(face_capture);
+                    face_targets.Add(face_target);
+                }
+
+                //an incomplete rig falls back to the pinhole path rather than to half a cube
+                if (face_components.Num() == face_count) {
+                    params->face_components = MoveTemp(face_components);
+                    params->face_targets = MoveTemp(face_targets);
+                    params->raymap = raymap;
+                }
+            }
+        }
+
+        render_params.push_back(params);
     }
 
     if (nullptr == gameViewport) {

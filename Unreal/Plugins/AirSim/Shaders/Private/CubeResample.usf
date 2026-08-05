@@ -1,0 +1,142 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// Generic (non-pinhole) camera resample - Phase 3b step 4.
+//
+// One full-screen pass over the OUTPUT image. Per output pixel: fetch that pixel's viewing ray
+// from the raymap, pick the cube face the ray falls in, project the ray into that face's image
+// plane, sample. The six faces are exact 90 degree pinhole renders sharing one origin, so the
+// only error this pass can introduce is resampling error.
+//
+// FRAME. Ray directions in the Raymap buffer are already in the UNREAL CAMERA frame
+// (+X forward, +Y right, +Z up) - the same frame as the face table in PIPCamera.cpp. The
+// optical -> Unreal axis change is applied once, on the CPU, in
+// APIPCamera::buildRaymapResource; nothing here re-applies it. Read that function's comment
+// before changing anything below.
+//
+// Face table, identical to APIPCamera::getCubeFaceRotation:
+//
+//   idx  name    forward(F)  image right(R)  image up(U)
+//    0   Front      +X            +Y             +Z
+//    1   Right      +Y            -X             +Z
+//    2   Left       -Y            +X             +Z
+//    3   Up         +Z            +Y             -X
+//    4   Down       -Z            +Y             +X
+//    5   Back       -X            -Y             +Z
+//
+// For a ray d on face f: a = dot(d,R)/dot(d,F) and b = dot(d,U)/dot(d,F), both in [-1,1] over
+// the face. Image UV is then (0.5*(a+1), 0.5*(1-b)) because v runs down the image.
+//
+// ADR-001: the raymap carries SIX floats per texel, (origin, direction). Every camera model in
+// the v1 set is central, so all six faces share one origin and the cube path cannot use a
+// per-pixel origin at all - a non-central model needs the native raymap path, not this one.
+// This shader therefore skips the ORIGIN FETCH, which is exactly the optimisation ADR-001
+// permits. It does not change the stored format: the origin channels are there, unread.
+
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<float> Raymap;
+
+Texture2D FaceTexture0;
+Texture2D FaceTexture1;
+Texture2D FaceTexture2;
+Texture2D FaceTexture3;
+Texture2D FaceTexture4;
+Texture2D FaceTexture5;
+SamplerState FaceSampler;
+
+int2 RaymapSize;
+uint FaceCount;
+
+float4 SampleCubeFace(uint Face, float2 UV)
+{
+    // A dynamic index into a texture array is not portable; a switch over six bindings is.
+    switch (Face)
+    {
+    case 0: return FaceTexture0.SampleLevel(FaceSampler, UV, 0);
+    case 1: return FaceTexture1.SampleLevel(FaceSampler, UV, 0);
+    case 2: return FaceTexture2.SampleLevel(FaceSampler, UV, 0);
+    case 3: return FaceTexture3.SampleLevel(FaceSampler, UV, 0);
+    case 4: return FaceTexture4.SampleLevel(FaceSampler, UV, 0);
+    default: return FaceTexture5.SampleLevel(FaceSampler, UV, 0);
+    }
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+    // SV_Position carries the +0.5 pixel-centre offset, so the truncation is the pixel index.
+    int2 Pixel = int2(SvPosition.xy);
+
+    // The raymap is built at the output resolution and refused otherwise (see
+    // APIPCamera::buildRaymapResource), so this clamp only guards against a driver handing us a
+    // pixel outside the viewport. It is not a resampling of the raymap.
+    int2 Texel = clamp(Pixel, int2(0, 0), RaymapSize - int2(1, 1));
+    uint Base = (uint)(Texel.y * RaymapSize.x + Texel.x) * 6u;
+
+    // Channels 0..2 are the origin. Not read - see the ADR-001 note in the header.
+    float3 Dir = float3(Raymap[Base + 3u], Raymap[Base + 4u], Raymap[Base + 5u]);
+
+    // An all-zero direction is a texel the camera model could not unproject: outside the lens'
+    // valid domain, which is a real case for a wide Double Sphere at the image corners. Black is
+    // the honest answer; there is no scene behind such a pixel.
+    if (dot(Dir, Dir) < 1e-8f)
+    {
+        OutColor = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    float3 Mag = abs(Dir);
+    uint Face;
+    float2 AB;
+
+    if (Mag.x >= Mag.y && Mag.x >= Mag.z)
+    {
+        if (Dir.x > 0.0f)
+        {
+            Face = 0; // Front: F=+X, R=+Y, U=+Z
+            AB = float2(Dir.y, Dir.z) / Dir.x;
+        }
+        else
+        {
+            Face = 5; // Back: F=-X, R=-Y, U=+Z
+            AB = float2(-Dir.y, Dir.z) / (-Dir.x);
+        }
+    }
+    else if (Mag.y >= Mag.z)
+    {
+        if (Dir.y > 0.0f)
+        {
+            Face = 1; // Right: F=+Y, R=-X, U=+Z
+            AB = float2(-Dir.x, Dir.z) / Dir.y;
+        }
+        else
+        {
+            Face = 2; // Left: F=-Y, R=+X, U=+Z
+            AB = float2(Dir.x, Dir.z) / (-Dir.y);
+        }
+    }
+    else
+    {
+        if (Dir.z > 0.0f)
+        {
+            Face = 3; // Up: F=+Z, R=+Y, U=-X
+            AB = float2(Dir.y, -Dir.x) / Dir.z;
+        }
+        else
+        {
+            Face = 4; // Down: F=-Z, R=+Y, U=+X
+            AB = float2(Dir.y, Dir.x) / (-Dir.z);
+        }
+    }
+
+    // A five-face rig has no Back face. A ray that lands there is behind a camera that declared
+    // it never looks behind itself, so it is out of domain in exactly the sense above.
+    if (Face >= FaceCount)
+    {
+        OutColor = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    float2 UV = float2(0.5f * (AB.x + 1.0f), 0.5f * (1.0f - AB.y));
+    OutColor = SampleCubeFace(Face, UV);
+}

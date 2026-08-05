@@ -8,6 +8,7 @@
 #include <memory>
 #include "common/Common.hpp"
 #include "ImageTiming.h"
+#include "CubeResample.h"
 
 
 class RenderRequest : public FRenderCommand
@@ -19,6 +20,29 @@ public:
         bool pixels_as_float;
         bool compress;
         bool disable_gamma;
+
+        // Generic (non-pinhole) camera support - Phase 3b step 4, finding F1.
+        //
+        // The 1:1 assumption above - one capture component, one render target - is the only
+        // structural thing a cube camera breaks: it needs N face captures feeding ONE output
+        // target. Rather than rewrite the pair into a list, the face list is ADDED alongside it
+        // and left EMPTY for every pinhole request, which is what makes the pinhole path
+        // bit-identical rather than merely equivalent:
+        //
+        //   - the constructor is untouched, so every existing construction site builds exactly
+        //     the object it built before, with two empty TArrays and a null TSharedPtr;
+        //   - getScreenshot tests face_components.Num() and, finding zero, fires the same single
+        //     CaptureSceneDeferred() on the same component as before;
+        //   - ExecuteTask tests face_targets.Num() and, finding zero, does no resample work at
+        //     all before dispatching to the same readback it dispatched to before;
+        //   - render_target stays what it always was, so ReadSurfaceData is untouched (F2).
+        //
+        // face_targets are internal; render_target remains the OUTPUT, and the resample writes
+        // into it. Filled by UnrealImageCapture only for a camera with a CameraModel block, and
+        // in step 4 only for ImageType::Scene (per-modality filtering is step 5).
+        TArray<USceneCaptureComponent2D*> face_components;
+        TArray<UTextureRenderTarget2D*> face_targets;
+        FAirSimRaymapResourcePtr raymap;
 
         RenderParams(USceneCaptureComponent2D * render_component_val, UTextureRenderTarget2D* render_target_val, bool pixels_as_float_val, bool compress_val, bool disable_gamma_val)
             : render_component(render_component_val), render_target(render_target_val), pixels_as_float(pixels_as_float_val), compress(compress_val), disable_gamma(disable_gamma_val)
@@ -40,6 +64,11 @@ public:
 
 private:
     static FReadSurfaceDataFlags setupRenderResource(const FTextureRenderTargetResource* rt_resource, const RenderParams* params, RenderResult* result, FIntPoint& size);
+
+    // Phase 3b step 4. Cube faces -> generic camera image, into the existing output target, at
+    // the top of ExecuteTask and therefore before any readback (finding F3). No-op unless a
+    // request carries faces.
+    void executeCubeResample();
 
     // I-G: the two readback paths, selected at runtime by airsim.GpuReadback. Both fill
     // results_[i]->bmp / bmp_float and record a completion stamp per image.

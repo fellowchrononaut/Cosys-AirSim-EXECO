@@ -7,6 +7,7 @@
 #include "CommonStructs.hpp"
 #include "ImageCaptureBase.hpp"
 #include "Settings.hpp"
+#include "cameras/CameraModel.hpp"
 #include "common_utils/Utils.hpp"
 #include "sensors/SensorBase.hpp"
 #include <exception>
@@ -293,6 +294,22 @@ namespace airlib
             std::map<int, PixelFormatOverrideSetting> pixel_format_override_settings;
         };
 
+        //Generic (non-pinhole) camera model — design doc section 7.2. Absent a "CameraModel"
+        //block in settings.json this stays disabled and nothing else in the pipeline looks at
+        //it, so behaviour is identical to before. The maths lives in AirLib/include/cameras/.
+        struct CameraModelSetting
+        {
+            bool enabled = false; //true only when a CameraModel block was present
+
+            cameras::CameraModelParams model;
+
+            //consumed by the cube capture / resample steps, parsed here so the schema is
+            //stable from the start: users write config files against these names
+            int cube_face_resolution = 0; //0 = auto
+            int faces = 0; //0 = Auto, else 5 (<=180 deg) or 6
+            bool splat_only = false; //content declaration; no effect until the native path exists
+        };
+
         using CaptureSettingsMap = std::map<int, CaptureSetting>;
         using NoiseSettingsMap = std::map<int, NoiseSetting>;
         struct CameraSetting
@@ -308,6 +325,7 @@ namespace airlib
             GimbalSetting gimbal;
             CaptureSettingsMap capture_settings;
             NoiseSettingsMap noise_settings;
+            CameraModelSetting camera_model;
 
             UnrealEngineSetting ue_setting;
 
@@ -1523,6 +1541,12 @@ namespace airlib
 
             loadUnrealEngineSetting(settings_json, setting.ue_setting);
 
+            //absent a CameraModel block this is one lookup that misses and nothing else:
+            //no raymap, no allocation, no behavioural difference
+            Settings json_camera_model;
+            if (settings_json.getChild("CameraModel", json_camera_model))
+                createCameraModelSetting(json_camera_model, setting.camera_model);
+
             return setting;
         }
 
@@ -1626,6 +1650,96 @@ namespace airlib
             capture_setting.depth_of_field_depth_blur_amount = settings_json.getFloat("DepthOfFieldDepthBlurAmount", capture_setting.depth_of_field_depth_blur_amount);
             capture_setting.depth_of_field_depth_blur_radius = settings_json.getFloat("DepthOfFieldDepthBlurRadius", capture_setting.depth_of_field_depth_blur_radius);
             capture_setting.depth_of_field_use_hair_depth = settings_json.getFloat("DepthOfFieldUseHairDepth", capture_setting.depth_of_field_use_hair_depth);
+        }
+
+        static int createCameraModelFacesSetting(const msr::airlib::Settings& settings_json)
+        {
+            //"Faces" is written either as a number (5, 6) or as a string ("Auto", "5", "6").
+            //Settings offers no type query, so the numeric read is tried first and a JSON
+            //type error falls through to the string form.
+            if (!settings_json.hasKey("Faces"))
+                return 0; //Auto
+
+            int faces = 0;
+            bool numeric = true;
+            try {
+                faces = settings_json.getInt("Faces", 0);
+            }
+            catch (const std::exception&) {
+                numeric = false;
+            }
+            if (!numeric) {
+                std::string faces_str = Utils::toLower(settings_json.getString("Faces", ""));
+                if (faces_str == "auto")
+                    faces = 0;
+                else if (faces_str == "5")
+                    faces = 5;
+                else if (faces_str == "6")
+                    faces = 6;
+                else
+                    throw std::invalid_argument(std::string("CameraModel Faces has invalid value in settings_json ") + faces_str);
+            }
+            if (faces != 0 && faces != 5 && faces != 6)
+                throw std::invalid_argument(std::string("CameraModel Faces must be Auto, 5 or 6 in settings_json"));
+
+            return faces;
+        }
+
+        //Parameter names deliberately match the calibrations we hold, so a calibration is
+        //transcribed rather than converted: ScanNet++ transforms.json is OPENCV_FISHEYE with
+        //k1..k4, and Kalibr emits Double Sphere as [xi, alpha, fx, fy, cx, cy] in that order.
+        //These names outlive the model list — adding a model later is cheap, renaming a
+        //parameter breaks every config already written.
+        static void createCameraModelSetting(const msr::airlib::Settings& settings_json, CameraModelSetting& camera_model_setting)
+        {
+            cameras::CameraModelParams& model = camera_model_setting.model;
+
+            std::string type = Utils::toLower(settings_json.getString("Type", ""));
+            if (type == "pinhole")
+                model.type = cameras::CameraModelType::Pinhole;
+            else if (type == "kannalabrandt")
+                model.type = cameras::CameraModelType::KannalaBrandt;
+            else if (type == "doublesphere")
+                model.type = cameras::CameraModelType::DoubleSphere;
+            else if (type == "raymap")
+                model.type = cameras::CameraModelType::Raymap;
+            else
+                throw std::invalid_argument(std::string("CameraModel Type has invalid value in settings_json ") + type);
+
+            int width = settings_json.getInt("Width", 0);
+            int height = settings_json.getInt("Height", 0);
+            if (width < 0 || height < 0)
+                throw std::invalid_argument(std::string("CameraModel Width and Height must not be negative in settings_json"));
+            model.width = static_cast<unsigned int>(width);
+            model.height = static_cast<unsigned int>(height);
+
+            //getDouble, not getFloat: these come straight out of a calibration file and are
+            //quoted to full double precision there
+            model.fx = settings_json.getDouble("fx", model.fx);
+            model.fy = settings_json.getDouble("fy", model.fy);
+            model.cx = settings_json.getDouble("cx", model.cx);
+            model.cy = settings_json.getDouble("cy", model.cy);
+
+            model.k1 = settings_json.getDouble("k1", model.k1);
+            model.k2 = settings_json.getDouble("k2", model.k2);
+            model.k3 = settings_json.getDouble("k3", model.k3);
+            model.k4 = settings_json.getDouble("k4", model.k4);
+
+            model.xi = settings_json.getDouble("xi", model.xi);
+            model.alpha = settings_json.getDouble("alpha", model.alpha);
+
+            model.fov_degrees = settings_json.getDouble("FOV_Degrees", model.fov_degrees);
+            model.raymap_path = settings_json.getString("Path", model.raymap_path);
+
+            camera_model_setting.cube_face_resolution = settings_json.getInt("CubeFaceResolution", camera_model_setting.cube_face_resolution);
+            camera_model_setting.faces = createCameraModelFacesSetting(settings_json);
+            camera_model_setting.splat_only = settings_json.getBool("SplatOnly", camera_model_setting.splat_only);
+
+            std::string error_message;
+            if (!cameras::resolveParams(model, error_message))
+                throw std::invalid_argument(std::string("CameraModel is invalid in settings_json: ") + error_message);
+
+            camera_model_setting.enabled = true;
         }
 
         static void loadSubWindowsSettings(const Settings& settings_json, std::vector<SubwindowSetting>& subwindow_settings)

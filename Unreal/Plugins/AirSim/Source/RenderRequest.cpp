@@ -228,7 +228,23 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             // while we're still on GameThread, enqueue request for capture the scene!
             for (unsigned int i = 0; i < req_size_; ++i) {
                 if (params_[i]->render_target != nullptr && params_[i]->render_component != nullptr) {
-                    params_[i]->render_component->CaptureSceneDeferred();
+                    // Phase 3b step 4 (F1). A generic-camera request renders its cube faces
+                    // INSTEAD of the pinhole capture, not as well as it: the pinhole render would
+                    // be overwritten by the resample, so firing it would buy a discarded frame.
+                    // face_components is empty for every pinhole request, so an ordinary request
+                    // pays one TArray::Num() compare and then does exactly what it did before.
+                    // All of these are still queued in the same single game-thread pass, so
+                    // finding F9 - one world state, one sim instant per batch - still holds, and
+                    // now holds across the faces of a camera as well as across cameras.
+                    if (params_[i]->face_components.Num() > 0) {
+                        for (USceneCaptureComponent2D* face_component : params_[i]->face_components) {
+                            if (face_component != nullptr)
+                                face_component->CaptureSceneDeferred();
+                        }
+                    }
+                    else {
+                        params_[i]->render_component->CaptureSceneDeferred();
+                    }
                 }
             }
         });
@@ -549,9 +565,76 @@ void RenderRequest::executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& r
     readbacks_.Reset();
 }
 
+// Phase 3b step 4. Six pinhole cube faces -> one image of the calibrated camera, written into
+// the request's EXISTING output render target (finding F2), so ReadSurfaceData and everything
+// downstream of it need no change.
+//
+// WHY HERE. The resample must run after the deferred face captures have rendered and before the
+// readback. CaptureSceneDeferred() queues into Unreal's own deferred-capture list, processed
+// during the scene render, while ExecuteTask is enqueued from OnEndDraw - reasoning about the
+// interleaving of two queueing mechanisms is fragile. ExecuteTask already runs on the render
+// thread immediately after the scene render, and it is ours, so dispatching here makes the
+// ordering trivially correct with no new synchronisation. That is finding F3, and it is why
+// this call sits at the TOP of ExecuteTask, before the airsim.GpuReadback dispatch and not
+// inside either readback path.
+//
+// A batch with no generic camera in it runs req_size_ integer compares here and nothing else.
+void RenderRequest::executeCubeResample()
+{
+    if (!AirSimCubeResampleEnabled())
+        return;
+
+    FRHICommandListImmediate* cmd_list = nullptr;
+
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        const RenderParams* params = params_[i].get();
+        if (params == nullptr || params->face_targets.Num() == 0)
+            continue; //pinhole request: this is the whole cost of the feature for it
+
+        if (params->render_target == nullptr || !params->raymap.IsValid() || !params->raymap->ready)
+            continue;
+
+        FTextureRenderTargetResource* output_resource = params->render_target->GetRenderTargetResource();
+        if (output_resource == nullptr)
+            continue;
+        FRHITexture* output_texture = output_resource->GetRenderTargetTexture();
+        if (output_texture == nullptr)
+            continue;
+
+        FRHITexture* face_textures[kAirSimCubeResampleMaxFaces] = {};
+        const int32 face_count = FMath::Min(params->face_targets.Num(), kAirSimCubeResampleMaxFaces);
+        bool faces_ready = face_count > 0;
+        for (int32 face = 0; face < face_count; ++face) {
+            FRHITexture* face_texture = nullptr;
+            UTextureRenderTarget2D* face_target = params->face_targets[face];
+            if (face_target != nullptr) {
+                FTextureRenderTargetResource* face_resource = face_target->GetRenderTargetResource();
+                if (face_resource != nullptr)
+                    face_texture = face_resource->GetRenderTargetTexture();
+            }
+            if (face_texture == nullptr) {
+                faces_ready = false;
+                break;
+            }
+            face_textures[face] = face_texture;
+        }
+        if (!faces_ready)
+            continue; //leave the target alone rather than write half an image into it
+
+        if (cmd_list == nullptr)
+            cmd_list = &GetImmediateCommandList_ForRenderCommand();
+
+        AirSimCubeResample_RenderThread(*cmd_list, face_textures, face_count, output_texture, *params->raymap);
+    }
+}
+
 void RenderRequest::ExecuteTask()
 {
     if (params_ != nullptr && req_size_ > 0) {
+        // Phase 3b step 4 (F3): resample BEFORE the readback dispatch below. No-op for a batch
+        // that contains no generic camera.
+        executeCubeResample();
+
         // Readback-completion time per result, kept for the airsim.LogImageTimestamps diagnostic
         // even when airsim.BatchImageTimestamp overrides what actually reaches the response.
         TArray<msr::airlib::TTimePoint> readback_stamps;

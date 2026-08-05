@@ -13,6 +13,7 @@
 #include "common/AirSimSettings.hpp"
 #include "NedTransform.h"
 #include "DetectionComponent.h"
+#include "CubeResample.h"
 
 //CinemAirSim
 #include <CineCameraActor.h>
@@ -93,6 +94,26 @@ public:
     UTextureRenderTarget2D* getRenderTarget(const ImageType type, bool if_active, std::string annotation_name = "");
     UDetectionComponent* getDetectionComponent(const ImageType type, bool if_active, std::string annotation_name = "") const;
 
+    // Generic (non-pinhole) camera support - Phase 3b step 3. The cube face rig is six
+    // USceneCaptureComponent2D per ImageType (decision D13), built only for a camera whose
+    // settings carry a CameraModel block and only for the ImageTypes that camera actually uses.
+    // Absent that block hasCameraModel() is false, the two arrays below stay empty and not one
+    // component or render target is ever constructed. The face-orientation convention is stated
+    // in full above getCubeFaceRotation() in PIPCamera.cpp - read it before consuming a face.
+    bool hasCameraModel() const;
+    int getCubeFaceCount() const;
+    int getCubeFaceResolution() const;
+    static const TCHAR* getCubeFaceName(int face);
+    USceneCaptureComponent2D* getFaceCaptureComponent(const ImageType type, int face);
+    UTextureRenderTarget2D* getFaceRenderTarget(const ImageType type, int face);
+
+    // Phase 3b step 4. The camera's raymap as a GPU resource, built once at configuration time.
+    // Invalid - and therefore silently the pinhole path - for every camera without a CameraModel
+    // block, and also for a camera whose CameraModel and Scene CaptureSettings resolutions
+    // disagree, which buildRaymapResource() refuses loudly rather than resampling something that
+    // is not the calibrated camera.
+    const FAirSimRaymapResourcePtr& getRaymapResource() const;
+
     msr::airlib::Pose getPose() const;
 
 private: //members
@@ -107,6 +128,19 @@ private: //members
     TArray<UTextureRenderTarget2D*> render_targets_;
     UPROPERTY()
     TArray<UDetectionComponent*> detections_;
+
+    // Cube face rig, flat and indexed image_type * kCubeFaceCount + face. Both stay Num() == 0
+    // for a camera with no CameraModel block, which is where the non-invasiveness of this
+    // feature is enforced: an empty TArray allocates nothing.
+    UPROPERTY()
+    TArray<USceneCaptureComponent2D*> face_captures_;
+    UPROPERTY()
+    TArray<UTextureRenderTarget2D*> face_render_targets_;
+
+    // Per-camera raymap on the GPU (step 4). Not a UPROPERTY: it holds RHI references, not
+    // UObjects. Stays null for a camera with no CameraModel block, so an ordinary camera pays
+    // one null pointer.
+    FAirSimRaymapResourcePtr raymap_;
 
     UPROPERTY() UStaticMesh* annotation_sphere_static_;
 
@@ -156,9 +190,15 @@ private: //methods
     typedef AirSimSettings::CaptureSetting CaptureSetting;
     typedef AirSimSettings::NoiseSetting NoiseSetting;
 
+    static constexpr int kCubeFaceCount = 6;
+
     static unsigned int imageTypeCount();
     unsigned int cameraCaptureCount();
     void enableCaptureComponent(const ImageType type, bool is_enabled, std::string annotation_name = "");
+    static FRotator getCubeFaceRotation(int face);
+    void ensureFaceRig(const ImageType type);
+    void setFaceRigEnabled(const ImageType type, bool is_enabled);
+    void buildRaymapResource();
     static void updateCaptureComponentSetting(USceneCaptureComponent2D* capture, UTextureRenderTarget2D* render_target,
                                               bool auto_format, const EPixelFormat& pixel_format, const CaptureSetting& setting, const NedTransform& ned_transform,
                                               bool force_linear_gamma);
