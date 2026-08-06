@@ -37,6 +37,12 @@ other two.
           arguing.  Also measures how far an ID boundary sits from the corresponding
           Scene edge in the same camera.
 
+  ros     step 6's gate (T6.1/T6.2).  A pixel the camera model cannot unproject has NO RAY,
+          so depth there must publish NaN (REP 117: unknown), not 0.0 - which reads as a
+          surface touching the lens.  Checked against the raymap PIXEL FOR PIXEL rather than
+          by count, and it answers "did float16 NaN survive the readback" for free, because
+          if it did not the count is exactly zero rather than merely wrong.
+
   test3   seam check.  Classifies every output pixel by the cube face it came from,
           finds the boundaries, and compares the image gradient ACROSS a boundary
           with the gradient just inside each face.
@@ -134,6 +140,22 @@ def optical_dirs(rm):
     d = rm["data"][:, :, 3:6]
     valid = np.linalg.norm(d, axis=2) > 1e-8
     return d, valid
+
+
+def pinhole_dirs(width, height, fov_degrees):
+    """(H, W, 3) unit directions in the OPTICAL frame for a NATIVE AirSim pinhole camera.
+
+    Step 6 needs these so that a cross-check arm can be run with a native pinhole in the
+    generic camera's place - the same-condition control the step-5 method notes demand.
+    Conventions are D12's, the same ones raymap_dump writes: integer pixel coordinates are
+    pixel CENTRES, so cx = (W-1)/2, and fx comes from the horizontal FOV as AirSim defines
+    it.  Getting that half pixel wrong is invisible at the centre and only shows at the rim,
+    which is exactly where these arms disagree."""
+    fx = (width / 2.0) / np.tan(np.radians(fov_degrees) / 2.0)
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float64)
+    d = np.stack([(xx - cx) / fx, (yy - cy) / fx, np.ones_like(xx)], axis=-1)
+    return d / np.linalg.norm(d, axis=-1, keepdims=True)
 
 
 def optical_to_unreal(d):
@@ -708,6 +730,40 @@ def report_relative(err_rel, mask, label, floor_rel=None):
            100.0 * np.percentile(a, 99), 100.0 * a.max(), extra))
 
 
+def plane_content_mask(seg_img, seed, requested_id=None):
+    """WHICH PIXELS ACTUALLY SEE THE PLANE - step 6's repair of T5.1's periphery.
+
+    T5.1 asks "does the returned range match an analytic plane".  It selected its pixels by
+    GEOMETRY alone: every ray pointing at the plane with a well-conditioned intersection.
+    That is right at the image centre, where the floor is all there is, and wrong at the
+    periphery, where the same rays land on sky and on a block that are nowhere near the
+    plane.  It read 47% at r > 0.66 and the depth was correct - the number was about the
+    scene, not the camera.
+
+    So mask on CONTENT instead.  Segmentation gives a flat per-instance colour, so "is this
+    pixel the floor" is exact rather than inferred.  The ID is taken from the pixels the
+    offset fit already trusts most - the best-conditioned rays, which for a floor are the
+    ones pointing most nearly straight down at it - so the test needs no new argument and no
+    hand-picked seed pixel.
+
+    Returns (mask, id_tuple, share) where share is the fraction of the seed pixels carrying
+    that ID.  A low share means the seed set was not looking at one surface and the mask
+    should not be trusted."""
+    q = np.rint(seg_img).astype(np.int64)
+    if requested_id is not None:
+        wanted = np.array(requested_id, dtype=np.int64)
+        mask = np.all(q == wanted, axis=-1)
+        return mask, tuple(int(v) for v in wanted), float(mask[seed].mean()) if np.any(seed) else 0.0
+
+    if not np.any(seed):
+        return np.zeros(q.shape[:2], dtype=bool), None, 0.0
+    votes = q[seed].reshape(-1, 3)
+    colours, counts = np.unique(votes, axis=0, return_counts=True)
+    winner = colours[int(np.argmax(counts))]
+    share = float(counts.max()) / float(votes.shape[0])
+    return np.all(q == winner, axis=-1), tuple(int(v) for v in winner), share
+
+
 def sobel_magnitude(img):
     """Gradient magnitude, used to compare an ID boundary with a Scene edge.  Correlating
     a segmentation image against a Scene image directly is meaningless - they carry
@@ -781,6 +837,60 @@ def depth_material_check(client, airsim, args):
     return rp
 
 
+def range_cross_check(client, airsim, args, d_opt, finite, img, meta, ref_cam, floor_rel, label):
+    """One same-origin range-identity arm: the model camera's own rays, rotated into a native
+    pinhole reference, sampled there, compared.
+
+    Step 6 added two things to it, both because step 5 left four of these arms disagreeing
+    (ref_right and ref_down exact, ref_left and ref_up 18.4% and 10.5% at the periphery) and
+    the asymmetry had to be explicable before any of them could be quoted:
+
+      * it reports error against the ANGLE FROM THE REFERENCE'S OPTICAL AXIS, not only image
+        radius.  A 90 degree pinhole runs out at 45 degrees, and one fisheye pixel near that
+        edge spans many reference pixels, so a bilinear sample of the reference's DEPTH there
+        is averaging across whatever the reference has at that stretch.  If the error lives in
+        the last few degrees, it is the arm's reach, not the camera.
+      * it takes any camera as the model, so the whole thing can be run native-vs-native.
+
+    Worth keeping in mind while reading it: with a SHARED ORIGIN there is no parallax and no
+    occlusion difference, so the only free parameters in this comparison are the rotation
+    composition and the reference's assumed intrinsics.  Nothing else can be wrong."""
+    (ref_img, ref_meta), = grab_typed(client, airsim, args.vehicle,
+                                      [(ref_cam, "DepthPerspective", True)])
+    h, w = img.shape
+    rh, rw = ref_img.shape
+    rfx = (rw / 2.0) / np.tan(np.radians(args.ref_fov) / 2.0)
+    rcx, rcy = (rw - 1) / 2.0, (rh - 1) / 2.0
+    r_model_to_ref = quat_matrix(ref_meta.camera_orientation).T @ \
+        quat_matrix(meta.camera_orientation)
+    d_ref = ned_body_to_optical(
+        (r_model_to_ref @ optical_to_ned_body(d_opt).reshape(-1, 3).T).T).reshape(d_opt.shape)
+    inside = finite & (d_ref[..., 2] > 1e-6)
+    u = np.where(inside, rfx * d_ref[..., 0] / np.maximum(d_ref[..., 2], 1e-9) + rcx, 0)
+    v = np.where(inside, rfx * d_ref[..., 1] / np.maximum(d_ref[..., 2], 1e-9) + rcy, 0)
+    inside &= (u >= 1) & (v >= 1) & (u <= rw - 2) & (v <= rh - 2)
+    print("  %s" % label)
+    if not np.any(inside):
+        print("    no overlap between the two frusta")
+        return
+    ref_at = sample_bilinear(ref_img[..., None], u, v)[..., 0]
+    err = np.where(inside, (img - ref_at) / np.maximum(ref_at, 1e-9), np.nan)
+    r = radial_bins(h, w)
+    report_relative(err, inside & (r < 0.33), "  centre  (r<0.33)", floor_rel)
+    report_relative(err, inside & (r >= 0.33) & (r < 0.66), "  mid     (0.33-0.66)", floor_rel)
+    report_relative(err, inside & (r >= 0.66), "  PERIPHERY (r>0.66)", floor_rel)
+
+    # the same pixels, binned by how far off the REFERENCE's axis they land. 45 degrees is
+    # the corner of a 90 degree frustum, so the last bin is where the reference is most
+    # stretched and least able to answer.
+    theta = np.degrees(np.arccos(np.clip(d_ref[..., 2], -1.0, 1.0)))
+    report_relative(err, inside & (theta < 20), "  ref axis <20 deg", floor_rel)
+    report_relative(err, inside & (theta >= 20) & (theta < 35), "  ref axis 20-35 deg", floor_rel)
+    report_relative(err, inside & (theta >= 35), "  ref axis >35 deg", floor_rel)
+    print("    NOTE this arm bilinearly samples the reference, so it inherits the "
+          "reference's own resampling error at every silhouette. Read the median, not the max.")
+
+
 def depth(args):
     rm = load_raymap(args.raymap)
     d_opt, valid = optical_dirs(rm)
@@ -789,20 +899,34 @@ def depth(args):
 
     client, airsim = connect(args.port)
 
+    # Segmentation is here for T5.1's content mask, not for its own sake. It costs a third
+    # face rig on the generic camera (12 -> 18 face renders, ~126 ms at step 5's T5.7
+    # numbers), which is a fair price for a gate that measures the floor instead of the sky.
+    want_mask = not args.no_plane_mask
     specs = [(args.model_cam, args.image_type, True),
              (args.model_cam, "DepthPerspective", True)]
+    if want_mask:
+        specs.append((args.model_cam, "Segmentation", False))
+    cross_cams = [c for c in ([args.ref_cam] if args.ref_cam else []) + list(args.extra_ref) if c]
+    for cam in cross_cams:
+        specs.append((cam, "DepthPerspective", True))
     if args.ref_cam:
-        specs += [(args.ref_cam, "DepthPlanar", True), (args.ref_cam, "DepthPerspective", True)]
+        specs.append((args.ref_cam, "DepthPlanar", True))
+    if args.cross_control:
+        specs.append((args.cross_control, "DepthPerspective", True))
     warm(client, airsim, args.vehicle, specs)
 
     if args.ref_cam:
         depth_material_check(client, airsim, args)
         print()
 
-    grabbed = grab_typed(client, airsim, args.vehicle,
-                         [(args.model_cam, args.image_type, True),
-                          (args.model_cam, "DepthPerspective", True)])
-    (img, meta), (persp_img, _) = grabbed
+    grab_specs = [(args.model_cam, args.image_type, True),
+                  (args.model_cam, "DepthPerspective", True)]
+    if want_mask:
+        grab_specs.append((args.model_cam, "Segmentation", False))
+    grabbed = grab_typed(client, airsim, args.vehicle, grab_specs)
+    (img, meta), (persp_img, _) = grabbed[0], grabbed[1]
+    seg_img = grabbed[2][0] if want_mask else None
     if img.shape != (h, w):
         raise SystemExit("raymap is %dx%d but %s/%s returned %dx%d. The generic camera's "
                          "CaptureSettings for this ImageType must match its Scene block - "
@@ -812,9 +936,14 @@ def depth(args):
 
     # The blendable swap of section 3.3, checked rather than assumed: on a generic camera
     # DepthPlanar and DepthPerspective are deliberately the same image.
-    same = np.mean(img == persp_img)
-    print("generic-camera DepthPlanar vs DepthPerspective: %.2f%% of pixels bit-identical" %
-          (100.0 * same))
+    # ⚠ NaN != NaN, so a plain `img == persp_img` scores every out-of-domain pixel as a
+    # MISMATCH and reports exactly (100 - out_of_domain)%.  Step 6 made that 91.95% on a lens
+    # whose invalid domain is 8.05% - a number that looks like a real regression from step 5's
+    # 100.00% and is arithmetic.  Two NaN in the same place are agreement here: both cameras
+    # correctly say "no ray".
+    same = np.mean((img == persp_img) | (np.isnan(img) & np.isnan(persp_img)))
+    print("generic-camera DepthPlanar vs DepthPerspective: %.2f%% of pixels bit-identical "
+          "(NaN counted as agreeing where BOTH are NaN)" % (100.0 * same))
     print("  100%% is the intended result (design section 5 O3). Anything else means the "
           "DepthPlanar face captures did not get the perspective material.")
     print()
@@ -848,17 +977,41 @@ def depth(args):
         # left is a pure SHAPE test: does one scalar explain the whole surface, periphery
         # and face boundaries included?  A planar-instead-of-range error fails the shape
         # test badly and cannot hide in the offset.
+        best = toward & (denom >= np.percentile(denom[toward], 95))
+
+        # CONTENT MASK - step 6. Without it this test compares the sky against a floor at
+        # the periphery and calls the camera wrong; see plane_content_mask.
+        plane_mask = np.ones_like(toward)
+        if seg_img is not None:
+            plane_mask, plane_id, share = plane_content_mask(seg_img, best, args.plane_id)
+            print("T5.1 content mask: plane ID %s covers %d px (%.1f%% of the frame); "
+                  "%.0f%% of the best-conditioned rays carry it" %
+                  (plane_id, int(plane_mask.sum()), 100.0 * plane_mask.mean(), 100.0 * share))
+            if share < 0.5:
+                print("  ⚠ the seed rays do NOT agree on one surface. The mask is not "
+                      "trustworthy - pass --plane-id explicitly, or --no-plane-mask and read "
+                      "the centre band only.")
+            best = best & plane_mask
+
         if args.plane_offset is not None:
             offset = float(args.plane_offset)
             arm = "absolute (--plane-offset %.4f)" % offset
         else:
-            best = toward & (denom >= np.percentile(denom[toward], 95))
+            if not np.any(best):
+                print("T5.1 - no plane pixels among the best-conditioned rays; cannot fit an "
+                      "offset. Is there anything below the camera?")
+                best = toward
             offset = float(np.median(p @ n + img[best] * denom[best]))
             arm = "shape only (offset fitted to %.4f from the %d best-conditioned rays)" % (
                 offset, int(best.sum()))
 
-        predicted = (offset - p @ n) / denom
-        ok = toward & (predicted > 0)
+        # `toward` already excludes the grazing rays, but `denom` still carries the exact zeros
+        # of rays parallel to the plane, and dividing by them prints a warning that reads like a
+        # numerical problem in the test rather than a ray that simply never meets the plane.
+        predicted = np.divide(offset - p @ n, denom, out=np.full_like(denom, np.nan),
+                              where=np.abs(denom) > 1e-12)
+        geometric = toward & (predicted > 0)
+        ok = geometric & plane_mask
         err_rel = np.where(ok, (img - predicted) / np.maximum(predicted, 1e-9), np.nan)
 
         r = radial_bins(h, w)
@@ -870,9 +1023,22 @@ def depth(args):
         report_relative(err_rel, ok & (r >= 0.33) & (r < 0.66), "mid     (0.33-0.66)", floor_rel)
         report_relative(err_rel, ok & (r >= 0.66), "PERIPHERY (r>0.66)", floor_rel)
         report_relative(err_rel, band & ok, "seam band (+/-%dpx)" % args.seam_width, floor_rel)
-        overall = np.nanmedian(np.abs(err_rel[ok]))
-        print("  gate: median relative error over the plane %.4f%% -> %s" %
-              (100.0 * overall, "PASS" if overall < 0.01 else "FAIL"))
+        if not np.any(ok & (r >= 0.66)):
+            print("  the periphery of this frame contains NO plane pixels. That is a fact "
+                  "about the scene, not a result: peripheral depth is covered by the "
+                  "cross-check arms below, which need no geometry at all.")
+        overall = np.nanmedian(np.abs(err_rel[ok])) if np.any(ok) else float("nan")
+        print("  gate: median relative error over the plane %.4f%% -> %s   (n=%d)" %
+              (100.0 * overall, "PASS" if overall < 0.01 else "FAIL", int(ok.sum())))
+        if seg_img is not None:
+            # The control the mask deserves: the same statistic WITHOUT it. If the two agree
+            # the mask changed nothing and the old number was fine; if they diverge, the gap
+            # is the non-plane content, which is what the mask exists to remove.
+            unmasked = np.where(geometric, (img - predicted) / np.maximum(predicted, 1e-9), np.nan)
+            um = np.nanmedian(np.abs(unmasked[geometric])) if np.any(geometric) else float("nan")
+            print("  control - same fit, NO content mask: %.4f%% over %d px. The difference "
+                  "between these two lines is scene content, not depth error." %
+                  (100.0 * um, int(geometric.sum())))
         print("  the periphery is where a wrong conversion shows: planar-instead-of-range is "
               "off by sqrt(1+a^2+b^2), which is 1.000 at a face centre and 1.732 at a corner.")
     print()
@@ -910,43 +1076,44 @@ def depth(args):
               (100 * med, 100 * np.percentile(boundary, 95), boundary.size))
         print("  ratio %.2f -> %s" % (med / ref if ref > 1e-12 else float("inf"),
                                       "consistent" if ref > 1e-12 and med <= 3.0 * ref else "SEAM"))
-        print("  in absolute units, median step across a boundary %.5f" %
-              float(np.median(np.abs(np.diff(img, axis=1))[face[:, :-1] != face[:, 1:]])))
+        # the same NaN trap as above: an out-of-domain pixel on either side of a boundary makes
+        # the difference NaN, and one NaN in the sample makes the median NaN. Score it on the
+        # pairs where both sides carry a range.
+        abs_step = np.abs(np.diff(img, axis=1))
+        abs_sel = (face[:, :-1] != face[:, 1:]) & finite[:, :-1] & finite[:, 1:]
+        print("  in absolute units, median step across a boundary %s" %
+              ("%.5f" % float(np.median(abs_step[abs_sel])) if np.any(abs_sel) else "no pairs"))
     print()
 
     # ---------------- cross-check against a native pinhole, no plane needed ----------
-    if args.ref_cam:
-        print("cross-check - same-origin range identity against the native pinhole %s." %
-              args.ref_cam)
+    if cross_cams:
+        print("cross-check - same-origin range identity against native pinholes.")
         print("  Both cameras sit at one point, so the range along a given WORLD direction is "
               "the same number for both. No geometry is assumed; the renderer is the oracle, "
               "so this cannot catch an error the two paths share - it catches the ones step 5 "
               "introduces.")
-        (ref_img, ref_meta), = grab_typed(client, airsim, args.vehicle,
-                                          [(args.ref_cam, "DepthPerspective", True)])
-        rh, rw = ref_img.shape
-        rfx = (rw / 2.0) / np.tan(np.radians(args.ref_fov) / 2.0)
-        rcx, rcy = (rw - 1) / 2.0, (rh - 1) / 2.0
-        r_model_to_ref = quat_matrix(ref_meta.camera_orientation).T @ \
-            quat_matrix(meta.camera_orientation)
-        d_ref = ned_body_to_optical(
-            (r_model_to_ref @ optical_to_ned_body(d_opt).reshape(-1, 3).T).T).reshape(d_opt.shape)
-        inside = finite & (d_ref[..., 2] > 1e-6)
-        u = np.where(inside, rfx * d_ref[..., 0] / np.maximum(d_ref[..., 2], 1e-9) + rcx, 0)
-        v = np.where(inside, rfx * d_ref[..., 1] / np.maximum(d_ref[..., 2], 1e-9) + rcy, 0)
-        inside &= (u >= 1) & (v >= 1) & (u <= rw - 2) & (v <= rh - 2)
-        if not np.any(inside):
-            print("  no overlap between the two frusta")
-        else:
-            ref_at = sample_bilinear(ref_img[..., None], u, v)[..., 0]
-            err = np.where(inside, (img - ref_at) / np.maximum(ref_at, 1e-9), np.nan)
-            r = radial_bins(h, w)
-            report_relative(err, inside & (r < 0.33), "centre  (r<0.33)", floor_rel)
-            report_relative(err, inside & (r >= 0.33) & (r < 0.66), "mid     (0.33-0.66)", floor_rel)
-            report_relative(err, inside & (r >= 0.66), "PERIPHERY (r>0.66)", floor_rel)
-            print("  NOTE this arm bilinearly samples the reference, so it inherits the "
-                  "reference's own resampling error at every silhouette. Read the median, "
-                  "not the max.")
+        for cam in cross_cams:
+            range_cross_check(client, airsim, args, d_opt, finite, img, meta, cam, floor_rel,
+                              "%s vs %s" % (args.model_cam, cam))
+
+    # THE CONTROL, step 6, and it decides the ref_left / ref_up question on its own. Put a
+    # NATIVE PINHOLE where the generic camera was and run the identical comparison: no cube
+    # path, no camera model, no raymap. Whatever it reports is the arm's own error floor, so
+    # if it also reads 18% toward ref_left then the disagreement was never about the camera.
+    if args.cross_control:
+        print()
+        print("cross-check CONTROL - %s (native pinhole) in the generic camera's place." %
+              args.cross_control)
+        (ctl_img, ctl_meta), = grab_typed(client, airsim, args.vehicle,
+                                          [(args.cross_control, "DepthPerspective", True)])
+        ctl_h, ctl_w = ctl_img.shape
+        ctl_dirs = pinhole_dirs(ctl_w, ctl_h, args.ref_fov)
+        ctl_finite = np.isfinite(ctl_img) & (ctl_img > 1e-6)
+        for cam in cross_cams:
+            if cam == args.cross_control:
+                continue
+            range_cross_check(client, airsim, args, ctl_dirs, ctl_finite, ctl_img, ctl_meta,
+                              cam, floor_rel, "%s vs %s  [CONTROL]" % (args.cross_control, cam))
 
 
 # --------------------------------------------------------------------------
@@ -1171,6 +1338,87 @@ def normals(args):
           "CubeResample.usf, and re-run.")
 
 
+# --------------------------------------------------------------------------
+# step 6 - the publishing contract  (T6.1 the gate, T6.2 the readback)
+# --------------------------------------------------------------------------
+def ros(args):
+    """T6.1/T6.2 - THE STEP-6 GATE, and it is binary.
+
+    Out-of-domain pixels must publish NaN, not 0.0.  0.0 range reads as a surface touching
+    the lens, which a collision check or a point-cloud conversion will believe, and it is the
+    corners of a wide lens - exactly where a phantom near return is least wanted.
+
+    The test does not take the count on trust.  The raymap already knows which texels the
+    camera model could not unproject, so the NaN set and the zero-direction set must agree
+    PIXEL FOR PIXEL.  A matching count with a mismatched mask would mean the shader is
+    writing NaN somewhere else and losing it somewhere else again; that is a different bug
+    with the same headline number.
+
+    It also answers T6.2 on the way past, because if float16 NaN does not survive
+    FFloat16::GetFloat() the count is not "wrong", it is exactly zero."""
+    rm = load_raymap(args.raymap)
+    _, valid = optical_dirs(rm)
+    h, w = rm["height"], rm["width"]
+    out_of_domain = ~valid
+
+    client, airsim = connect(args.port)
+    specs = [(args.model_cam, args.image_type, True)]
+    warm(client, airsim, args.vehicle, specs)
+    (img, _), = grab_typed(client, airsim, args.vehicle, specs)
+    if img.shape != (h, w):
+        raise SystemExit("raymap is %dx%d but %s/%s returned %dx%d - the CaptureSettings for "
+                         "this ImageType must match the camera's Scene block, or you are "
+                         "looking at a pinhole image" %
+                         (w, h, args.model_cam, args.image_type, img.shape[1], img.shape[0]))
+
+    nan_mask = np.isnan(img)
+    zero_mask = img == 0.0
+    agree = int(np.sum(nan_mask & out_of_domain))
+    missing = int(np.sum(out_of_domain & ~nan_mask))
+    extra = int(np.sum(nan_mask & ~out_of_domain))
+
+    print("T6.1 - out-of-domain encoding on %s/%s" % (args.model_cam, args.image_type))
+    print("  raymap says %d of %d texels (%.2f%%) are outside the lens' valid domain" %
+          (int(out_of_domain.sum()), h * w, 100.0 * out_of_domain.mean()))
+    print("  image has  %d NaN, %d exact 0.0" % (int(nan_mask.sum()), int(zero_mask.sum())))
+    print("  agree %d   out-of-domain but NOT NaN %d   NaN but IN domain %d" %
+          (agree, missing, extra))
+    if int(nan_mask.sum()) == 0:
+        print("  -> FAIL, and check T6.2 FIRST: zero NaN can mean the shader did not write "
+              "them, OR that float16 NaN did not survive FFloat16::GetFloat(). Those need "
+              "different fixes. A large finite value where the corners should be is the tell "
+              "for the second.")
+    elif missing == 0 and extra == 0:
+        print("  -> PASS. The NaN mask IS the raymap's invalid set, pixel for pixel.")
+    else:
+        print("  -> FAIL. The counts may match; the masks do not.")
+
+    # 0.0 is still a legal reading elsewhere in principle, so this is reported rather than
+    # asserted - but on a real scene nothing sits at zero range, so any survivor is suspect.
+    leftover = int(np.sum(zero_mask & out_of_domain))
+    if leftover:
+        print("  ⚠ %d out-of-domain pixels still read exactly 0.0 - the phantom-surface "
+              "value this step exists to remove." % leftover)
+
+    finite = np.isfinite(img) & (img > 1e-6)
+    if np.any(finite):
+        print("  finite range: median %.3f  min %.3f  max %.3f (metres). The large maximum is "
+              "the far plane, which this step deliberately does NOT change - see O6." %
+              (float(np.median(img[finite])), float(img[finite].min()), float(img[finite].max())))
+
+    if args.save:
+        np.save(args.save, img)
+        print("  saved the RPC frame to %s - T6.4 compares the published topic against this "
+              "exact array, so grab both from the same pose." % args.save)
+
+
+def parse_rgb(text):
+    parts = text.split(",")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("expected r,g,b - got %r" % text)
+    return tuple(int(p) for p in parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1239,6 +1487,22 @@ def main():
                     help="reject rays that graze the plane; below this the intersection is "
                          "ill-conditioned and the residual is about the plane, not the camera")
     pd.add_argument("--seam-width", type=int, default=3)
+    pd.add_argument("--extra-ref", nargs="*", default=[],
+                    help="further native pinholes to cross-check against. Each is one "
+                         "same-origin range-identity arm, and they need no geometry, so this "
+                         "is how the PERIPHERY gets covered when the plane does not reach it")
+    pd.add_argument("--cross-control", default=None,
+                    help="a native pinhole to put in the generic camera's place, so the "
+                         "cross-check runs native-vs-native with no cube path anywhere. This "
+                         "is the arm that says whether a disagreement is the camera or the "
+                         "comparison - run it before believing either")
+    pd.add_argument("--plane-id", type=parse_rgb, default=None,
+                    help="r,g,b of the plane's segmentation colour. Omit and it is taken "
+                         "from the best-conditioned rays, which is usually right")
+    pd.add_argument("--no-plane-mask", action="store_true",
+                    help="score T5.1 on geometry alone, as step 5 did. Keeps the old "
+                         "behaviour available; it is what read 47%% at the periphery on "
+                         "content that was never the plane")
     pd.set_defaults(func=depth)
 
     ps = sub.add_parser("seg", help="step 5: segmentation ID exactness and alignment")
@@ -1252,6 +1516,15 @@ def main():
     ps.add_argument("--min-texture", type=float, default=8.0,
                     help="minimum patch std of the EDGE map for a T5.4 site to be scored")
     ps.set_defaults(func=seg)
+
+    pr = sub.add_parser("ros", help="step 6 gate: out-of-domain depth is NaN, not 0.0")
+    common(pr)
+    pr.add_argument("--raymap", required=True)
+    pr.add_argument("--image-type", default="DepthPerspective", choices=IMAGE_TYPE_NAMES)
+    pr.add_argument("--save", default=None,
+                    help="write the RPC frame to this .npy so the ROS-side checker can "
+                         "compare the published topic against the exact same array")
+    pr.set_defaults(func=ros)
 
     pn = sub.add_parser("normals", help="step 5: |n| = 1 and the normals frame")
     common(pn)

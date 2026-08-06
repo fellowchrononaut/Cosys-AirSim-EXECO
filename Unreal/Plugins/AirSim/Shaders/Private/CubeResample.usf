@@ -59,6 +59,34 @@
 #define RESAMPLE_MODE AIRSIM_RESAMPLE_BILINEAR
 #endif
 
+// OUT OF DOMAIN - Phase 3b step 6.
+//
+// Two cases below reach a pixel that has no ray at all: the camera model could not unproject it
+// (a real case for a wide Double Sphere - 8.05% of the frame on the Agilex calibration at
+// 1280x1024), and a five-face rig asked for the face it declared it never looks at. Nothing was
+// rendered there and nothing was measured there.
+//
+// Black is the honest answer for a colour or ID buffer, and for Segmentation it is load-bearing:
+// the annotation render's own background is black, so black stays a legal, non-novel value.
+//
+// It is WRONG for depth. 0.0 range reads as a surface touching the lens - a phantom obstacle
+// across the corners of a wide lens, which collision checks and depth_image_proc will believe.
+// REP 117 assigns NaN to "unknown", +Inf to "too far" and -Inf to "too close"; an out-of-domain
+// pixel is not a long reading, it is the absence of a ray, so it is NaN.
+//
+// asfloat() of the quiet-NaN bit pattern rather than 0.0/0.0, which a fast-math build folds. If
+// a compiler ever folds this one too, the escape is a float uniform set from C++ inside the same
+// #if - the value never has to be a literal.
+//
+// The macro exists so that mode 0's PREPROCESSED source is unchanged: the expansion is
+// character-for-character the literal it replaced, which is what keeps
+// `cpp -P -DRESAMPLE_MODE=0` diffing clean against step 4's and step 5's.
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_DEPTH
+#define AIRSIM_OUT_OF_DOMAIN float4(asfloat(0x7FC00000u), asfloat(0x7FC00000u), asfloat(0x7FC00000u), 1.0f)
+#else
+#define AIRSIM_OUT_OF_DOMAIN float4(0.0f, 0.0f, 0.0f, 1.0f)
+#endif
+
 StructuredBuffer<float> Raymap;
 
 Texture2D FaceTexture0;
@@ -183,11 +211,11 @@ void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
     float3 Dir = float3(Raymap[Base + 3u], Raymap[Base + 4u], Raymap[Base + 5u]);
 
     // An all-zero direction is a texel the camera model could not unproject: outside the lens'
-    // valid domain, which is a real case for a wide Double Sphere at the image corners. Black is
-    // the honest answer; there is no scene behind such a pixel.
+    // valid domain, which is a real case for a wide Double Sphere at the image corners. There is
+    // no scene behind such a pixel - see the AIRSIM_OUT_OF_DOMAIN note in the header.
     if (dot(Dir, Dir) < 1e-8f)
     {
-        OutColor = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        OutColor = AIRSIM_OUT_OF_DOMAIN;
         return;
     }
 
@@ -239,7 +267,7 @@ void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
     // it never looks behind itself, so it is out of domain in exactly the sense above.
     if (Face >= FaceCount)
     {
-        OutColor = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        OutColor = AIRSIM_OUT_OF_DOMAIN;
         return;
     }
 

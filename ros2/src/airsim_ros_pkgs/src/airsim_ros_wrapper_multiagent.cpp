@@ -285,6 +285,7 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
     image_pub_vec_.clear();
     cam_info_pub_vec_.clear();
     camera_info_msg_vec_.clear();
+    camera_model_pub_vec_.clear();
     vehicle_name_ptr_map_.clear();
 
     size_t lidar_cnt    = 0;
@@ -401,6 +402,28 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
 
             set_nans_to_zeros_in_pose(*vehicle_setting, camera_setting);
             append_static_camera_tf(vehicle_ros.get(), curr_camera_name, camera_setting);
+
+            // Phase 3b step 6: a generic camera's real calibration, once per CAMERA rather than
+            // once per image type, and latched so a node that subscribes later still gets it.
+            // Absent a CameraModel block this topic does not exist at all - the non-invasiveness
+            // contract reaches the topic list too, not just message contents.
+            if (camera_setting.camera_model.enabled) {
+                auto model_pub = nh_->create_publisher<std_msgs::msg::String>(
+                    topic_prefix + "/" + curr_camera_name + "/camera_model",
+                    rclcpp::QoS(1).transient_local());
+                std_msgs::msg::String model_msg;
+                model_msg.data = generate_camera_model_json(camera_setting);
+                model_pub->publish(model_msg);
+                camera_model_pub_vec_.push_back(model_pub);
+                RCLCPP_INFO(nh_->get_logger(),
+                            "Camera %s is a generic %s camera: CameraInfo is published as "
+                            "UNCALIBRATED unless the model is expressible; the calibration is on "
+                            "%s/%s/camera_model. Depth on this camera is RANGE ALONG THE RAY in "
+                            "metres, and out-of-domain pixels are NaN.",
+                            curr_camera_name.c_str(),
+                            msr::airlib::cameras::toString(camera_setting.camera_model.model.type),
+                            topic_prefix.c_str(), curr_camera_name.c_str());
+            }
 
             for (const auto& curr_capture_elem : camera_setting.capture_settings) {
                 auto& capture_setting = curr_capture_elem.second;
@@ -1798,21 +1821,146 @@ airsim_interfaces::msg::ObjectTransformsList AirsimROSWrapperMultiAgent::get_obj
 // Camera info / image processing
 // ============================================================================
 
+// CameraInfo is published PER CAMERA MODEL - Phase 3b step 6, design doc section 7.3.
+//
+// The message's geometry fields are K (a 3x3 pinhole matrix), D (coefficients) and a
+// distortion_model string naming which model D is in. Every model in that vocabulary shares one
+// structure: divide by z, distort, multiply by K - "a pinhole camera plus a correction". That
+// structure fails outright at wide field of view, and DOUBLE SPHERE IS NOT OF THAT FORM at all:
+// it projects onto a unit sphere, then onto a second sphere displaced by xi, then through a
+// pinhole-like step blended by alpha. There is no K + D decomposition to extract and no string
+// for it.
+//
+// The danger is that the failure is SILENT. Publish "equidistant" with coefficients fitted to
+// approximate a Double Sphere lens and every downstream node accepts it, computes subtly wrong
+// rays, triangulation and point clouds, and nothing errors - it surfaces weeks later as an
+// unexplained bias in a SLAM result. So for a model we cannot express we publish the one thing
+// in the vocabulary that means "this camera is not calibrated": all matrices ZEROED. A consumer
+// that needs calibration then fails immediately and visibly. depth_image_proc refusing to build
+// a point cloud out of a fisheye depth image is the CORRECT outcome; it genuinely cannot.
+//
+// The authoritative calibration goes out on the <camera>/camera_model topic instead - see
+// generate_camera_model_json. That is the real interface, and it is what the tools which do
+// support these models (SaDVIO, Basalt, OpenVINS, Kalibr) read anyway.
 sensor_msgs::msg::CameraInfo AirsimROSWrapperMultiAgent::generate_cam_info(const std::string& camera_name,
                                                                            const CameraSetting& camera_setting,
                                                                            const CaptureSetting& capture_setting) const
 {
-    unused(camera_setting);
     sensor_msgs::msg::CameraInfo info;
     info.header.frame_id = camera_name + "_optical";
     info.height = capture_setting.height;
     info.width  = capture_setting.width;
-    float f_x = (capture_setting.width / 2.0f) / tan(math_common::deg2rad(capture_setting.fov_degrees / 2.0f));
-    info.k = { f_x, 0.0, capture_setting.width / 2.0, 0.0, f_x, capture_setting.height / 2.0, 0.0, 0.0, 1.0 };
-    info.p = { f_x, 0.0, capture_setting.width / 2.0, 0.0, 0.0, f_x, capture_setting.height / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0 };
-    info.d = { 0.0, 0.0, 0.0, 0.0, 0.0 };
-    info.r = { 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 };
+
+    // No CameraModel block: this is every camera that existed before Phase 3b, and the message
+    // below must stay byte-identical to what it published then. Do not "improve" it here.
+    if (!camera_setting.camera_model.enabled) {
+        float f_x = (capture_setting.width / 2.0f) / tan(math_common::deg2rad(capture_setting.fov_degrees / 2.0f));
+        info.k = { f_x, 0.0, capture_setting.width / 2.0, 0.0, f_x, capture_setting.height / 2.0, 0.0, 0.0, 1.0 };
+        info.p = { f_x, 0.0, capture_setting.width / 2.0, 0.0, 0.0, f_x, capture_setting.height / 2.0, 0.0, 0.0, 0.0, 1.0, 0.0 };
+        info.d = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+        info.r = { 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 };
+        return info;
+    }
+
+    const auto& model = camera_setting.camera_model.model;
+
+    // The cube path is REFUSED when the model's size and the capture size disagree
+    // (APIPCamera::buildRaymapResource), and the camera then renders as an ordinary pinhole. We
+    // cannot tell from here which happened, so a mismatch means we do not know what is on this
+    // topic - which is exactly the uncalibrated case. Saying nothing beats saying something
+    // plausible.
+    const bool size_matches = model.width == capture_setting.width &&
+                              model.height == capture_setting.height;
+    const bool intrinsics_known = size_matches && std::isfinite(model.fx) && std::isfinite(model.fy) &&
+                                  std::isfinite(model.cx) && std::isfinite(model.cy);
+
+    if (intrinsics_known && model.type == msr::airlib::cameras::CameraModelType::Pinhole) {
+        // Exact. Note this is NOT identical to the branch above: D12 fixes the principal point at
+        // (W-1)/2 because integer pixel coordinates are pixel CENTRES, which is the convention
+        // every calibration we hold is written in. The old form uses W/2 - half a pixel out.
+        info.distortion_model = sensor_msgs::distortion_models::PLUMB_BOB;
+        info.k = { model.fx, 0.0, model.cx, 0.0, model.fy, model.cy, 0.0, 0.0, 1.0 };
+        info.p = { model.fx, 0.0, model.cx, 0.0, 0.0, model.fy, model.cy, 0.0, 0.0, 0.0, 1.0, 0.0 };
+        info.d = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+        info.r = { 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 };
+    }
+    else if (intrinsics_known && model.type == msr::airlib::cameras::CameraModelType::KannalaBrandt) {
+        // Also exact, not an approximation: "equidistant" IS Kannala-Brandt, k1..k4 in this order.
+        // The caveat is the consumer's, not ours - image_pipeline still divides by z, so a >=180
+        // degree lens breaks it however right the coefficients are.
+        info.distortion_model = sensor_msgs::distortion_models::EQUIDISTANT;
+        info.k = { model.fx, 0.0, model.cx, 0.0, model.fy, model.cy, 0.0, 0.0, 1.0 };
+        info.p = { model.fx, 0.0, model.cx, 0.0, 0.0, model.fy, model.cy, 0.0, 0.0, 0.0, 1.0, 0.0 };
+        info.d = { model.k1, model.k2, model.k3, model.k4 };
+        info.r = { 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 };
+    }
+    else {
+        // DoubleSphere, Raymap, or a misconfigured camera. Zeroed on purpose - see the header
+        // comment. Width and height stay correct: the image size is not in dispute.
+        info.distortion_model = "";
+        info.k.fill(0.0);
+        info.p.fill(0.0);
+        info.r.fill(0.0);
+        info.d.clear();
+    }
+
     return info;
+}
+
+// The authoritative calibration of a generic camera, as the settings JSON that produced it.
+//
+// Design section 7.3 resolution point 1: ship the real calibration in the format the tools which
+// support these models already read, and treat CameraInfo as the approximate one. On a ROS graph
+// the equivalent of "ships with the dataset" is a LATCHED topic, because it lands in the bag.
+//
+// The contract is that a user can paste this straight back under a camera's "CameraModel" key and
+// get the same camera - which is a testable claim, not a hope: feed it to tools/raymap_dump and
+// the raymap must come back bit-identical. Hence full double precision, and hence no NaN fields:
+// a value the settings parser would reject must never appear here.
+std::string AirsimROSWrapperMultiAgent::generate_camera_model_json(const CameraSetting& camera_setting) const
+{
+    const auto& setting = camera_setting.camera_model;
+    const auto& model   = setting.model;
+
+    std::ostringstream json;
+    json << std::setprecision(17);
+    json << "{\"Type\": \"" << msr::airlib::cameras::toString(model.type) << "\"";
+    json << ", \"Width\": " << model.width << ", \"Height\": " << model.height;
+
+    // resolveParams has already filled these in, including for a Pinhole written as FOV_Degrees,
+    // so the payload is self-contained rather than a copy of whatever shorthand the user typed.
+    if (std::isfinite(model.fx)) json << ", \"fx\": " << model.fx;
+    if (std::isfinite(model.fy)) json << ", \"fy\": " << model.fy;
+    if (std::isfinite(model.cx)) json << ", \"cx\": " << model.cx;
+    if (std::isfinite(model.cy)) json << ", \"cy\": " << model.cy;
+
+    if (model.type == msr::airlib::cameras::CameraModelType::KannalaBrandt) {
+        json << ", \"k1\": " << model.k1 << ", \"k2\": " << model.k2
+             << ", \"k3\": " << model.k3 << ", \"k4\": " << model.k4;
+    }
+    if (model.type == msr::airlib::cameras::CameraModelType::DoubleSphere) {
+        json << ", \"xi\": " << model.xi << ", \"alpha\": " << model.alpha;
+    }
+    if (model.type == msr::airlib::cameras::CameraModelType::Raymap) {
+        // escaped, because a path is the one field here that can carry a character which would
+        // otherwise end the string and hand a consumer invalid JSON
+        std::string path;
+        for (char c : model.raymap_path) {
+            if (c == '\\' || c == '"')
+                path += '\\';
+            path += c;
+        }
+        json << ", \"Path\": \"" << path << "\"";
+    }
+
+    json << ", \"CubeFaceResolution\": " << setting.cube_face_resolution;
+    if (setting.faces == 0)
+        json << ", \"Faces\": \"Auto\"";
+    else
+        json << ", \"Faces\": " << setting.faces;
+    json << ", \"SplatOnly\": " << (setting.splat_only ? "true" : "false");
+    json << "}";
+    return json.str();
 }
 
 std::shared_ptr<sensor_msgs::msg::Image> AirsimROSWrapperMultiAgent::get_img_msg_from_response(const ImageResponse& img_response, const rclcpp::Time curr_ros_time, const std::string frame_id)
@@ -1830,6 +1978,24 @@ std::shared_ptr<sensor_msgs::msg::Image> AirsimROSWrapperMultiAgent::get_img_msg
     return msg;
 }
 
+// DEPTH SEMANTICS, and they are NOT the same for every camera - Phase 3b steps 5 and 6.
+//
+// On a camera with a CameraModel block:
+//   * the value is RANGE ALONG THE RAY, in METRES, not planar depth. DepthPlanar has no meaning
+//     without an image plane, so both DepthPlanar and DepthPerspective publish the same image -
+//     bit-identical, deliberately. A consumer that assumes planar depth is wrong.
+//   * a pixel outside the lens' valid domain publishes NaN (REP 117: unknown). On a wide Double
+//     Sphere that is ~8% of the frame, in the corners. It used to publish 0.0, which reads as a
+//     surface touching the lens.
+//
+// On EVERY camera, generic or not, "no geometry" still publishes a large finite value (~16400)
+// where REP 117 asks for +Inf. That is pre-existing base-AirSim behaviour, not something the
+// generic camera introduced, and changing it touches every existing user - it is open decision
+// O6 in the project plan.
+//
+// The image is not mis-scaled and does not need converting. If it looks entirely white, that is
+// the viewer: most tools map 32FC1 to [0, 1] without normalising, so everything past 1 m
+// saturates.
 std::shared_ptr<sensor_msgs::msg::Image> AirsimROSWrapperMultiAgent::get_depth_img_msg_from_response(const ImageResponse& img_response, const rclcpp::Time curr_ros_time, const std::string frame_id)
 {
     unused(curr_ros_time);

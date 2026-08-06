@@ -40,7 +40,10 @@ STRICT_MODE_OFF
 #include <airsim_interfaces/msg/string_array.hpp>
 #include <airsim_interfaces/msg/environment.hpp>
 #include <chrono>
+#include <cmath>
 #include <cv_bridge/cv_bridge.h>
+#include <iomanip>
+#include <sstream>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -66,6 +69,7 @@ STRICT_MODE_OFF
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/range.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -350,6 +354,9 @@ private:
     sensor_msgs::msg::CameraInfo generate_cam_info(const std::string& camera_name,
                                                    const CameraSetting& camera_setting,
                                                    const CaptureSetting& capture_setting) const;
+    //Phase 3b step 6: the authoritative calibration of a generic (non-pinhole) camera, as the
+    //settings JSON a user can paste back. See generate_cam_info for why CameraInfo is not it.
+    std::string generate_camera_model_json(const CameraSetting& camera_setting) const;
     std::shared_ptr<sensor_msgs::msg::Image> get_img_msg_from_response(const ImageResponse& img_response,
                                                                        const rclcpp::Time curr_ros_time,
                                                                        const std::string frame_id);
@@ -522,6 +529,11 @@ private:
     std::vector<image_transport::Publisher> image_pub_vec_;
     std::vector<rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr> cam_info_pub_vec_;
     std::vector<sensor_msgs::msg::CameraInfo> camera_info_msg_vec_;
+
+    //Phase 3b step 6. One per GENERIC camera, not per image type, and latched: a node that
+    //subscribes after we published still receives it, which is what makes the calibration
+    //recoverable from a bag. Held only to keep the publishers alive.
+    std::vector<rclcpp::Publisher<std_msgs::msg::String>::SharedPtr> camera_model_pub_vec_;
 
     std::unordered_map<std::string, bool> sensor_name_to_passive_enable_map_;
     std::unordered_map<std::string, bool> sensor_name_to_active_enable_map_;
