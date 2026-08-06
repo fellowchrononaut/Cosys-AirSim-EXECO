@@ -85,6 +85,65 @@ TAutoConsoleVariable<int32> CVarDebugForceLODLevel(
 	TEXT("Use with gs.ShowClusterBounds 2 to visualize which LOD level is being rendered."),
 	ECVF_RenderThreadSafe);
 
+/** 3DGEER exact per-ray splat evaluation (see 3DGEERNanoGS.md). Per-asset via
+ *  UGaussianSplatAsset::GeerMode; this CVar is the global override for A/B testing. */
+TAutoConsoleVariable<int32> CVarGeerEval(
+	TEXT("gs.GeerEval"),
+	1,
+	TEXT("3DGEER exact per-ray Gaussian evaluation (per-asset GeerEval property).\n")
+	TEXT("Frames containing a GEER asset also sort by Euclidean camera distance.\n")
+	TEXT(" 0: Force legacy EWA falloff + clip-z sort everywhere (kill switch)\n")
+	TEXT(" 1: Respect the per-asset flag (default)\n")
+	TEXT(" 2: Force GEER evaluation for ALL splat assets (A/B testing)"),
+	ECVF_RenderThreadSafe);
+
+/** Footprint inflation for GEER eval: the EWA quad edge is ~2.83 sigma but GEER integrates to
+ *  3 sigma, and the EWA footprint itself is approximate. Tune down after Phase 2 (PBF). */
+TAutoConsoleVariable<float> CVarGeerQuadInflation(
+	TEXT("gs.GeerQuadInflation"),
+	1.4f,
+	TEXT("Multiplier on the EWA quad axes when gs.GeerEval is on (footprint only; 1.0 = off)."),
+	ECVF_RenderThreadSafe);
+
+/** Canonical-space cutoff radius for GEER evaluation, in sigma. The reference rasteriser bounds
+ *  every Gaussian at 3 sigma (forward.cu:882 "cutoff = 3.0f") and culls rays outside those bounds
+ *  before shading — in ALL association modes, PBF and EWA alike. Phase 1 has no geometric bound
+ *  (the quad is EWA-derived and Phase 2 replaces it with the exact PBF rect), so without this the
+ *  exp() tail is shaded across the whole quad with a nonzero pedestal at the edge, where the
+ *  legacy falloff reached exactly zero. Applied per ray, so it is shape-agnostic and will remain
+ *  correct once Phase 2 swaps the quad for a PBF rect. */
+TAutoConsoleVariable<float> CVarGeerCutoff(
+	TEXT("gs.GeerCutoff"),
+	3.0f,
+	TEXT("GEER canonical cutoff radius in sigma (forward.cu uses 3.0). 0 = no cutoff."),
+	ECVF_RenderThreadSafe);
+
+/** Near-plane cull for GEER splats, in cm. The reference drops any Gaussian whose view-space z
+ *  is <= near_threshold (auxiliary.h in_frustum, default 0.2 m) and never shades it. We cull
+ *  only clipPos.w <= 0, so splats in front of but very close to the camera survive — and for
+ *  those the GEER density degenerates: p is tiny, so |d_obj x p_obj| is tiny, so power ~ 0 over
+ *  the WHOLE quad, i.e. full opacity everywhere. That is correct GEER behaviour for a camera
+ *  effectively inside a Gaussian, which is exactly why the reference culls instead of shading.
+ *  EWA never showed this because its falloff is in quad-local coords and always decays.
+ *  Applies to GEER splats only; classic assets are untouched. */
+TAutoConsoleVariable<float> CVarGeerNearCull(
+	TEXT("gs.GeerNearCull"),
+	20.0f,
+	TEXT("Cull GEER splats closer than this view-space depth in cm (reference: 0.2 m = 20 cm). 0 = off."),
+	ECVF_RenderThreadSafe);
+
+/** Diagnostic: visualise the GEER canonical radius instead of shading. Intended for the
+ *  single-splat analytic scene (arm 1), where there is no blending to confuse the readout —
+ *  it makes the density field's iso-contours directly measurable in pixels, so an effective
+ *  sigma error or a transposed basis is a number rather than an impression. */
+TAutoConsoleVariable<int32> CVarGeerDebugView(
+	TEXT("gs.GeerDebugView"),
+	0,
+	TEXT("Visualise GEER evaluation instead of shading it.\n")
+	TEXT(" 0: Off (normal shading)\n")
+	TEXT(" 1: Canonical radius r — green ring at r=1 sigma, blue ring at r=2, red ramps 0..3"),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<float> CVarGSLightingBlend(
 	TEXT("gs.LightingBlend"),
 	0.0f,
@@ -771,6 +830,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		FMatrix CurrentVP = SceneView->ViewMatrices.GetViewMatrix() * SceneView->ViewMatrices.GetProjectionNoAAMatrix();
 		int32 CurrentDebugMode = DebugMode;
 		int32 CurrentDebugForceLODLevel = CVarDebugForceLODLevel.GetValueOnRenderThread();
+		// GEER eval mode for this frame. Resolved per proxy below; captured here so the
+		// camera-static skip can notice a change (cached W2O rows / AA opacity go stale).
+		const int32 CurrentGeerMode = CVarGeerEval.GetValueOnRenderThread();
 
 		bool bCanSkip = GlobalAccumulator->bHasCachedSortData &&
 			GlobalAccumulator->CachedTotalSplatCount == TotalSplatCount &&
@@ -789,7 +851,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					GPUResources->CachedSplatScale != Info.Proxy->GetSplatScale() ||
 					GPUResources->CachedErrorThreshold != ProxyErrorThreshold ||
 					GPUResources->CachedDebugMode != CurrentDebugMode ||
-					GPUResources->CachedDebugForceLODLevel != CurrentDebugForceLODLevel)
+					GPUResources->CachedDebugForceLODLevel != CurrentDebugForceLODLevel ||
+					GPUResources->CachedGeerEval != ((CurrentGeerMode == 2) ||
+						(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat())))
 				{
 					bCanSkip = false;
 					break;
@@ -823,7 +887,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			ERDGPassFlags::Raster,
 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
+			 CurrentDebugForceLODLevel, CurrentGeerMode, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
 			 bUseNormalConfidenceFade](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
@@ -968,6 +1032,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						// (indirect dispatch, only visible splats per proxy)
 						// Only process proxies that went through culling/compaction
 						// --------------------------------------------------
+						// The sort key must be uniform across the whole global sort, so it is a
+						// per-FRAME decision: Euclidean iff any visible proxy takes the GEER path.
+						bool bAnyGeerVisible = false;
 						for (int32 i = 0; i < NumProcessedProxies; i++)
 						{
 							const auto& Info = ValidProxies[i];
@@ -975,6 +1042,12 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							if (!GPUResources) continue;  // Extra safety check
 							int32 SplatCount = Info.Proxy->GetSplatCount();
 							int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
+
+							// Evaluation is per PROXY: 2 forces GEER everywhere, 1 respects the
+							// per-asset declaration, 0 is the kill switch.
+							const bool bProxyGeer = (CurrentGeerMode == 2) ||
+								(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
+							bAnyGeerVisible |= bProxyGeer;
 
 							FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 								RHICmdList, *SceneView, GPUResources,
@@ -986,14 +1059,15 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								Info.Proxy->GetSplatScale(),
 								i,
 								RawAccumulator,
-								MaxRenderBudget);
+								MaxRenderBudget,
+								bProxyGeer);
 						}
 
 						// --------------------------------------------------
 						// Phase 3: Single global CalcDistances + RadixSort
 						// (all indirect — count driven by GPU prefix sum)
 						// --------------------------------------------------
-						FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(RHICmdList, RawAccumulator);
+						FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(RHICmdList, RawAccumulator, bAnyGeerVisible);
 						FGaussianSplatRenderer::DispatchRadixSortGlobalIndirect(RHICmdList, RawAccumulator);
 
 						// Update caches — only for processed proxies
@@ -1016,6 +1090,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								GPUResources->CachedErrorThreshold = FMath::Max(0.1f, Info.Proxy->GetLODErrorThreshold());
 								GPUResources->CachedDebugMode = CurrentDebugMode;
 								GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
+								GPUResources->CachedGeerEval = (CurrentGeerMode == 2) ||
+									(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
 								GPUResources->bHasCachedSortData = true;
 							}
 							else
@@ -1053,6 +1129,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						// --------------------------------------------------
 						// Phase 1: Per-proxy ClusterCulling + CalcViewData
 						// --------------------------------------------------
+						// Per-FRAME sort decision, as in the compaction path above.
+						bool bAnyGeerVisible = false;
 						for (const auto& Info : ValidProxies)
 						{
 							// Skip proxies that would write beyond the render budget
@@ -1072,6 +1150,11 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 									Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
 							}
 
+							// Evaluation is per PROXY (see the compaction path for the mode table).
+							const bool bProxyGeer = (CurrentGeerMode == 2) ||
+								(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
+							bAnyGeerVisible |= bProxyGeer;
+
 							// CalcViewData → writes to GlobalViewDataBuffer at GlobalBaseOffset
 							FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 								RHICmdList, *SceneView, GPUResources,
@@ -1082,13 +1165,14 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								Info.Proxy->GetSplatScale(),
 								Info.bUseLODRendering,
 								Info.GlobalBaseOffset,
-								RawAccumulator);
+								RawAccumulator,
+								bProxyGeer);
 						}
 
 						// --------------------------------------------------
 						// Phase 2: Single global CalcDistances + RadixSort
 						// --------------------------------------------------
-						FGaussianSplatRenderer::DispatchCalcDistancesGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
+						FGaussianSplatRenderer::DispatchCalcDistancesGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount, bAnyGeerVisible);
 						FGaussianSplatRenderer::DispatchRadixSortGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
 
 						// Update caches
@@ -1108,6 +1192,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							GPUResources->CachedErrorThreshold = FMath::Max(0.1f, Info.Proxy->GetLODErrorThreshold());
 							GPUResources->CachedDebugMode = CurrentDebugMode;
 							GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
+							GPUResources->CachedGeerEval = (CurrentGeerMode == 2) ||
+								(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
 							GPUResources->bHasCachedSortData = true;
 						}
 					}

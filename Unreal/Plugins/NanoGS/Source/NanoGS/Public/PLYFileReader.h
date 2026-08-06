@@ -27,6 +27,9 @@ struct FPLYHeader
 
 	/** Header end position in file */
 	int64 DataOffset = 0;
+
+	/** True if the header carried a "comment 3dgeer" line (GutWrap/3DGEER exporter marker) */
+	bool bHasGeerComment = false;
 };
 
 /**
@@ -43,9 +46,13 @@ public:
 	 * @param OutSplats Output array of splat data
 	 * @param OutError Error message if reading failed
 	 * @param OutSHBands Optional output for detected SH band count (0-3)
+	 * @param bOutGeerMarker Optional output: true if the header carried a "comment 3dgeer" line.
+	 *        A default-setter only — no checkpoint produced so far carries the marker, so this
+	 *        is expected to be false and the user declares GEER-ness on the asset instead.
 	 * @return True if successful
 	 */
-	static bool ReadPLYFile(const FString& FilePath, TArray<FGaussianSplatData>& OutSplats, FString& OutError, int32* OutSHBands = nullptr);
+	static bool ReadPLYFile(const FString& FilePath, TArray<FGaussianSplatData>& OutSplats, FString& OutError,
+		int32* OutSHBands = nullptr, bool* bOutGeerMarker = nullptr);
 
 	/**
 	 * Check if a file is a valid PLY file

@@ -113,7 +113,8 @@ struct FGaussianSplatData
 /**
  * Per-frame view data computed by compute shader, used by vertex shader
  * This structure must match the HLSL definition in GaussianDataTypes.ush
- * Total: 64 bytes per splat (with TranslatedWorldPos for velocity, 16-byte aligned)
+ * Total: 128 bytes per splat (with TranslatedWorldPos for velocity, SplatNormal and the GEER
+ * canonical transform rows, 16-byte aligned)
  */
 USTRUCT()
 struct FGaussianSplatViewData
@@ -157,6 +158,22 @@ struct FGaussianSplatViewData
 	 *  coin-flip and the normal is unstable between neighboring splats. Used to fade lighting
 	 *  back toward unlit for low-confidence splats instead of trusting a noisy normal. */
 	float SplatNormalConfidence = 0.0f;
+
+	/** GEER: world-space canonical transform rows (unit axis / effective sigma, 1/cm) */
+	FVector3f W2ORow0 = FVector3f::ZeroVector;
+
+	/** GEER: Euclidean camera->splat distance (cm), sort key (always filled) */
+	float ViewDistance = 0.0f;
+
+	FVector3f W2ORow1 = FVector3f::ZeroVector;
+
+	/** Spare (Phase 2: PBF rect NDC offset x) */
+	float W2OPad1 = 0.0f;
+
+	FVector3f W2ORow2 = FVector3f::ZeroVector;
+
+	/** Spare (Phase 2: PBF rect NDC offset y) */
+	float W2OPad2 = 0.0f;
 };
 
 /**

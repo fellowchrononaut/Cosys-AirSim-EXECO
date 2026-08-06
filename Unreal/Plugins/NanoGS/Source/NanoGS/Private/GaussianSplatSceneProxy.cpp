@@ -689,6 +689,7 @@ FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent
 	, SplatScale(InComponent->SplatScale)
 	, LODErrorThreshold(InComponent->LODErrorThreshold)
 	, bEnableFrustumCulling(InComponent->bEnableFrustumCulling)
+	, bGeerSplat(InComponent->SplatAsset ? InComponent->SplatAsset->IsGeerSplat() : false)
 {
 	bWillEverBeLit = false;
 }

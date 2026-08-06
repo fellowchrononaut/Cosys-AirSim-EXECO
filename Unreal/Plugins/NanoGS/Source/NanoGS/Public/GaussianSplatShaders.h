@@ -52,6 +52,9 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, UseSHRendering)   // 1 = use view-dependent SH evaluation
 		SHADER_PARAMETER(float, OpacityScale)
 		SHADER_PARAMETER(float, SplatScale)
+		SHADER_PARAMETER(float, QuadInflation)  // GEER footprint inflation (1.0 = off)
+		SHADER_PARAMETER(uint32, UseGeerEval)   // 1 = fill W2O rows / AA opacity
+		SHADER_PARAMETER(float, GeerNearCull)   // cull GEER splats nearer than this view z (cm)
 		SHADER_PARAMETER(uint32, GlobalBaseOffset)  // Offset into global ViewDataBuffer (non-compaction global path)
 		// Global compaction path: GPU prefix-sum offsets
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, GlobalBaseOffsetsBuffer)  // prefix sums per proxy
@@ -159,6 +162,7 @@ class FGaussianSplatCalcDistancesCS : public FGlobalShader
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, DistanceBuffer)
 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, KeyBuffer)
 		SHADER_PARAMETER(uint32, SplatCount)
+		SHADER_PARAMETER(uint32, UseGeerSort)   // 1 = Euclidean sort key (any GEER asset visible)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -230,6 +234,15 @@ class FGaussianSplatPS : public FGlobalShader
 		SHADER_PARAMETER_SAMPLER(SamplerState, CompletedDepthAccumSampler)
 		SHADER_PARAMETER(uint32, UseDepthProximityWeight)
 		SHADER_PARAMETER(float, DepthProximitySigma)
+		// GEER exact ray evaluation (mirrors FGaussianSplatCompositePS ray reconstruction)
+		SHADER_PARAMETER(uint32, UseGeerEval)
+		SHADER_PARAMETER(FMatrix44f, InvViewMatrix)           // view -> world (GetInvViewMatrix)
+		SHADER_PARAMETER(FVector2f, FocalLength)              // pixels: (ProjM00*W/2, ProjM11*H/2)
+		SHADER_PARAMETER(FVector2f, ScreenSize)               // ViewRect extent (pixels)
+		SHADER_PARAMETER(FVector2f, ViewRectMin)              // ViewRect.Min
+		SHADER_PARAMETER(FVector3f, CameraTranslatedWorldPos) // ViewOrigin + PreViewTranslation
+		SHADER_PARAMETER(float, GeerPowerCutoff)              // -0.5*cutoff^2; discard below. 0 = off
+		SHADER_PARAMETER(uint32, GeerDebugView)               // 1 = visualise canonical radius
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

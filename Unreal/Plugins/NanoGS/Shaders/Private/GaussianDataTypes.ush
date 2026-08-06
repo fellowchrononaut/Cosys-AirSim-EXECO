@@ -11,7 +11,8 @@
 #define SH_C0 0.28209479177387814f
 
 // Per-frame view data structure (must match C++ FGaussianSplatViewData)
-// Total: 80 bytes per splat (with TranslatedWorldPos for velocity and SplatNormal, 16-byte aligned)
+// Total: 128 bytes per splat (with TranslatedWorldPos for velocity, SplatNormal and the GEER
+// canonical transform rows, 16-byte aligned)
 struct FGaussianSplatViewData
 {
 	float4 ClipPosition;       // Clip space position (xyz, w)
@@ -25,6 +26,14 @@ struct FGaussianSplatViewData
 	uint Padding;              // Padding for 16-byte alignment
 	float3 SplatNormal;        // Analytic per-splat normal (world space, camera-facing), GeometryMode 2
 	float SplatNormalConfidence; // [0,1] confidence the thinnest-axis choice is reliable (see CalcSplatNormalConfidence)
+	// GEER exact ray evaluation (gs.GeerEval): world-space canonical transform rows,
+	// w2o_row_j = unit_axis_j / effective_sigma_j (1/cm). See 3DGEERNanoGS.md.
+	float3 W2ORow0;
+	float  ViewDistance;       // Euclidean camera->splat distance (cm) — GEER sort key (always filled)
+	float3 W2ORow1;
+	float  W2OPad1;            // spare (Phase 2: PBF rect NDC offset x)
+	float3 W2ORow2;
+	float  W2OPad2;            // spare (Phase 2: PBF rect NDC offset y)
 };
 
 // Chunk info for quantized data (must match C++ FGaussianChunkInfo)

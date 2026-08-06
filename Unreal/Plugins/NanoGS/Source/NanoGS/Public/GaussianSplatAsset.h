@@ -22,6 +22,26 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FOnGaussianSplatAssetChanged, UGaussianSplat
 #define GAUSSIAN_SPLAT_ASSET_VERSION 5  // SH buffer now includes DC coefficient for view-dependent rendering
 
 /**
+ * How this checkpoint should be evaluated at render time.
+ *
+ * Tri-state rather than a bool because GEER-ness is a property of how the checkpoint was
+ * TRAINED, not of what is in the PLY: 3DGEER checkpoints are byte-format identical to vanilla
+ * 3DGS (62 properties, f_rest = 45), so no amount of sniffing can recover it. A bool could not
+ * tell "never touched" from "deliberately classic", which means the importer's default-setter
+ * could not run without risking a silent override of the user's choice.
+ */
+UENUM()
+enum class EGaussianSplatGeerMode : uint8
+{
+	/** Follow the PLY marker if the exporter wrote one; classic EWA otherwise. Default. */
+	Unset        UMETA(DisplayName = "Unset (follow PLY marker)"),
+	/** Always render with classic EWA splatting, even if the file carries a GEER marker. */
+	ForceClassic UMETA(DisplayName = "Force classic EWA"),
+	/** Always render with 3DGEER exact per-ray evaluation. */
+	ForceGEER    UMETA(DisplayName = "Force 3DGEER per-ray"),
+};
+
+/**
  * Asset containing Gaussian Splatting data loaded from PLY files
  * Stores compressed splat data optimized for GPU rendering
  */
@@ -64,6 +84,14 @@ public:
 	/** Check if Nanite is enabled for this asset */
 	UFUNCTION(BlueprintCallable, Category = "Gaussian Splatting|Nanite")
 	bool IsNaniteEnabled() const { return bEnableNanite; }
+
+	/**
+	 * Resolve GeerMode to the render-time decision. Unset means classic: the importer promotes
+	 * Unset to ForceGEER when the PLY carries a marker, so anything still Unset by render time
+	 * has no marker and no user override. gs.GeerEval 2 overrides this globally for A/B testing.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Gaussian Splatting|Format")
+	bool IsGeerSplat() const { return GeerMode == EGaussianSplatGeerMode::ForceGEER; }
 
 #if WITH_EDITOR
 	/**
@@ -184,6 +212,20 @@ public:
 	 */
 	UPROPERTY(VisibleAnywhere, Category = "Nanite")
 	bool bEnableNanite = false;
+
+	/**
+	 * Whether this checkpoint was trained with 3DGEER (+GutWrap) and must be rendered with exact
+	 * per-ray evaluation instead of EWA splatting. Editable, because none of the trained PLYs
+	 * carry a marker — see EGaussianSplatGeerMode.
+	 *
+	 * NOTE: deliberately NOT added to the manual Ar << chain in Serialize(). That chain sits
+	 * behind a hard version gate that rejects any asset whose Version differs, so extending it
+	 * would force every existing asset to be reimported. As a UPROPERTY this is persisted by
+	 * UObject::Serialize's tagged-property pass (called via Super::Serialize), which is
+	 * backward compatible: assets saved before this field load with the default, Unset.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Format")
+	EGaussianSplatGeerMode GeerMode = EGaussianSplatGeerMode::Unset;
 
 	/**
 	 * Hierarchical cluster structure for Nanite-style LOD and culling

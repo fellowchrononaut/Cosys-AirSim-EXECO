@@ -131,7 +131,8 @@ public:
 		int32 SHOrder,
 		float OpacityScale,
 		float SplatScale,
-		bool bUseLODRendering = false
+		bool bUseLODRendering = false,
+		bool bGeerEval = false
 	);
 
 	/**
@@ -140,7 +141,8 @@ public:
 	static void DispatchCalcDistances(
 		FRHICommandListImmediate& RHICmdList,
 		FGaussianSplatGPUResources* GPUResources,
-		int32 SplatCount
+		int32 SplatCount,
+		bool bUseGeerSort = false
 	);
 
 	/**
@@ -230,7 +232,8 @@ public:
 		int32 OriginalSplatCount,
 		int32 SHOrder,
 		float OpacityScale,
-		float SplatScale
+		float SplatScale,
+		bool bGeerEval = false
 	);
 
 	/**
@@ -239,7 +242,8 @@ public:
 	 */
 	static void DispatchCalcDistancesIndirect(
 		FRHICommandListImmediate& RHICmdList,
-		FGaussianSplatGPUResources* GPUResources
+		FGaussianSplatGPUResources* GPUResources,
+		bool bUseGeerSort = false
 	);
 
 	//----------------------------------------------------------------------
@@ -261,7 +265,8 @@ public:
 		float SplatScale,
 		bool bUseLODRendering,
 		uint32 GlobalBaseOffset,
-		FGaussianGlobalAccumulator* GlobalAccumulator
+		FGaussianGlobalAccumulator* GlobalAccumulator,
+		bool bGeerEval = false
 	);
 
 	/**
@@ -271,7 +276,8 @@ public:
 	static void DispatchCalcDistancesGlobal(
 		FRHICommandListImmediate& RHICmdList,
 		FGaussianGlobalAccumulator* GlobalAccumulator,
-		int32 TotalSplatCount
+		int32 TotalSplatCount,
+		bool bUseGeerSort = false
 	);
 
 	/**
@@ -349,7 +355,8 @@ public:
 		float SplatScale,
 		int32 ProxyIndex,
 		FGaussianGlobalAccumulator* GlobalAccumulator,
-		uint32 MaxRenderBudget
+		uint32 MaxRenderBudget,
+		bool bGeerEval = false
 	);
 
 	/**
@@ -358,7 +365,8 @@ public:
 	 */
 	static void DispatchCalcDistancesGlobalIndirect(
 		FRHICommandListImmediate& RHICmdList,
-		FGaussianGlobalAccumulator* GlobalAccumulator
+		FGaussianGlobalAccumulator* GlobalAccumulator,
+		bool bUseGeerSort = false
 	);
 
 	/**

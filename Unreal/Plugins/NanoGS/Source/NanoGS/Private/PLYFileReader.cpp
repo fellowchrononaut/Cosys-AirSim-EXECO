@@ -4,7 +4,8 @@
 #include "Misc/FileHelper.h"
 #include "HAL/PlatformFileManager.h"
 
-bool FPLYFileReader::ReadPLYFile(const FString& FilePath, TArray<FGaussianSplatData>& OutSplats, FString& OutError, int32* OutSHBands)
+bool FPLYFileReader::ReadPLYFile(const FString& FilePath, TArray<FGaussianSplatData>& OutSplats, FString& OutError,
+	int32* OutSHBands, bool* bOutGeerMarker)
 {
 	OutSplats.Empty();
 
@@ -63,6 +64,11 @@ bool FPLYFileReader::ReadPLYFile(const FString& FilePath, TArray<FGaussianSplatD
 			*OutSHBands = 0;  // No f_rest data (DC only)
 		}
 		UE_LOG(LogTemp, Log, TEXT("PLYFileReader: Detected SH bands = %d"), *OutSHBands);
+	}
+
+	if (bOutGeerMarker)
+	{
+		*bOutGeerMarker = Header.bHasGeerComment;
 	}
 
 	// Validate file size against expected data
@@ -172,6 +178,19 @@ bool FPLYFileReader::ParseHeader(IFileHandle* FileHandle, FPLYHeader& OutHeader,
 		if (TrimmedLine == TEXT("ply"))
 		{
 			bFoundPly = true;
+			continue;
+		}
+
+		if (TrimmedLine.StartsWith(TEXT("comment")))
+		{
+			// GutWrap/3DGEER exporters may tag checkpoints with "comment 3dgeer" so the importer
+			// can preselect the exact-ray renderer. None of the checkpoints in this project carry
+			// it — GEER-ness is a property of training, not of the file — so this is a
+			// default-setter for future exports, never the thing correctness depends on.
+			if (TrimmedLine.Contains(TEXT("3dgeer"), ESearchCase::IgnoreCase))
+			{
+				OutHeader.bHasGeerComment = true;
+			}
 			continue;
 		}
 

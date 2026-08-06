@@ -22,6 +22,30 @@
 // Console variables (declared in GaussianSplatting.cpp)
 extern TAutoConsoleVariable<int32> CVarShowClusterBounds;
 extern TAutoConsoleVariable<int32> CVarDebugForceLODLevel;
+extern TAutoConsoleVariable<int32> CVarGeerEval;
+extern TAutoConsoleVariable<float> CVarGeerQuadInflation;
+extern TAutoConsoleVariable<float> CVarGeerCutoff;
+extern TAutoConsoleVariable<int32> CVarGeerDebugView;
+extern TAutoConsoleVariable<float> CVarGeerNearCull;
+
+// GEER eval is exact only under rigid + uniform-scale actor transforms (world-space
+// invariance argument in 3DGEERNanoGS.md §1.5). Warn once per session otherwise.
+static void WarnOnceIfNonUniformScaleForGeer(const FMatrix& LocalToWorld)
+{
+	static bool bWarned = false;
+	if (bWarned)
+	{
+		return;
+	}
+	const FVector Scale3D = LocalToWorld.GetScaleVector();
+	if (!Scale3D.AllComponentsEqual(UE_KINDA_SMALL_NUMBER))
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("NanoGS: gs.GeerEval is on but the splat actor has non-uniform scale %s - GEER ray evaluation will be wrong. Use uniform scale."),
+			*Scale3D.ToString());
+		bWarned = true;
+	}
+}
 
 // Helper: Set pixel shader velocity parameters using self-tracked previous frame data.
 // UE5's PrevViewInfo is not populated for PostOpaqueRender callbacks, so we store
@@ -32,6 +56,9 @@ extern TAutoConsoleVariable<int32> CVarDebugForceLODLevel;
 // IMPORTANT: We use UN-JITTERED projection matrices for velocity calculation.
 // This ensures ClipPosition is stable when camera is static (we skip CalcViewData
 // when camera doesn't move, so jittered positions would cause velocity errors).
+//
+// Also binds the GEER ray-reconstruction parameters (gs.GeerEval), because all three
+// FGaussianSplatPS bind sites go through this one helper and it has View in scope.
 static void SetVelocityPSParameters(
 	FGaussianSplatPS::FParameters& PSParameters,
 	const FSceneView& View,
@@ -72,6 +99,29 @@ static void SetVelocityPSParameters(
 		Data.TranslatedViewProjectionMatrix = CurTranslatedVP;
 		Data.PreViewTranslation = CurPreViewTranslation;
 	}
+
+	// GEER exact ray evaluation (gs.GeerEval): same ray-reconstruction inputs the composite
+	// pass binds (CompositeToSceneColor). All splat raster passes set their viewport from
+	// ViewInfo.ViewRect, so these are consistent with SV_Position in the pixel shader.
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	const FIntRect ViewRect = ViewInfo.ViewRect;
+	// Global kill-switch only — per-splat GEER selection happens in the PS via the W2O rows,
+	// which CalcViewData zeroes for classic (non-GEER) assets.
+	PSParameters.UseGeerEval = (CVarGeerEval.GetValueOnRenderThread() != 0) ? 1u : 0u;
+	PSParameters.InvViewMatrix = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
+	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
+	PSParameters.FocalLength = FVector2f(
+		(float)(ProjMatrix.M[0][0] * ViewRect.Width() * 0.5),
+		(float)(ProjMatrix.M[1][1] * ViewRect.Height() * 0.5));
+	PSParameters.ScreenSize = FVector2f((float)ViewRect.Width(), (float)ViewRect.Height());
+	PSParameters.ViewRectMin = FVector2f((float)ViewRect.Min.X, (float)ViewRect.Min.Y);
+	PSParameters.CameraTranslatedWorldPos = FVector3f(
+		View.ViewMatrices.GetViewOrigin() + View.ViewMatrices.GetPreViewTranslation());
+	// Pre-square on the CPU so the PS compares against power_mah directly: the reference culls
+	// rays outside a `cutoff` sigma bound, and power_mah = -0.5 * r^2 in canonical sigma units.
+	const float GeerCutoff = FMath::Max(CVarGeerCutoff.GetValueOnRenderThread(), 0.0f);
+	PSParameters.GeerPowerCutoff = (GeerCutoff > 0.0f) ? (-0.5f * GeerCutoff * GeerCutoff) : 0.0f;
+	PSParameters.GeerDebugView = (uint32)FMath::Max(CVarGeerDebugView.GetValueOnRenderThread(), 0);
 }
 
 FGaussianSplatRenderer::FGaussianSplatRenderer()
@@ -118,7 +168,8 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	int32 SHOrder,
 	float OpacityScale,
 	float SplatScale,
-	bool bUseLODRendering)
+	bool bUseLODRendering,
+	bool bGeerEval)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewData);
 
@@ -195,6 +246,11 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	Parameters.UseSHRendering = (EffectiveSHOrder > 0) ? 1 : 0;
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.SplatScale = SplatScale;
+	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
+	Parameters.QuadInflation = bGeerEval
+		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
+	Parameters.GeerNearCull = bGeerEval
+		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
 
 	// Not using global compaction path
 	Parameters.GlobalBaseOffsetsBuffer = GPUResources->CompactedSplatIndicesBufferSRV;  // dummy
@@ -218,7 +274,8 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 void FGaussianSplatRenderer::DispatchCalcDistances(
 	FRHICommandListImmediate& RHICmdList,
 	FGaussianSplatGPUResources* GPUResources,
-	int32 SplatCount)
+	int32 SplatCount,
+	bool bUseGeerSort)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistances);
 
@@ -239,6 +296,7 @@ void FGaussianSplatRenderer::DispatchCalcDistances(
 	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
 	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
 	Parameters.SplatCount = SplatCount;
+	Parameters.UseGeerSort = bUseGeerSort ? 1u : 0u;
 
 	// Dispatch only for actual SplatCount — no power-of-2 padding needed for radix sort
 	const uint32 ThreadGroupSize = 256;
@@ -770,7 +828,8 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	int32 OriginalSplatCount,
 	int32 SHOrder,
 	float OpacityScale,
-	float SplatScale)
+	float SplatScale,
+	bool bGeerEval)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataCompacted);
 
@@ -838,6 +897,11 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	Parameters.UseSHRendering = (EffectiveSHOrder > 0) ? 1 : 0;
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.SplatScale = SplatScale;
+	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
+	Parameters.QuadInflation = bGeerEval
+		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
+	Parameters.GeerNearCull = bGeerEval
+		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
 
 	// Per-proxy compaction path
 	Parameters.GlobalBaseOffsetsBuffer = GPUResources->CompactedSplatIndicesBufferSRV;  // dummy
@@ -857,7 +921,8 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 
 void FGaussianSplatRenderer::DispatchCalcDistancesIndirect(
 	FRHICommandListImmediate& RHICmdList,
-	FGaussianSplatGPUResources* GPUResources)
+	FGaussianSplatGPUResources* GPUResources,
+	bool bUseGeerSort)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesIndirect);
 
@@ -881,6 +946,7 @@ void FGaussianSplatRenderer::DispatchCalcDistancesIndirect(
 	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
 	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
 	Parameters.SplatCount = GPUResources->TotalSplatCount;  // Max count for bounds
+	Parameters.UseGeerSort = bUseGeerSort ? 1u : 0u;
 
 	// INDIRECT DISPATCH
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
@@ -904,9 +970,15 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	float SplatScale,
 	bool bUseLODRendering,
 	uint32 GlobalBaseOffset,
-	FGaussianGlobalAccumulator* GlobalAccumulator)
+	FGaussianGlobalAccumulator* GlobalAccumulator,
+	bool bGeerEval)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataGlobal);
+
+	if (bGeerEval)
+	{
+		WarnOnceIfNonUniformScaleForGeer(LocalToWorld);
+	}
 
 	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	if (!ComputeShader.IsValid())
@@ -983,6 +1055,11 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	Parameters.UseSHRendering = (EffectiveSHOrder > 0) ? 1 : 0;
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.SplatScale = SplatScale;
+	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
+	Parameters.QuadInflation = bGeerEval
+		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
+	Parameters.GeerNearCull = bGeerEval
+		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
 
 	// KEY: tell the shader where to write in the global buffer
 	Parameters.GlobalBaseOffset = GlobalBaseOffset;
@@ -1006,7 +1083,8 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 void FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
 	FRHICommandListImmediate& RHICmdList,
 	FGaussianGlobalAccumulator* GlobalAccumulator,
-	int32 TotalSplatCount)
+	int32 TotalSplatCount,
+	bool bUseGeerSort)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesGlobal);
 
@@ -1027,6 +1105,7 @@ void FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
 	Parameters.DistanceBuffer = GlobalAccumulator->GlobalSortDistanceBufferUAV;
 	Parameters.KeyBuffer = GlobalAccumulator->GlobalSortKeysBufferUAV;
 	Parameters.SplatCount = TotalSplatCount;
+	Parameters.UseGeerSort = bUseGeerSort ? 1u : 0u;
 
 	const uint32 ThreadGroupSize = 256;
 	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)TotalSplatCount, ThreadGroupSize);
@@ -1399,9 +1478,15 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	float SplatScale,
 	int32 ProxyIndex,
 	FGaussianGlobalAccumulator* GlobalAccumulator,
-	uint32 MaxRenderBudget)
+	uint32 MaxRenderBudget,
+	bool bGeerEval)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataCompactedGlobal);
+
+	if (bGeerEval)
+	{
+		WarnOnceIfNonUniformScaleForGeer(LocalToWorld);
+	}
 
 	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	if (!ComputeShader.IsValid())
@@ -1476,6 +1561,11 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	Parameters.UseSHRendering = (EffectiveSHOrder > 0) ? 1 : 0;
 	Parameters.OpacityScale  = OpacityScale;
 	Parameters.SplatScale    = SplatScale;
+	Parameters.UseGeerEval   = bGeerEval ? 1u : 0u;
+	Parameters.QuadInflation = bGeerEval
+		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
+	Parameters.GeerNearCull = bGeerEval
+		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
 
 	// Use the per-proxy indirect dispatch args (filled by DispatchPrepareIndirectArgs)
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
@@ -1488,7 +1578,8 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 
 void FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(
 	FRHICommandListImmediate& RHICmdList,
-	FGaussianGlobalAccumulator* GlobalAccumulator)
+	FGaussianGlobalAccumulator* GlobalAccumulator,
+	bool bUseGeerSort)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesGlobalIndirect);
 
@@ -1510,6 +1601,7 @@ void FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(
 	Parameters.KeyBuffer       = GlobalAccumulator->GlobalSortKeysBufferUAV;
 	// AllocatedCount is always >= TotalVisible — safe upper bound for the shader guard
 	Parameters.SplatCount      = GlobalAccumulator->AllocatedCount;
+	Parameters.UseGeerSort     = bUseGeerSort ? 1u : 0u;
 
 	// GlobalCalcDistIndirectArgsBuffer is in IndirectArgs state from DispatchPrefixSumVisibleCounts
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());

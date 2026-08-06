@@ -56,6 +56,41 @@ Texture2D    CompletedDepthAccumTexture;
 SamplerState CompletedDepthAccumSampler;
 uint         UseDepthProximityWeight;
 float        DepthProximitySigma;
+// GEER exact ray evaluation — mirrors the composite pass's ray reconstruction.
+// UseGeerEval is the global kill-switch (gs.GeerEval != 0); which splats actually take the
+// GEER path is decided per splat by their W2O rows (zero for classic assets).
+uint      UseGeerEval;
+float4x4  InvViewMatrix;               // view -> world (GetInvViewMatrix)
+float2    FocalLength;                 // pixels: (ProjM00*W/2, ProjM11*H/2)
+float2    ScreenSize;                  // ViewRect extent (pixels)
+float2    ViewRectMin;                 // ViewRect.Min (viewport == ViewRect on all splat passes)
+float3    CameraTranslatedWorldPos;    // ViewOrigin + PreViewTranslation
+float     GeerPowerCutoff;             // -0.5*cutoff^2 (cutoff in sigma); 0 = no cutoff
+uint      GeerDebugView;               // 1 = visualise canonical radius instead of shading
+
+// ADR-001: a viewing ray is (origin, direction), never a direction alone.
+// Phase 1: Origin is the uniform camera position. Later phases may vary it per pixel
+// (rolling shutter, non-central lenses) — callers must not assume it is uniform.
+struct FSplatRay { float3 Origin; float3 Dir; };
+
+// Reconstruct this pixel's viewing ray. Mirrors the composite pass
+// (GaussianSplatComposite.usf, ViewZAndPixelToWorld), except SvPosition already carries the
+// half-pixel centre offset, so there is no +0.5 here. Dir is NOT normalised: the GEER density
+// |d_obj x p_obj|^2 / |d_obj|^2 is scale-invariant in d, so normalising would be wasted work.
+FSplatRay GetPixelRay(float2 SvPosition)
+{
+	float2 pv = SvPosition - ViewRectMin;
+	float cx = ScreenSize.x * 0.5;
+	float cy = ScreenSize.y * 0.5;
+	float3 dView = float3((pv.x - cx) / FocalLength.x,
+	                      (cy - pv.y) / FocalLength.y,   // pixel down -> view up
+	                      1.0);
+
+	FSplatRay Ray;
+	Ray.Origin = CameraTranslatedWorldPos;
+	Ray.Dir = mul(float4(dView, 0.0), InvViewMatrix).xyz;
+	return Ray;
+}
 #endif
 
 // Convert HSV to RGB (Nanite-style saturated colors)
@@ -110,6 +145,9 @@ struct FVertexOutput
 	float3 TranslatedWorldPos : TEXCOORD3;  // For velocity calculation in pixel shader
 	float4 CenterClipPos : TEXCOORD4;       // Splat center clip position for velocity (Nanite-style)
 	float4 SplatNormal : TEXCOORD5;         // xyz = analytic per-splat normal (world space), w = confidence [0,1]
+	nointerpolation float3 W2ORow0 : TEXCOORD6;  // GEER canonical transform rows (gs.GeerEval)
+	nointerpolation float3 W2ORow1 : TEXCOORD7;
+	nointerpolation float3 W2ORow2 : TEXCOORD8;
 };
 
 // Pixel shader output with velocity for TAA/TSR
@@ -160,6 +198,9 @@ FVertexOutput MainVS(
 	Output.TranslatedWorldPos = viewData.TranslatedWorldPos;
 	Output.CenterClipPos = viewData.ClipPosition;
 	Output.SplatNormal = float4(viewData.SplatNormal, viewData.SplatNormalConfidence);
+	Output.W2ORow0 = viewData.W2ORow0;
+	Output.W2ORow1 = viewData.W2ORow1;
+	Output.W2ORow2 = viewData.W2ORow2;
 
 	// Check validity (w <= 0 means invalid/behind camera)
 	if (viewData.ClipPosition.w <= 0.0)
@@ -271,23 +312,80 @@ FPixelOutput MainPS(FVertexOutput Input)
 		return Output;
 	}
 
-	// Normalized Gaussian falloff (matches SuperSplat)
-	// Shifts and rescales exp(-4*A) so it reaches exactly 0.0 at the quad edge,
-	// eliminating the visible discontinuity from a nonzero cutoff
 	float distSq = dot(Input.LocalPos, Input.LocalPos);
 
-	// Discard pixels outside the unit circle for efficiency
-	if (distSq > 1.0)
+	// Per-splat mode: GEER splats carry nonzero W2O rows (row magnitude = 1/sigmaEff > 0);
+	// classic-asset splats have exactly zero rows and take the legacy branch below unchanged.
+	// UseGeerEval (gs.GeerEval != 0) is only the global kill-switch.
+	if (UseGeerEval != 0 && dot(Input.W2ORow0, Input.W2ORow0) > 0.0)
 	{
-		discard;
+		// 3DGEER exact per-ray evaluation (forward.cu renderCUDA ~1089-1101):
+		// peak Gaussian density along this pixel's ray, in canonical splat space.
+		FSplatRay Ray = GetPixelRay(Input.Position.xy);
+		// p = camera -> splat CENTER (cm); constant across the quad.
+		float3 p = Input.TranslatedWorldPos - Ray.Origin;
+		float3 pObj = float3(dot(p, Input.W2ORow0), dot(p, Input.W2ORow1), dot(p, Input.W2ORow2));
+		float3 dObj = float3(dot(Ray.Dir, Input.W2ORow0), dot(Ray.Dir, Input.W2ORow1), dot(Ray.Dir, Input.W2ORow2));
+		float3 nrm = cross(dObj, pObj);
+		float power = -0.5 * dot(nrm, nrm) / dot(dObj, dObj);
+		// 3-sigma cutoff (gs.GeerCutoff). The reference bounds EVERY Gaussian at `cutoff` sigma
+		// and culls rays outside those bounds before shading (forward.cu:882, and the tan-bounds
+		// test in renderCUDA) — in all association modes, PBF and EWA alike. Without it the
+		// exp() tail is shaded over the whole quad with a nonzero pedestal at the edge, where
+		// the legacy falloff reached exactly zero; across millions of overlapping splats that
+		// accumulates into a milky, order-dependent wash. Applied per ray, so it is independent
+		// of the footprint's shape and stays correct when Phase 2 swaps the quad for a PBF rect.
+		if (GeerPowerCutoff < 0.0 && power < GeerPowerCutoff)
+		{
+			discard;
+		}
+		// gs.GeerDebugView 1: paint the canonical radius instead of shading, so the density
+		// field's iso-contours are directly measurable in pixels. Opaque, because this is
+		// meant for the single-splat analytic scene where nothing should blend over it.
+		if (GeerDebugView == 1)
+		{
+			float r = sqrt(max(-2.0 * power, 0.0));
+			color.rgb = float3(
+				saturate(r / 3.0),                        // red ramps 0..3 sigma
+				saturate(1.0 - abs(r - 1.0) * 6.0),       // green ring exactly at r = 1 sigma
+				saturate(1.0 - abs(r - 2.0) * 6.0));      // blue ring exactly at r = 2 sigma
+			color.a = 1.0;
+		}
+		else
+		{
+			// The reference SKIPS a Gaussian when power_mah > 0 (forward.cu:1094 `continue`).
+			// Clamping to exp(0) instead would hand a numerically degenerate splat FULL peak
+			// alpha — the opposite behaviour. Mathematically power <= 0 always (both terms of
+			// -0.5*|n|^2/|d|^2 are non-negative), so this only fires on NaN/Inf, but match the
+			// reference rather than invert it.
+			if (!(power <= 0.0))
+			{
+				discard;
+			}
+			// No unit-circle discard on this path: the quad is only a footprint (and Phase 2's
+			// PBF rects must not be cut to a circle). The 1/255 alpha discard below remains.
+			color.a = min(0.99, color.a * exp(power));
+		}
 	}
+	else
+	{
+		// Legacy SuperSplat-style normalized falloff (unchanged)
+		// Shifts and rescales exp(-4*A) so it reaches exactly 0.0 at the quad edge,
+		// eliminating the visible discontinuity from a nonzero cutoff
 
-	static const float EXP4 = exp(-4.0);           // ≈ 0.0183
-	static const float INV_EXP4 = 1.0 / (1.0 - EXP4); // normalization factor
-	float gaussianWeight = (exp(-4.0 * distSq) - EXP4) * INV_EXP4;
+		// Discard pixels outside the unit circle for efficiency
+		if (distSq > 1.0)
+		{
+			discard;
+		}
 
-	// Apply Gaussian to alpha
-	color.a = saturate(gaussianWeight * color.a);
+		static const float EXP4 = exp(-4.0);           // ≈ 0.0183
+		static const float INV_EXP4 = 1.0 / (1.0 - EXP4); // normalization factor
+		float gaussianWeight = (exp(-4.0 * distSq) - EXP4) * INV_EXP4;
+
+		// Apply Gaussian to alpha
+		color.a = saturate(gaussianWeight * color.a);
+	}
 
 	// Premultiplied alpha
 	color.rgb *= color.a;

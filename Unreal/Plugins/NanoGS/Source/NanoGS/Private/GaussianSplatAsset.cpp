@@ -630,6 +630,9 @@ bool UGaussianSplatAsset::BuildNaniteClusterHierarchy()
 	TArray<FGaussianSplatData> SplatData;
 	FString ErrorMessage;
 
+	// Deliberately does NOT request the 3dgeer marker: this is an internal re-read of the same
+	// file to rebuild clusters, not a reimport, and GeerMode may carry a user override by now.
+	// Re-sniffing here could only ever clobber it. Same at ClearNaniteClusterHierarchy below.
 	if (!FPLYFileReader::ReadPLYFile(SourceFilePath, SplatData, ErrorMessage))
 	{
 		UE_LOG(LogTemp, Error, TEXT("BuildNaniteClusterHierarchy: Failed to read PLY file: %s"), *ErrorMessage);
@@ -731,6 +734,8 @@ void UGaussianSplatAsset::ClearNaniteClusterHierarchy()
 			TArray<FGaussianSplatData> SplatData;
 			FString ErrorMessage;
 
+			// No marker request here either — internal re-read, not a reimport. GeerMode is
+			// left exactly as the user set it (see BuildNaniteClusterHierarchy).
 			if (FPLYFileReader::ReadPLYFile(SourceFilePath, SplatData, ErrorMessage))
 			{
 				// Reinitialize with original splats only (no LOD)

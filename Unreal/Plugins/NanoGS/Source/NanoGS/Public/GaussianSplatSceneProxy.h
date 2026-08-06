@@ -331,6 +331,9 @@ public:
 	float CachedErrorThreshold = -1.0f;
 	int32 CachedDebugMode = -1;
 	int32 CachedDebugForceLODLevel = -1;
+	/** GEER eval state the cached view data was computed under. Cached W2O rows and the AA
+	 *  opacity scaling are stale if this changes, so the camera-static skip must not reuse them. */
+	bool CachedGeerEval = false;
 	bool bHasCachedSortData = false;
 };
 
@@ -376,6 +379,10 @@ public:
 	float GetSplatScale() const { return SplatScale; }
 	float GetLODErrorThreshold() const { return LODErrorThreshold; }
 
+	/** True if this proxy's asset declares 3DGEER exact per-ray evaluation (GeerMode ForceGEER).
+	 *  Render-thread copy of the asset property: the asset itself must not be touched there. */
+	bool IsGeerSplat() const { return bGeerSplat; }
+
 	/** Check if this proxy is safe to use for rendering.
 	 *  Returns false if proxy is being destroyed or has invalid resources.
 	 *  Thread-safe - can be called from render thread.
@@ -418,6 +425,8 @@ private:
 	float SplatScale = 1.0f;
 	float LODErrorThreshold = 0.03f;
 	bool bEnableFrustumCulling = true;
+	/** Snapshot of the asset's GeerMode at proxy creation (see IsGeerSplat) */
+	bool bGeerSplat = false;
 
 #if WITH_EDITOR
 	/** Cached hit proxy created in CreateHitProxies, used for editor viewport click selection. */

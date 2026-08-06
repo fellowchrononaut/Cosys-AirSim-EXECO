@@ -141,8 +141,9 @@ UGaussianSplatAsset* UGaussianSplatAssetFactory::ImportPLYFile(
 	TArray<FGaussianSplatData> SplatData;
 	FString ErrorMessage;
 	int32 DetectedSHBands = 0;
+	bool bGeerMarker = false;
 
-	if (!FPLYFileReader::ReadPLYFile(FilePath, SplatData, ErrorMessage, &DetectedSHBands))
+	if (!FPLYFileReader::ReadPLYFile(FilePath, SplatData, ErrorMessage, &DetectedSHBands, &bGeerMarker))
 	{
 		UE_LOG(LogTemp, Error, TEXT("Failed to read PLY file: %s"), *ErrorMessage);
 		return nullptr;
@@ -170,6 +171,15 @@ UGaussianSplatAsset* UGaussianSplatAssetFactory::ImportPLYFile(
 
 	// Set the detected SH band count BEFORE initializing (CompressSH uses this)
 	Asset->SHBands = DetectedSHBands;
+
+	// GEER marker is a DEFAULT-SETTER, never an override: only promote an asset that is still
+	// Unset. This path doubles as a reimport (Asset == ExistingAsset above), and silently
+	// reverting a user's ForceGEER/ForceClassic on reimport would read as a renderer bug.
+	if (bGeerMarker && Asset->GeerMode == EGaussianSplatGeerMode::Unset)
+	{
+		Asset->GeerMode = EGaussianSplatGeerMode::ForceGEER;
+		UE_LOG(LogTemp, Log, TEXT("GaussianSplatAssetFactory: PLY carries a 3dgeer marker - defaulting GeerMode to ForceGEER"));
+	}
 
 	// Initialize asset from splat data (NO cluster building - user enables Nanite via Asset Actions)
 	SlowTask.EnterProgressFrame(55.0f, FText::FromString(TEXT("Compressing splat data...")));

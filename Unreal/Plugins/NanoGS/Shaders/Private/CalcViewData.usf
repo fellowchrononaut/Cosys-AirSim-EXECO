@@ -41,6 +41,9 @@ uint SHBufferCoeffs;   // Coefficients actually stored per splat in SHBuffer (ba
 uint UseSHRendering;   // 1 = use view-dependent SH evaluation, 0 = use pre-computed DC color
 float OpacityScale;
 float SplatScale;
+float QuadInflation;   // GEER: multiply EWA quad axes (footprint only); 1.0 = off
+uint  UseGeerEval;     // 1 = fill W2O rows / AA opacity (ViewDistance is always filled)
+float GeerNearCull;    // GEER: cull splats nearer than this view-space z (cm); 0 = off
 uint GlobalBaseOffset; // Offset into global ViewDataBuffer (for multi-proxy global accumulator, non-compaction path)
 
 // Global compaction path: read per-proxy base offset from GPU prefix-sum buffer
@@ -80,6 +83,12 @@ void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
 	viewData.Padding = lodLevel;
 	viewData.SplatNormal = float3(0, 0, 0);
 	viewData.SplatNormalConfidence = 0;
+	viewData.W2ORow0 = float3(0, 0, 0);
+	viewData.ViewDistance = 0;
+	viewData.W2ORow1 = float3(0, 0, 0);
+	viewData.W2OPad1 = 0;
+	viewData.W2ORow2 = float3(0, 0, 0);
+	viewData.W2OPad2 = 0;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 
@@ -113,6 +122,18 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// Transform to view space
 	float4 viewPos = mul(worldPos, WorldToView);
 
+	// GEER near cull (gs.GeerNearCull), mirroring the reference's in_frustum near_threshold
+	// (auxiliary.h, default 0.2 m). A splat this close degenerates under peak-density
+	// evaluation: p -> 0 makes |d_obj x p_obj| -> 0, so power -> 0 across the WHOLE quad and
+	// the splat renders at full opacity everywhere. The reference drops these rather than
+	// shading them. GEER splats only — the classic EWA path is bit-identical without this,
+	// because its falloff is in quad-local coords and decays regardless of proximity.
+	if (UseGeerEval != 0 && GeerNearCull > 0.0 && viewPos.z <= GeerNearCull)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
 	// Clamp view position to prevent extreme projections at edge of view
 	float tanFovX = (ScreenSize.x * 0.5) / FocalLength.x;
 	float tanFovY = (ScreenSize.y * 0.5) / FocalLength.y;
@@ -136,6 +157,37 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		splatNormal = -splatNormal;
 	}
 	float splatNormalConfidence = CalcSplatNormalConfidence(scale);
+
+	// --- GEER exact ray evaluation (gs.GeerEval) ---
+	// Euclidean sort key: always filled so CalcDistances can sort by it in both modes.
+	float viewDistance = length(worldPos.xyz - CameraPosition);
+	// World-space canonical transform w2o (forward.cu:888-890). The GEER density
+	// |d_obj x p_obj|^2 / |d_obj|^2 is invariant under rigid transforms + uniform
+	// scale, so evaluating in UE world space (cm) is exact as long as the actor
+	// scale is uniform (warned C++-side; non-uniform scale is unsupported).
+	float3 w2oRow0 = 0, w2oRow1 = 0, w2oRow2 = 0;
+	if (UseGeerEval)
+	{
+		float3x3 R = QuatToMatrix(rotation);
+		// Actor uniform scale factor: length of any rotated unit vector.
+		float actorScale = length(mul(float3(1, 0, 0), localToWorldRot));
+		// h_var = 1e-7 m^2 (GEER omni_hvar, forward.cu:154-170) = 1e-3 cm^2 in UE units.
+		// Also regularizes packed 8-bit scales that decode to exactly 0.
+		const float H_VAR = 1e-3;
+		float3 sw = scale * actorScale;                       // world sigma per axis (cm)
+		float3 sigmaEff = sqrt(sw * sw + H_VAR);
+		// Splat local axis j is COLUMN j of R (see CalcSplatLocalNormal).
+		float3 ax0 = normalize(mul(float3(R[0][0], R[1][0], R[2][0]), localToWorldRot));
+		float3 ax1 = normalize(mul(float3(R[0][1], R[1][1], R[2][1]), localToWorldRot));
+		float3 ax2 = normalize(mul(float3(R[0][2], R[1][2], R[2][2]), localToWorldRot));
+		w2oRow0 = ax0 / sigmaEff.x;
+		w2oRow1 = ax1 / sigmaEff.y;
+		w2oRow2 = ax2 / sigmaEff.z;
+		// GEER antialiasing opacity scaling (forward.cu omni_hvar): ~1 except thin splats.
+		// Must happen before opacity is packed into PackedColorBA below.
+		opacity *= (sw.x * sw.y * sw.z) / (sigmaEff.x * sigmaEff.y * sigmaEff.z);
+	}
+
 	float3x3 viewMat = (float3x3)WorldToView;
 	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
 
@@ -146,6 +198,11 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// Convert to NDC
 	axis1 = axis1 / ScreenSize * 4.0;
 	axis2 = axis2 / ScreenSize * 4.0;
+
+	// GEER: quad edge is currently ~2.83σ (exp(-4) cutoff). GEER integrates to 3σ and the
+	// EWA footprint itself is approximate — inflate to stay conservative (gs.GeerQuadInflation).
+	axis1 *= QuadInflation;
+	axis2 *= QuadInflation;
 
 	// Safety clamp
 	float maxAxisSize = 2.0;
@@ -233,6 +290,12 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	viewData.Padding = selectedLODLevel;
 	viewData.SplatNormal = splatNormal;
 	viewData.SplatNormalConfidence = splatNormalConfidence;
+	viewData.W2ORow0 = w2oRow0;
+	viewData.ViewDistance = viewDistance;
+	viewData.W2ORow1 = w2oRow1;
+	viewData.W2OPad1 = 0;
+	viewData.W2ORow2 = w2oRow2;
+	viewData.W2OPad2 = 0;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 

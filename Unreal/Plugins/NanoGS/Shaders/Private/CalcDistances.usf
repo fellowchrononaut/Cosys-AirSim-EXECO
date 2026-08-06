@@ -10,6 +10,7 @@ StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
 RWStructuredBuffer<uint> DistanceBuffer;
 RWStructuredBuffer<uint> KeyBuffer;
 uint SplatCount;
+uint UseGeerSort;   // 1 = Euclidean-distance sort key (any GEER asset visible), 0 = legacy clip z/w
 
 #ifndef THREADGROUP_SIZE
 #define THREADGROUP_SIZE 256
@@ -35,18 +36,31 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
-	// Calculate depth (Z/W for perspective, normalized to [0,1])
-	float depth = clipPos.z / clipPos.w;
+	if (UseGeerSort)
+	{
+		// GEER sorts by Euclidean camera->splat distance (forward.cu depths[]), not z.
+		// This also makes the order identical across cube faces sharing an origin,
+		// which is what makes cubemap-based fisheye/ERP capture seam-free (Phase 3).
+		// Distance is >= 0, so asuint() is already monotonic; bitwise NOT makes
+		// ascending radix order = descending distance = back-to-front.
+		float dist = ViewDataBuffer[splatIndex].ViewDistance;
+		DistanceBuffer[splatIndex] = ~asuint(dist);
+	}
+	else
+	{
+		// Calculate depth (Z/W for perspective, normalized to [0,1])
+		float depth = clipPos.z / clipPos.w;
 
-	// Convert to sortable uint for back-to-front sorting
-	// UE uses reversed-Z: near=1, far=0. So ascending sort of depth values
-	// naturally gives back-to-front order (far/small values first, near/large values last).
-	uint depthBits = asuint(depth);
+		// Convert to sortable uint for back-to-front sorting
+		// UE uses reversed-Z: near=1, far=0. So ascending sort of depth values
+		// naturally gives back-to-front order (far/small values first, near/large values last).
+		uint depthBits = asuint(depth);
 
-	// Flip sign bit for proper float-to-sortable-uint conversion
-	// This ensures correct ordering for both positive and negative floats
-	depthBits ^= (-(int)(depthBits >> 31)) | 0x80000000;
+		// Flip sign bit for proper float-to-sortable-uint conversion
+		// This ensures correct ordering for both positive and negative floats
+		depthBits ^= (-(int)(depthBits >> 31)) | 0x80000000;
 
-	DistanceBuffer[splatIndex] = depthBits;
+		DistanceBuffer[splatIndex] = depthBits;
+	}
 	KeyBuffer[splatIndex] = splatIndex;
 }
