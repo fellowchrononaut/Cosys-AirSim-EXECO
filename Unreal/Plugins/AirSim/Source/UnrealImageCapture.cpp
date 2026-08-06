@@ -102,24 +102,48 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
         if (requests[i].image_type == ImageCaptureBase::ImageType::Segmentation || requests[i].image_type == ImageCaptureBase::ImageType::Annotation)disable_gamma = true;
         auto params = std::make_shared<RenderRequest::RenderParams>(capture, textureTarget, requests[i].pixels_as_float, requests[i].compress, disable_gamma);
 
-        //Generic (non-pinhole) camera - Phase 3b step 4. Everything below is skipped by the
-        //first condition for every camera that has no CameraModel block, which leaves params
-        //exactly the object this line used to push: two empty TArrays and a null raymap, which
-        //RenderRequest reads as "pinhole, behave as before".
+        //Generic (non-pinhole) camera - Phase 3b step 4, extended to the other modalities in
+        //step 5. Everything below is skipped by the hasCameraModel() test for every camera that
+        //has no CameraModel block, which leaves params exactly the object this line used to push:
+        //two empty TArrays, a null raymap and mode 0, which RenderRequest reads as "pinhole,
+        //behave as before".
         //
-        //Scene only in step 4, deliberately. Design section 5: Segmentation and Annotation are ID
-        //buffers that must be sampled nearest, depth must be converted to range along the ray
-        //BEFORE it is filtered because per-face planar depth is measured against that face's own
-        //axis, and optical flow cannot be resampled at all. Bilinear on any of those produces a
-        //buffer that looks right and is wrong. Those are step 5. Until then a non-Scene request
-        //on a generic camera returns the ordinary pinhole render, which is honest: it is what
-        //that ImageType has always returned, not a silently mis-filtered fisheye.
+        //Which ImageTypes go through the cube path, and how each is filtered, is
+        //AirSimCubeResampleModeForImageType and nowhere else - see the table in CubeResample.cpp
+        //for every row and its reason. Unsupported here means what it meant in step 4: fall
+        //through to the ordinary pinhole render. It is honest rather than empty - it is what that
+        //ImageType has always returned, not a silently mis-filtered fisheye - and it is why
+        //optical flow, disparity and DepthVis are still on the pinhole path.
+        const EAirSimCubeResampleMode resample_mode =
+            AirSimCubeResampleModeForImageType(static_cast<int32>(requests[i].image_type));
+
+        //The mode table indexes AirLib's ImageType BY VALUE, in a header that deliberately does
+        //not include AirLib. Anchor both ends of that so a reordered enum is a compile error and
+        //not four silently mis-filtered modalities.
+        static_assert(static_cast<int>(ImageType::Scene) == 0 &&
+                          static_cast<int>(ImageType::Segmentation) == 5 &&
+                          static_cast<int>(ImageType::Annotation) == 11 &&
+                          static_cast<int>(ImageType::Count) == 12,
+                      "AirSimCubeResampleModeForImageType's table is keyed on these values");
+
         if (capture != nullptr && textureTarget != nullptr && camera->hasCameraModel() &&
-            requests[i].image_type == ImageType::Scene) {
+            resample_mode != EAirSimCubeResampleMode::Unsupported) {
+
+            //The raymap is ONE RAY PER OUTPUT PIXEL, and buildRaymapResource already refuses any
+            //camera whose CameraModel resolution differs from its Scene CaptureSettings - so the
+            //Scene target's size IS the raymap's size. An ImageType with its own, different
+            //CaptureSettings would resample the top-left CORNER of the raymap into a smaller
+            //image and look entirely plausible, and since CaptureSetting defaults to 256x144 that
+            //is the normal case for a settings.json that only sizes Scene. Fall back to the
+            //pinhole render instead, which is exactly what an Unsupported type does.
+            UTextureRenderTarget2D* scene_target = camera->getRenderTarget(ImageType::Scene, false);
+            const bool size_matches = scene_target != nullptr &&
+                                      textureTarget->SizeX == scene_target->SizeX &&
+                                      textureTarget->SizeY == scene_target->SizeY;
 
             const FAirSimRaymapResourcePtr& raymap = camera->getRaymapResource();
             const int face_count = camera->getCubeFaceCount();
-            if (raymap.IsValid() && face_count > 0) {
+            if (size_matches && raymap.IsValid() && face_count > 0) {
                 TArray<USceneCaptureComponent2D*> face_components;
                 TArray<UTextureRenderTarget2D*> face_targets;
                 face_components.Reserve(face_count);
@@ -142,6 +166,7 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
                     params->face_components = MoveTemp(face_components);
                     params->face_targets = MoveTemp(face_targets);
                     params->raymap = raymap;
+                    params->resample_mode = static_cast<int32>(resample_mode);
                 }
             }
         }

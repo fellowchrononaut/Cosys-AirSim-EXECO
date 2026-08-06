@@ -26,6 +26,29 @@ class FRHICommandListImmediate;
 // Shaders/Private/CubeResample.usf.
 static constexpr int32 kAirSimCubeResampleMaxFaces = 6;
 
+// How one ImageType is resampled - Phase 3b step 5.
+//
+// Each value is a SHADER PERMUTATION (RESAMPLE_MODE in CubeResample.usf), not a uniform branch,
+// so a mode costs no registers in the modes that do not use it and Scene's generated code is the
+// step 4 code unchanged. Order matters: the permutation index is (mode - 1), asserted in
+// CubeResample.cpp.
+enum class EAirSimCubeResampleMode : uint8
+{
+    Unsupported = 0, //falls through to the ordinary pinhole render, exactly as before step 5
+    Bilinear,        //colour buffers
+    Nearest,         //ID buffers - interpolating an ID invents one
+    DepthRange,      //range along the ray, 4-tap with edge rejection
+    Normals,         //decode, filter, renormalise
+};
+
+// THE single source of truth for which ImageTypes go through the cube path and how.
+//
+// image_type is msr::airlib::ImageCaptureBase::ImageType's underlying int. This header does not
+// include AirLib - the caller converts - so that RenderRequest.h stays cheap, and so that
+// CubeResample is the ONLY file that knows the mapping. UnrealImageCapture gates on
+// != Unsupported; there is no second copy of the rule anywhere.
+EAirSimCubeResampleMode AirSimCubeResampleModeForImageType(int32 image_type);
+
 // One camera's raymap on the GPU.
 //
 // FORMAT: a structured buffer of float, stride 4 bytes, SIX consecutive floats per texel, laid
@@ -72,4 +95,5 @@ bool AirSimCubeResampleEnabled();
 bool AirSimCubeResample_RenderThread(FRHICommandListImmediate& cmd_list,
                                      FRHITexture* const* face_textures, int32 face_count,
                                      FRHITexture* output_texture,
-                                     const FAirSimRaymapResource& raymap);
+                                     const FAirSimRaymapResource& raymap,
+                                     EAirSimCubeResampleMode mode);

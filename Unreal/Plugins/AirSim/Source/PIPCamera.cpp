@@ -1360,6 +1360,30 @@ void APIPCamera::ensureFaceRig(const ImageType type)
         capture->PostProcessSettings = parent->PostProcessSettings; //carries the blendables, so depth and segmentation materials come with it
         capture->PostProcessBlendWeight = parent->PostProcessBlendWeight;
 
+        //Phase 3b step 5, design section 5 O3: NON-PINHOLE DEPTH IS RANGE ALONG THE RAY.
+        //
+        //DepthPlanar has no meaning without an image plane, and per-face planar depth is measured
+        //against THAT FACE's axis, so values from two faces are not comparable and interpolating
+        //them across a boundary is meaningless. Range is: all six faces share one origin (the
+        //SetRelativeLocation(FVector::ZeroVector) above), so range is a single continuous
+        //function of direction over the whole sphere.
+        //
+        //DepthPerspectiveMaterial already emits exactly that - it is VectorLength of the
+        //camera-relative world position - so the correction is not a shader conversion at all,
+        //it is giving the DepthPlanar FACES the perspective material. No asset load, no new
+        //material, and both depth types then return range, which is what O3 resolved they should.
+        //
+        //This is a copy onto components that exist only for a camera with a CameraModel block:
+        //captures_[DepthPlanar] - every ordinary pinhole camera in AirSim - is untouched, and so
+        //is the parent's own struct. It does replace this face's distortion and noise blendables
+        //with DepthPerspective's, which are the same materials configured the same way for the
+        //same camera.
+        if (type == ImageType::DepthPlanar) {
+            USceneCaptureComponent2D* perspective = captures_[Utils::toNumeric(ImageType::DepthPerspective)];
+            if (perspective != nullptr)
+                capture->PostProcessSettings.WeightedBlendables = perspective->PostProcessSettings.WeightedBlendables;
+        }
+
         //C3, measured 2026-08-05: kill the screen-space lens effects on the FACE captures only.
         //Each of these is computed per view, radially about ITS OWN frame centre, so a 90-degree
         //cube face applies a full lens vignette inside what is really one patch of a wider image -

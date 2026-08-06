@@ -624,7 +624,8 @@ void RenderRequest::executeCubeResample()
         if (cmd_list == nullptr)
             cmd_list = &GetImmediateCommandList_ForRenderCommand();
 
-        AirSimCubeResample_RenderThread(*cmd_list, face_textures, face_count, output_texture, *params->raymap);
+        AirSimCubeResample_RenderThread(*cmd_list, face_textures, face_count, output_texture, *params->raymap,
+                                        static_cast<EAirSimCubeResampleMode>(params->resample_mode));
     }
 }
 

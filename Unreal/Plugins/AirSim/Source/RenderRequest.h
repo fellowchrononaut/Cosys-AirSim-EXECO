@@ -44,6 +44,15 @@ public:
         TArray<UTextureRenderTarget2D*> face_targets;
         FAirSimRaymapResourcePtr raymap;
 
+        // Which filter the resample pass runs - an EAirSimCubeResampleMode, carried as an int so
+        // that this stays a plain forwarded value. Phase 3b step 5.
+        //
+        // The MODE and not the ImageType: RenderRequest has no business knowing AirLib's enum,
+        // and CubeResample stays the only file that maps one to the other. Zero is Unsupported,
+        // which is also what every pinhole request leaves it at - and a pinhole request never
+        // reaches the pass anyway, because face_targets is empty.
+        int32 resample_mode = 0;
+
         RenderParams(USceneCaptureComponent2D * render_component_val, UTextureRenderTarget2D* render_target_val, bool pixels_as_float_val, bool compress_val, bool disable_gamma_val)
             : render_component(render_component_val), render_target(render_target_val), pixels_as_float(pixels_as_float_val), compress(compress_val), disable_gamma(disable_gamma_val)
         {

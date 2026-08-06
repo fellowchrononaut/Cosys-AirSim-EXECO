@@ -33,7 +33,31 @@
 // This shader therefore skips the ORIGIN FETCH, which is exactly the optimisation ADR-001
 // permits. It does not change the stored format: the origin channels are there, unread.
 
+// PER-MODALITY FILTERING - Phase 3b step 5.
+//
+// RESAMPLE_MODE is a shader PERMUTATION, set from EAirSimCubeResampleMode in CubeResample.cpp
+// (mode - 1). It is not a uniform, and that is deliberate: every line step 5 added is excluded by
+// the preprocessor in mode 0, so the Scene shader that step 4 shipped is compiled from exactly
+// the tokens it was compiled from then. If you add a mode, add it here AND to the mode table in
+// CubeResample.cpp - there is no third place.
+//
+//   0 Bilinear   colour. Hardware bilinear, one SampleLevel. Scene, Lighting.
+//   1 Nearest    ID buffers. Point sampler, one SampleLevel; interpolating an ID invents one.
+//   2 DepthRange range along the ray, 4 point taps with edge rejection.
+//   3 Normals    decode, blend, RENORMALISE, re-encode.
+
 #include "/Engine/Public/Platform.ush"
+
+#define AIRSIM_RESAMPLE_BILINEAR 0
+#define AIRSIM_RESAMPLE_NEAREST  1
+#define AIRSIM_RESAMPLE_DEPTH    2
+#define AIRSIM_RESAMPLE_NORMALS  3
+
+// The C++ side always sets this. The fallback keeps the file readable stand-alone and makes the
+// default the mode whose output must not change.
+#ifndef RESAMPLE_MODE
+#define RESAMPLE_MODE AIRSIM_RESAMPLE_BILINEAR
+#endif
 
 StructuredBuffer<float> Raymap;
 
@@ -48,6 +72,22 @@ SamplerState FaceSampler;
 int2 RaymapSize;
 uint FaceCount;
 
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_DEPTH || RESAMPLE_MODE == AIRSIM_RESAMPLE_NORMALS
+// Square, and the same for every face - APIPCamera::ensureFaceRig builds them that way. Needed
+// because these modes take their four taps by hand instead of asking the sampler for them.
+int2 FaceSize;
+#endif
+
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_DEPTH
+uint DepthPlanarToRange;
+uint DepthFilterMode;   // 0 nearest, 1 blend, 2 the rule below
+float DepthEdgeRatio;
+#endif
+
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_NORMALS
+uint NormalsFaceSpace;
+#endif
+
 float4 SampleCubeFace(uint Face, float2 UV)
 {
     // A dynamic index into a texture array is not portable; a switch over six bindings is.
@@ -61,6 +101,72 @@ float4 SampleCubeFace(uint Face, float2 UV)
     default: return FaceTexture5.SampleLevel(FaceSampler, UV, 0);
     }
 }
+
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_DEPTH || RESAMPLE_MODE == AIRSIM_RESAMPLE_NORMALS
+
+// The four texels a bilinear tap would have used, fetched individually with the POINT sampler,
+// plus the bilinear weights and each tap's own face coordinates.
+//
+// Taking the taps by hand is the whole point of these two modes: both have to look at the four
+// values and decide what to do with them, which a hardware bilinear tap does not let you do.
+//
+// TapAB is exact rather than approximate. A face is a 90 degree pinhole render on a square
+// target, so its texel centres are at a = 2u - 1, b = 1 - 2v for the tap's own (u, v) - the
+// inverse of the UV mapping MainPS applies below. That is the (a, b) the planar-to-range
+// conversion needs, per tap and not per pixel.
+//
+// Nearest is returned as a second SET OF WEIGHTS - one-hot on the tap whose texel centre is
+// closest - rather than as an index, so that "blend" and "nearest" are the same expression with
+// different weights. No dynamic indexing into a local array, and no divergent branch.
+void GatherCubeFaceTaps(uint Face, float2 UV, out float4 Tap[4], out float2 TapAB[4],
+                        out float4 Weight, out float4 Nearest)
+{
+    float2 Size = float2(FaceSize);
+    float2 Continuous = UV * Size - 0.5f;
+    float2 Corner = floor(Continuous);
+    float2 Frac = Continuous - Corner;
+
+    Weight = float4((1.0f - Frac.x) * (1.0f - Frac.y),
+                    Frac.x * (1.0f - Frac.y),
+                    (1.0f - Frac.x) * Frac.y,
+                    Frac.x * Frac.y);
+
+    // step(0.5, Frac) is 1 on the axis where the far texel is the closer one, which is exactly
+    // the texel SF_Point would have picked for this UV.
+    float2 Pick = step(0.5f, Frac);
+    Nearest = float4((1.0f - Pick.x) * (1.0f - Pick.y),
+                     Pick.x * (1.0f - Pick.y),
+                     (1.0f - Pick.x) * Pick.y,
+                     Pick.x * Pick.y);
+
+    UNROLL
+    for (int i = 0; i < 4; ++i)
+    {
+        float2 Index = clamp(Corner + float2((float)(i & 1), (float)(i >> 1)),
+                             float2(0.0f, 0.0f), Size - 1.0f);
+        float2 Centre = (Index + 0.5f) / Size;
+        Tap[i] = SampleCubeFace(Face, Centre);
+        TapAB[i] = float2(2.0f * Centre.x - 1.0f, 1.0f - 2.0f * Centre.y);
+    }
+}
+
+#endif
+
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_NORMALS
+// The face table of the header, as a basis. Only reached under airsim.CubeResampleNormalsFrame 1.
+void GetCubeFaceBasis(uint Face, out float3 F, out float3 R, out float3 U)
+{
+    switch (Face)
+    {
+    case 0:  F = float3( 1, 0, 0); R = float3(0,  1, 0); U = float3( 0, 0,  1); break; // Front
+    case 1:  F = float3( 0, 1, 0); R = float3(-1, 0, 0); U = float3( 0, 0,  1); break; // Right
+    case 2:  F = float3( 0,-1, 0); R = float3(1,  0, 0); U = float3( 0, 0,  1); break; // Left
+    case 3:  F = float3( 0, 0, 1); R = float3(0,  1, 0); U = float3(-1, 0,  0); break; // Up
+    case 4:  F = float3( 0, 0,-1); R = float3(0,  1, 0); U = float3( 1, 0,  0); break; // Down
+    default: F = float3(-1, 0, 0); R = float3(0, -1, 0); U = float3( 0, 0,  1); break; // Back
+    }
+}
+#endif
 
 void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
 {
@@ -138,5 +244,92 @@ void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
     }
 
     float2 UV = float2(0.5f * (AB.x + 1.0f), 0.5f * (1.0f - AB.y));
+#if RESAMPLE_MODE == AIRSIM_RESAMPLE_BILINEAR || RESAMPLE_MODE == AIRSIM_RESAMPLE_NEAREST
     OutColor = SampleCubeFace(Face, UV);
+#elif RESAMPLE_MODE == AIRSIM_RESAMPLE_DEPTH
+
+    // DEPTH - design section 5 O3, step 5 section 3.3.
+    //
+    // The value is RANGE ALONG THE RAY, not planar depth: DepthPlanar has no meaning without an
+    // image plane, and all six faces share one origin, so range is the one quantity that is
+    // commensurable across a face boundary. It is also therefore CONTINUOUS across a boundary,
+    // which is what makes a seam here a bug rather than a property.
+    //
+    // Filtering is a 4-tap gather with EDGE REJECTION, not a plain bilinear. Bilinear across a
+    // silhouette returns a value that is in neither tap - a ramp of geometry hanging in space at
+    // every object edge, and it would be at every edge in the image, not an occasional artefact.
+    float4 Tap[4];
+    float2 TapAB[4];
+    float4 Weight;
+    float4 Nearest;
+    GatherCubeFaceTaps(Face, UV, Tap, TapAB, Weight, Nearest);
+
+    float3 Rgb[4];
+    float Range[4];
+    UNROLL
+    for (int i = 0; i < 4; ++i)
+    {
+        // 1 unless airsim.CubeResampleDepthPlanarToRange says the faces are planar, in which case
+        // each tap converts with ITS OWN (a, b) - the conversion is per tap and before the
+        // filtering, because values from different points on the face are not comparable until it
+        // has been applied.
+        float Scale = DepthPlanarToRange != 0u ? sqrt(1.0f + dot(TapAB[i], TapAB[i])) : 1.0f;
+        Rgb[i] = Tap[i].rgb * Scale;
+        Range[i] = Rgb[i].r;
+    }
+
+    float MinRange = min(min(Range[0], Range[1]), min(Range[2], Range[3]));
+    float MaxRange = max(max(Range[0], Range[1]), max(Range[2], Range[3]));
+
+    // The rule: the four taps are one surface while they agree to within DepthEdgeRatio. The
+    // positive-minimum guard stops a zero or negative tap - an out-of-domain or never-written
+    // texel - from making the ratio test pass trivially.
+    bool Agrees = MinRange > 0.0f && MaxRange <= MinRange * DepthEdgeRatio;
+    bool UseBlend = DepthFilterMode == 1u || (DepthFilterMode != 0u && Agrees);
+    float4 W = UseBlend ? Weight : Nearest;
+
+    float3 Blended = Rgb[0] * W.x + Rgb[1] * W.y + Rgb[2] * W.z + Rgb[3] * W.w;
+    // alpha carries no depth; blend it with the same weights so the pixel is whatever the pinhole
+    // path's pixel would have been in that channel
+    float Alpha = dot(float4(Tap[0].a, Tap[1].a, Tap[2].a, Tap[3].a), W);
+    OutColor = float4(Blended, Alpha);
+
+#else
+
+    // SURFACE NORMALS - step 5 section 3.4.
+    //
+    // NormalsMaterial reads PPI_WorldNormal, the GBuffer's WORLD-space normal, so every face
+    // encodes the same vector for the same surface and no rotation is needed. The rotation branch
+    // exists behind airsim.CubeResampleNormalsFrame for the case where the measurement disagrees.
+    //
+    // The only bug available on the world-space path is forgetting to renormalise: the mean of
+    // two unit vectors is not a unit vector, and the shortfall is largest exactly where the
+    // normal changes fastest.
+    float4 Tap[4];
+    float2 TapAB[4];
+    float4 Weight;
+    float4 Nearest;
+    GatherCubeFaceTaps(Face, UV, Tap, TapAB, Weight, Nearest);
+
+    float3 BasisF, BasisR, BasisU;
+    GetCubeFaceBasis(Face, BasisF, BasisR, BasisU);
+
+    float3 Sum = float3(0.0f, 0.0f, 0.0f);
+    UNROLL
+    for (int i = 0; i < 4; ++i)
+    {
+        float3 N = Tap[i].rgb * 2.0f - 1.0f;
+        if (NormalsFaceSpace != 0u)
+            N = N.x * BasisR + N.y * BasisU + N.z * BasisF;
+        Sum += Weight[i] * N;
+    }
+
+    float LengthSq = dot(Sum, Sum);
+    // A tap set that cancels exactly carries no direction at all; leave it at the encoding's
+    // zero rather than inventing an axis.
+    float3 Unit = LengthSq > 1e-12f ? Sum * rsqrt(LengthSq) : float3(0.0f, 0.0f, 0.0f);
+    float Alpha = dot(float4(Tap[0].a, Tap[1].a, Tap[2].a, Tap[3].a), Weight);
+    OutColor = float4(Unit * 0.5f + 0.5f, Alpha);
+
+#endif
 }
