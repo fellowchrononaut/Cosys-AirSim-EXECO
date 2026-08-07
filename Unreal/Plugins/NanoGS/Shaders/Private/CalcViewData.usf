@@ -43,6 +43,7 @@ float OpacityScale;
 float SplatScale;
 float QuadInflation;   // GEER: multiply EWA quad axes (footprint only); 1.0 = off
 uint  UseGeerEval;     // 1 = fill W2O rows / AA opacity (ViewDistance is always filled)
+uint  UseNativeGeer;   // 1 = full-output native raymap path; no pinhole projection/culling
 float GeerNearCull;    // GEER: cull splats nearer than this view-space z (cm); 0 = off
 uint  UseGeerPBF;      // 1 = replace the EWA quad with the exact PBF rect (gs.GeerPBF)
 float GeerPBFLambda;   // PBF bound radius in sigma (follows gs.GeerCutoff; 3.0 when it is off)
@@ -115,8 +116,9 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// TranslatedWorld = World + PreViewTranslation (matches UE convention)
 	float3 translatedWorldPos = worldPos.xyz + PreViewTranslation;
 
-	// Cull if behind camera
-	if (clipPos.w <= 0.0)
+	// Pinhole-only rejection. Native cameras may contain valid rays whose forward component is
+	// negative, so clip-W cannot participate in native candidate generation.
+	if (UseNativeGeer == 0 && clipPos.w <= 0.0)
 	{
 		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
 		return;
@@ -131,22 +133,14 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// the splat renders at full opacity everywhere. The reference drops these rather than
 	// shading them. GEER splats only — the classic EWA path is bit-identical without this,
 	// because its falloff is in quad-local coords and decays regardless of proximity.
-	if (UseGeerEval != 0 && GeerNearCull > 0.0 && viewPos.z <= GeerNearCull)
+	float nativeViewDistance = length(worldPos.xyz - CameraPosition);
+	if (UseGeerEval != 0 && GeerNearCull > 0.0 &&
+		((UseNativeGeer != 0 && nativeViewDistance <= GeerNearCull) ||
+		 (UseNativeGeer == 0 && viewPos.z <= GeerNearCull)))
 	{
 		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
 		return;
 	}
-
-	// Clamp view position to prevent extreme projections at edge of view
-	float tanFovX = (ScreenSize.x * 0.5) / FocalLength.x;
-	float tanFovY = (ScreenSize.y * 0.5) / FocalLength.y;
-	float limX = 1.3 * tanFovX;
-	float limY = 1.3 * tanFovY;
-	// The clamp below is an EWA-specific guard on the projection Jacobian. The PBF bound is exact
-	// off-axis and would be biased by a moved centre, so it uses the true view position.
-	float3 viewPosUnclamped = viewPos.xyz;
-	viewPos.x = clamp(viewPos.x / viewPos.z, -limX, limX) * viewPos.z;
-	viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
 
 	// Calculate covariance
 	float3x3 cov3D_local = CalcCovariance3D(rotation, scale);
@@ -166,7 +160,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 
 	// --- GEER exact ray evaluation (gs.GeerEval) ---
 	// Euclidean sort key: always filled so CalcDistances can sort by it in both modes.
-	float viewDistance = length(worldPos.xyz - CameraPosition);
+	float viewDistance = nativeViewDistance;
 	// World-space canonical transform w2o (forward.cu:888-890). The GEER density
 	// |d_obj x p_obj|^2 / |d_obj|^2 is invariant under rigid transforms + uniform
 	// scale, so evaluating in UE world space (cm) is exact as long as the actor
@@ -199,13 +193,46 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		}
 	}
 
+	float2 axis1 = float2(1.0, 0.0);
+	float2 axis2 = float2(0.0, 1.0);
+	float2 pbfNdcOffset = float2(0.0, 0.0);
+
+	if (UseNativeGeer != 0)
+	{
+		// Full-output-per-splat Gate-B1 representation. The VS ignores ClipPosition/Axis for
+		// placement, but a positive W keeps the common validity/sort machinery deterministic.
+		clipPos = float4(0.0, 0.0, 0.5, 1.0);
+		float3 cameraToCenter = worldPos.xyz - CameraPosition;
+		float3 centerObj = float3(dot(cameraToCenter, w2oRow0),
+			                         dot(cameraToCenter, w2oRow1),
+			                         dot(cameraToCenter, w2oRow2));
+		// Same lambda-sigma camera-inside rule as the PBF path. A centre that encloses the camera
+		// would otherwise paint the complete native output at near-peak opacity.
+		if (dot(centerObj, centerObj) <= GeerPBFLambda * GeerPBFLambda)
+		{
+			WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+			return;
+		}
+	}
+	else
+	{
+	// Clamp view position to prevent extreme projections at edge of view
+	float tanFovX = (ScreenSize.x * 0.5) / FocalLength.x;
+	float tanFovY = (ScreenSize.y * 0.5) / FocalLength.y;
+	float limX = 1.3 * tanFovX;
+	float limY = 1.3 * tanFovY;
+	// The clamp below is an EWA-specific guard on the projection Jacobian. The PBF bound is exact
+	// off-axis and would be biased by a moved centre, so it uses the true view position.
+	float3 viewPosUnclamped = viewPos.xyz;
+	viewPos.x = clamp(viewPos.x / viewPos.z, -limX, limX) * viewPos.z;
+	viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
+
 	float3x3 viewMat = (float3x3)WorldToView;
 	// View-space 3D covariance, shared by the EWA projection and the GEER PBF bound below.
 	float3x3 viewCov = CalcCovariance3DView(cov3D_world, viewMat);
 	float2x2 cov2D = CalcCovariance2D(viewCov, viewPos.xyz, FocalLength);
 
 	// Decompose to axes
-	float2 axis1, axis2;
 	DecomposeCovariance2D(cov2D, axis1, axis2);
 
 	// Convert to NDC
@@ -226,7 +253,6 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// arm-1 splat C fills 0.850 of its quad with straight edges, against ~0.79 for a Gaussian
 	// ellipse). PBF derives the bound from the 3D covariance instead, so the density falls off
 	// inside its own footprint. This CHANGES the image for those splats, and that is the fix.
-	float2 pbfNdcOffset = float2(0.0, 0.0);
 	bool bPBFRect = false;
 	if (UseGeerEval != 0 && UseGeerPBF != 0)
 	{
@@ -299,6 +325,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 			WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
 			return;
 		}
+	}
 	}
 
 	// Compute final color

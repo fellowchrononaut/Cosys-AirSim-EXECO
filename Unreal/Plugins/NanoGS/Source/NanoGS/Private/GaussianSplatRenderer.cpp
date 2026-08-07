@@ -32,8 +32,14 @@ extern TAutoConsoleVariable<int32> CVarGeerPBF;
 extern TAutoConsoleVariable<int32> CVarGeerSort;
 extern TAutoConsoleVariable<int32> CVarGeerAAOpacity;
 
-static FRHIDepthStencilState* GetGaussianSplatDepthStencilState(bool bWriteSplatDepth)
+static FRHIDepthStencilState* GetGaussianSplatDepthStencilState(bool bWriteSplatDepth, bool bNativeGeer = false)
 {
+	if (bNativeGeer)
+	{
+		// Gate B1 is splat-only and has no pinhole-compatible hardware depth. Exact-ray rejection
+		// happens in the PS, so neither scene-depth testing nor stencil/depth writes are meaningful.
+		return TStaticDepthStencilState<false, CF_Always>::GetRHI();
+	}
 	if (bWriteSplatDepth)
 	{
 		return TStaticDepthStencilState<
@@ -121,7 +127,10 @@ static void WarnOnceIfNonUniformScaleForGeer(const FMatrix& LocalToWorld)
 static void SetVelocityPSParameters(
 	FGaussianSplatPS::FParameters& PSParameters,
 	const FSceneView& View,
-	FGaussianGlobalAccumulator* Accumulator)
+	FGaussianGlobalAccumulator* Accumulator,
+	bool bNativeGeer = false,
+	FShaderResourceViewRHIRef NativeGeerRaymap = FShaderResourceViewRHIRef(),
+	FIntPoint NativeGeerRaymapSize = FIntPoint::ZeroValue)
 {
 	// Current frame data - use UN-JITTERED matrix to match CalcViewData's WorldToClip
 	FMatrix CurTranslatedVP = View.ViewMatrices.GetTranslatedViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix();
@@ -166,7 +175,7 @@ static void SetVelocityPSParameters(
 	const FIntRect ViewRect = ViewInfo.ViewRect;
 	// Global kill-switch only — per-splat GEER selection happens in the PS via the W2O rows,
 	// which CalcViewData zeroes for classic (non-GEER) assets.
-	PSParameters.UseGeerEval = (CVarGeerEval.GetValueOnRenderThread() != 0) ? 1u : 0u;
+	PSParameters.UseGeerEval = (bNativeGeer || CVarGeerEval.GetValueOnRenderThread() != 0) ? 1u : 0u;
 	PSParameters.InvViewMatrix = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
 	PSParameters.FocalLength = FVector2f(
@@ -183,6 +192,8 @@ static void SetVelocityPSParameters(
 	PSParameters.GeerDebugView = (uint32)FMath::Max(CVarGeerDebugView.GetValueOnRenderThread(), 0);
 	PSParameters.GeerResidualDebug = (uint32)FMath::Clamp(
 		CVarGeerResidualDebug.GetValueOnRenderThread(), 0, 5);
+	PSParameters.NativeGeerRaymap = NativeGeerRaymap;
+	PSParameters.NativeGeerRaymapSize = NativeGeerRaymapSize;
 }
 
 FGaussianSplatRenderer::FGaussianSplatRenderer()
@@ -308,6 +319,7 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.SplatScale = SplatScale;
 	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
+	Parameters.UseNativeGeer = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -670,8 +682,12 @@ void FGaussianSplatRenderer::DrawSplats(
 	// Legacy per-proxy path: no depth MRT, so use the default (OUTPUT_DEPTH=0) permutation.
 	FGaussianSplatPS::FPermutationDomain PSPermutation;
 	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(false);
+	PSPermutation.Set<FGaussianSplatPS::FOutputNormal>(false);
+	PSPermutation.Set<FGaussianSplatPS::FNativeGeer>(false);
 
-	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FGaussianSplatVS::FPermutationDomain VSPermutation;
+	VSPermutation.Set<FGaussianSplatVS::FNativeGeer>(false);
+	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), VSPermutation);
 	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
@@ -962,6 +978,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.SplatScale = SplatScale;
 	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
+	Parameters.UseNativeGeer = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1036,7 +1053,8 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	bool bUseLODRendering,
 	uint32 GlobalBaseOffset,
 	FGaussianGlobalAccumulator* GlobalAccumulator,
-	bool bGeerEval)
+	bool bGeerEval,
+	bool bNativeGeer)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataGlobal);
 
@@ -1068,7 +1086,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	Parameters.LODClusterSelectedBitmap = GPUResources->LODClusterSelectedBitmapSRV;
 	Parameters.SelectedClusterBuffer = GPUResources->SelectedClusterBufferSRV;
 
-	if (GPUResources->bHasClusterData)
+	if (!bNativeGeer && GPUResources->bHasClusterData)
 	{
 		Parameters.UseClusterCulling = 1;
 		Parameters.UseLODRendering = bUseLODRendering ? 1 : 0;
@@ -1121,6 +1139,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	Parameters.OpacityScale = OpacityScale;
 	Parameters.SplatScale = SplatScale;
 	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
+	Parameters.UseNativeGeer = bNativeGeer ? 1u : 0u;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1150,7 +1169,8 @@ void FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
 	FRHICommandListImmediate& RHICmdList,
 	FGaussianGlobalAccumulator* GlobalAccumulator,
 	int32 TotalSplatCount,
-	bool bUseGeerSort)
+	bool bUseGeerSort,
+	bool bForceGeerSort)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesGlobal);
 
@@ -1171,7 +1191,8 @@ void FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
 	Parameters.DistanceBuffer = GlobalAccumulator->GlobalSortDistanceBufferUAV;
 	Parameters.KeyBuffer = GlobalAccumulator->GlobalSortKeysBufferUAV;
 	Parameters.SplatCount = TotalSplatCount;
-	Parameters.UseGeerSort = (bUseGeerSort && CVarGeerSort.GetValueOnRenderThread() != 0) ? 1u : 0u;
+	Parameters.UseGeerSort = (bUseGeerSort &&
+		(bForceGeerSort || CVarGeerSort.GetValueOnRenderThread() != 0)) ? 1u : 0u;
 
 	const uint32 ThreadGroupSize = 256;
 	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)TotalSplatCount, ThreadGroupSize);
@@ -1324,7 +1345,10 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	bool bOutputNormal,
 	bool bUseNormalConfidenceFade,
 	FRHITexture* CompletedDepthAccumTexture,
-	float DepthProximitySigma)
+	float DepthProximitySigma,
+	bool bNativeGeer,
+	FShaderResourceViewRHIRef NativeGeerRaymap,
+	FIntPoint NativeGeerRaymapSize)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal);
 
@@ -1339,8 +1363,11 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	FGaussianSplatPS::FPermutationDomain PSPermutation;
 	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(bOutputDepth);
 	PSPermutation.Set<FGaussianSplatPS::FOutputNormal>(bOutputNormal);
+	PSPermutation.Set<FGaussianSplatPS::FNativeGeer>(bNativeGeer);
 
-	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FGaussianSplatVS::FPermutationDomain VSPermutation;
+	VSPermutation.Set<FGaussianSplatVS::FNativeGeer>(bNativeGeer);
+	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), VSPermutation);
 	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
@@ -1359,7 +1386,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	// fragments also update depth or only blend among themselves.
 	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
 	// reduces temporal history weight for splat pixels, preventing ghost trails
-	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState(bWriteSplatDepth);
+	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState(bWriteSplatDepth, bNativeGeer);
 	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
 	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
 	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.
@@ -1424,7 +1451,8 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
 
 	FGaussianSplatPS::FParameters PSParameters;
-	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator, bNativeGeer,
+		NativeGeerRaymap, NativeGeerRaymapSize);
 	PSParameters.UseNormalConfidenceFade = bUseNormalConfidenceFade ? 1u : 0u;
 	PSParameters.CompletedDepthAccumTexture = CompletedDepthAccumTexture ? CompletedDepthAccumTexture : GBlackTexture->TextureRHI.GetReference();
 	PSParameters.CompletedDepthAccumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
@@ -1629,6 +1657,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	Parameters.OpacityScale  = OpacityScale;
 	Parameters.SplatScale    = SplatScale;
 	Parameters.UseGeerEval   = bGeerEval ? 1u : 0u;
+	Parameters.UseNativeGeer = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1830,8 +1859,11 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	FGaussianSplatPS::FPermutationDomain PSPermutation;
 	PSPermutation.Set<FGaussianSplatPS::FOutputDepth>(bOutputDepth);
 	PSPermutation.Set<FGaussianSplatPS::FOutputNormal>(bOutputNormal);
+	PSPermutation.Set<FGaussianSplatPS::FNativeGeer>(false);
 
-	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FGaussianSplatVS::FPermutationDomain VSPermutation;
+	VSPermutation.Set<FGaussianSplatVS::FNativeGeer>(false);
+	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), VSPermutation);
 	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())

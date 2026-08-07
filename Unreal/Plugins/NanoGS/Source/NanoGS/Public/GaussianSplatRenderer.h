@@ -267,7 +267,8 @@ public:
 		bool bUseLODRendering,
 		uint32 GlobalBaseOffset,
 		FGaussianGlobalAccumulator* GlobalAccumulator,
-		bool bGeerEval = false
+		bool bGeerEval = false,
+		bool bNativeGeer = false
 	);
 
 	/**
@@ -278,7 +279,8 @@ public:
 		FRHICommandListImmediate& RHICmdList,
 		FGaussianGlobalAccumulator* GlobalAccumulator,
 		int32 TotalSplatCount,
-		bool bUseGeerSort = false
+		bool bUseGeerSort = false,
+		bool bForceGeerSort = false
 	);
 
 	/**
@@ -306,7 +308,10 @@ public:
 		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
 		bool bUseNormalConfidenceFade = true, // GeometryMode 2: weight NormalAccum by per-splat confidence
 		FRHITexture* CompletedDepthAccumTexture = nullptr, // 2nd-pass only: resolved depth-accum SRV for depth-proximity weighting
-		float DepthProximitySigma = 0.05f                  // depth-similarity sigma as a fraction of view depth
+		float DepthProximitySigma = 0.05f,                 // depth-similarity sigma as a fraction of view depth
+		bool bNativeGeer = false,
+		FShaderResourceViewRHIRef NativeGeerRaymap = FShaderResourceViewRHIRef(),
+		FIntPoint NativeGeerRaymapSize = FIntPoint::ZeroValue
 	);
 
 	//----------------------------------------------------------------------

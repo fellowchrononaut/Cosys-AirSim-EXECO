@@ -345,6 +345,8 @@ public:
 	 *  no knob at all when it is the thing you are bisecting with. */
 	bool CachedGeerSort = false;
 	bool CachedGeerAAOpacity = false;
+	/** Backend is part of view-data identity: native data deliberately contains no pinhole projection. */
+	bool CachedNativeGeer = false;
 	bool bHasCachedSortData = false;
 };
 

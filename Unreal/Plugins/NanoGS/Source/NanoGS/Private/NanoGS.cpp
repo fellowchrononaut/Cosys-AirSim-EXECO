@@ -30,6 +30,8 @@ namespace
 	//Gate-A instrumentation is bounded to one line per registry generation even when a capture
 	//component renders continuously. Mutated only by the render-thread callback below.
 	TSet<uint64> GNanoGSLoggedNativeGeerRegistrations;
+	TSet<uint64> GNanoGSLoggedNativeGeerRefusals;
+	TSet<uint64> GNanoGSLoggedNativeGeerActive;
 }
 
 // Pass 2 parameter struct: declares IntermediateTexture, DepthAccumTexture, and CustomDepthTexture
@@ -695,21 +697,37 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 	FRDGBuilder& GraphBuilder = *Parameters.GraphBuilder;
 	const FSceneView* SceneView = reinterpret_cast<const FSceneView*>(Parameters.View);
+	FRDGTexture* ColorTexture = Parameters.ColorTexture;
+	if (!ColorTexture)
+	{
+		return;
+	}
 
 	FAirSimNativeGeerView NativeGeerView;
 	const FRenderTarget* FamilyRenderTarget = SceneView->Family != nullptr
 		? SceneView->Family->RenderTarget
 		: nullptr;
-	if (AirSimFindNativeGeerView_RenderThread(FamilyRenderTarget, NativeGeerView) &&
+	const bool bNativeGeerRegistered = AirSimFindNativeGeerView_RenderThread(FamilyRenderTarget, NativeGeerView);
+	const FIntPoint FamilyExtent = FamilyRenderTarget != nullptr
+		? FamilyRenderTarget->GetSizeXY()
+		: FIntPoint::ZeroValue;
+	const FIntPoint RenderViewExtent = static_cast<const FViewInfo&>(*SceneView).ViewRect.Size();
+	const bool bNativeDimensionsMatch = bNativeGeerRegistered &&
+		FamilyExtent == NativeGeerView.output_extent &&
+		SceneView->UnscaledViewRect.Size() == NativeGeerView.output_extent &&
+		RenderViewExtent == NativeGeerView.output_extent;
+	const bool bNativeRaymapReady = bNativeGeerRegistered && NativeGeerView.raymap.IsValid() &&
+		NativeGeerView.raymap->ready && NativeGeerView.raymap->srv.IsValid();
+	const bool bNativeRaymapDimensionsMatch = bNativeRaymapReady &&
+		NativeGeerView.raymap->width == static_cast<uint32>(NativeGeerView.output_extent.X) &&
+		NativeGeerView.raymap->height == static_cast<uint32>(NativeGeerView.output_extent.Y);
+	const bool bNativeGeerView = bNativeGeerRegistered && bNativeDimensionsMatch &&
+		bNativeRaymapDimensionsMatch && NativeGeerView.central && NativeGeerView.raymap->central;
+
+	if (bNativeGeerRegistered &&
 		!GNanoGSLoggedNativeGeerRegistrations.Contains(NativeGeerView.registration_serial))
 	{
 		GNanoGSLoggedNativeGeerRegistrations.Add(NativeGeerView.registration_serial);
-		const FIntPoint FamilyExtent = FamilyRenderTarget->GetSizeXY();
-		const bool bDimensionsMatch = FamilyExtent == NativeGeerView.output_extent;
-		const bool bRaymapReady = NativeGeerView.raymap.IsValid() && NativeGeerView.raymap->ready;
-		const bool bRaymapDimensionsMatch = bRaymapReady &&
-			NativeGeerView.raymap->width == static_cast<uint32>(NativeGeerView.output_extent.X) &&
-			NativeGeerView.raymap->height == static_cast<uint32>(NativeGeerView.output_extent.Y);
 
 		UE_LOG(LogTemp, Log,
 			TEXT("[NanoGS][NativeGEER][GateA] matched camera=%s target=%p serial=%llu ")
@@ -718,19 +736,34 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			static_cast<unsigned long long>(NativeGeerView.registration_serial),
 			NativeGeerView.output_extent.X, NativeGeerView.output_extent.Y,
 			FamilyExtent.X, FamilyExtent.Y,
-			SceneView->UnscaledViewRect.Width(), SceneView->UnscaledViewRect.Height(),
+			RenderViewExtent.X, RenderViewExtent.Y,
 			NativeGeerView.raymap.IsValid() ? NativeGeerView.raymap->width : 0,
 			NativeGeerView.raymap.IsValid() ? NativeGeerView.raymap->height : 0,
-			bRaymapReady ? TEXT("true") : TEXT("false"),
+			bNativeRaymapReady ? TEXT("true") : TEXT("false"),
 			NativeGeerView.central ? TEXT("true") : TEXT("false"),
-			(bDimensionsMatch && bRaymapDimensionsMatch) ? TEXT("OK") : TEXT("MISMATCH"));
-		if (!bDimensionsMatch || !bRaymapDimensionsMatch)
+			bNativeGeerView ? TEXT("OK") : TEXT("MISMATCH"));
+		if (!bNativeGeerView)
 		{
 			UE_LOG(LogTemp, Error,
 				TEXT("[NanoGS][NativeGEER][GateA] camera=%s matched the target identity but its ")
-				TEXT("output/raymap dimensions or readiness are invalid; native rendering must not proceed"),
+				TEXT("output/raymap dimensions, readiness, or centrality are invalid; native rendering will output black"),
 				*NativeGeerView.camera_name);
 		}
+	}
+
+	FShaderResourceViewRHIRef NativeGeerRaymap;
+	FIntPoint NativeGeerRaymapSize = FIntPoint::ZeroValue;
+	if (bNativeGeerRegistered)
+	{
+		// NativeGEER Scene is explicitly splat-only in 3c-1. Clear UE mesh/sky output before any
+		// possible early return so a bad configuration can never masquerade as a plausible fallback.
+		AddClearRenderTargetPass(GraphBuilder, ColorTexture, FLinearColor::Black);
+		if (!bNativeGeerView)
+		{
+			return;
+		}
+		NativeGeerRaymap = NativeGeerView.raymap->srv;
+		NativeGeerRaymapSize = NativeGeerView.output_extent;
 	}
 
 	TArray<FGaussianSplatSceneProxy*> Proxies;
@@ -753,19 +786,22 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		});
 	}
 
-	FRDGTexture* ColorTexture = Parameters.ColorTexture;
 	FRDGTexture* DepthTexture = Parameters.DepthTexture;
 	FRDGTexture* VelocityTexture = Parameters.VelocityTexture;
-	if (!ColorTexture)
-	{
-		return;
-	}
 
 	int32 DebugMode = CVarShowClusterBounds.GetValueOnRenderThread();
 
 	// Gather scene lights up front (render-thread access to Scene->Lights). Needed before Pass 1
 	// so we can decide whether to allocate + write the depth-accumulation MRT this frame.
 	FGaussianSceneLighting SceneLighting = GatherSceneLighting(SceneView);
+	if (bNativeGeerView)
+	{
+		// Gate B1 validates ray evaluation in isolation. The existing compositor reconstructs
+		// pinhole view-Z and is not a valid consumer until the later range/raymap gate.
+		SceneLighting.LightingBlend = 0.0f;
+		SceneLighting.DebugView = 0;
+		DebugMode = 0;
+	}
 
 	// Output the alpha-weighted depth MRT only when lighting actually needs it. RT2 requires RT1
 	// (velocity) to be bound contiguously, so we also require VelocityTexture. Debug viz disables it.
@@ -774,7 +810,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// use this MRT at all — skip allocating it.
 	const bool bWantsLighting = (SceneLighting.LightingBlend > 0.f) && (SceneLighting.NumLights > 0);
 	const bool bWantsDebugView = (SceneLighting.DebugView != 0);
-	const bool bLightingActive = (bWantsLighting || bWantsDebugView)
+	const bool bLightingActive = !bNativeGeerView && (bWantsLighting || bWantsDebugView)
 	                          && (VelocityTexture != nullptr)
 	                          && (DebugMode == 0);
 	const bool bOutputDepth = bLightingActive && (SceneLighting.GeometryMode == 0 || SceneLighting.GeometryMode == 2);
@@ -790,7 +826,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// already produced this frame (populated only if at least one primitive has "Render CustomDepth
 	// Pass" enabled). Null when unavailable — CompositeToSceneColor falls back to disabling lighting.
 	FRDGTexture* CustomDepthTexture = nullptr;
-	if (SceneLighting.GeometryMode == 1 && Parameters.SceneTexturesUniformParams)
+	if (!bNativeGeerView && SceneLighting.GeometryMode == 1 && Parameters.SceneTexturesUniformParams)
 	{
 		// SceneTexturesUniformParams is a raw TRDGUniformBuffer<FSceneTextureUniformParameters>*
 		// (see TRDGUniformBufferRef in RenderGraphFwd.h) — GetContents() reaches the actual
@@ -811,7 +847,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		if (!Proxy->IsShown(SceneView)) continue;
 
 		const FBoxSphereBounds& Bounds = Proxy->GetBounds();
-		if (!SceneView->ViewFrustum.IntersectBox(Bounds.Origin, Bounds.BoxExtent)) continue;
+		if (!bNativeGeerView && !SceneView->ViewFrustum.IntersectBox(Bounds.Origin, Bounds.BoxExtent)) continue;
 
 		FGaussianSplatGPUResources* GPUResources = Proxy->GetGPUResources();
 		if (!GPUResources || !GPUResources->IsValid()) continue;
@@ -826,8 +862,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	}
 
 	const int32 GeerDepthWriteMode = CVarGeerDepthWrite.GetValueOnRenderThread();
-	const bool bWriteSplatDepth = (GeerDepthWriteMode > 0) ||
-		(GeerDepthWriteMode < 0 && !bAnyGeerVisibleForDepth);
+	const bool bWriteSplatDepth = !bNativeGeerView && ((GeerDepthWriteMode > 0) ||
+		(GeerDepthWriteMode < 0 && !bAnyGeerVisibleForDepth));
 
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
@@ -893,7 +929,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	{
 		Pass1Parameters->RenderTargets[3] = FRenderTargetBinding(NormalAccumTexture, ERenderTargetLoadAction::EClear);
 	}
-	if (DepthTexture)
+	if (DepthTexture && !bNativeGeerView)
 	{
 		// Read-only mode still permits the depth test and stencil write; it removes only splat
 		// centre-depth writes so GEER splats cannot reject one another through hardware depth.
@@ -939,7 +975,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			if (!Proxy->IsShown(SceneView)) continue;
 
 			const FBoxSphereBounds& Bounds = Proxy->GetBounds();
-			if (!SceneView->ViewFrustum.IntersectBox(Bounds.Origin, Bounds.BoxExtent)) continue;
+			if (!bNativeGeerView && !SceneView->ViewFrustum.IntersectBox(Bounds.Origin, Bounds.BoxExtent)) continue;
 
 			FGaussianSplatGPUResources* GPUResources = Proxy->GetGPUResources();
 			if (!GPUResources || !GPUResources->IsValid()) continue;
@@ -948,12 +984,12 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			Info.Proxy = Proxy;
 			Info.LocalToWorld = Proxy->GetLocalToWorld();
 			Info.GlobalBaseOffset = 0;  // Will be computed after sorting
-			Info.bUseLODRendering = GPUResources->bEnableNanite && GPUResources->bHasLODSplats;
+			Info.bUseLODRendering = !bNativeGeerView && GPUResources->bEnableNanite && GPUResources->bHasLODSplats;
 			Info.DistanceToCamera = FVector::Dist(Bounds.Origin, CameraLocation);
 			VisibleProxies.Add(Info);
 
 			// All proxies must support Nanite compaction for the fast global path
-			if (!GPUResources->bEnableNanite || !GPUResources->bHasClusterData || !GPUResources->bSupportsCompaction)
+			if (bNativeGeerView || !GPUResources->bEnableNanite || !GPUResources->bHasClusterData || !GPUResources->bSupportsCompaction)
 			{
 				bAllNanite = false;
 			}
@@ -988,6 +1024,40 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			return;
 		}
 
+		// Gate B1 is intentionally brute-force and non-scalable. Refuse anything beyond the tiny
+		// analytic scene before allocating/drawing, and refuse any proxy that would take legacy EWA.
+		constexpr uint32 MaxNativeGeerGateB1Splats = 4;
+		bool bAllNativeProxiesUseGeer = true;
+		if (bNativeGeerView)
+		{
+			for (const FProxyRenderInfo& Info : VisibleProxies)
+			{
+				const bool bProxyGeer = (CurrentGeerMode == 2) ||
+					(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
+				bAllNativeProxiesUseGeer &= bProxyGeer;
+			}
+			if (TotalSplatCount > MaxNativeGeerGateB1Splats || !bAllNativeProxiesUseGeer)
+			{
+				if (!GNanoGSLoggedNativeGeerRefusals.Contains(NativeGeerView.registration_serial))
+				{
+					GNanoGSLoggedNativeGeerRefusals.Add(NativeGeerView.registration_serial);
+					UE_LOG(LogTemp, Error,
+						TEXT("[NanoGS][NativeGEER][GateB1] REFUSED camera=%s splats=%u cap=%u all_geer=%s; output remains black"),
+						*NativeGeerView.camera_name, TotalSplatCount, MaxNativeGeerGateB1Splats,
+						bAllNativeProxiesUseGeer ? TEXT("true") : TEXT("false"));
+				}
+				return;
+			}
+			if (!GNanoGSLoggedNativeGeerActive.Contains(NativeGeerView.registration_serial))
+			{
+				GNanoGSLoggedNativeGeerActive.Add(NativeGeerView.registration_serial);
+				UE_LOG(LogTemp, Log,
+					TEXT("[NanoGS][NativeGEER][GateB1] ACTIVE camera=%s splats=%u raymap=%dx%d full_output=true depth=false lighting=false velocity=zero"),
+					*NativeGeerView.camera_name, TotalSplatCount,
+					NativeGeerRaymapSize.X, NativeGeerRaymapSize.Y);
+			}
+		}
+
 		// Check camera-static skip: if nothing has changed, skip Phase 1+2 and reuse cached sort
 		// Use ProjectionNoAAMatrix to ignore TSR/TAA per-frame jitter that changes every frame
 		FMatrix CurrentVP = SceneView->ViewMatrices.GetViewMatrix() * SceneView->ViewMatrices.GetProjectionNoAAMatrix();
@@ -1003,7 +1073,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 		bool bCanSkip = GlobalAccumulator->bHasCachedSortData &&
 			GlobalAccumulator->CachedTotalSplatCount == TotalSplatCount &&
-			GlobalAccumulator->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f);
+			GlobalAccumulator->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f) &&
+			GlobalAccumulator->CachedNativeGeer == bNativeGeerView;
 
 		if (bCanSkip)
 		{
@@ -1023,7 +1094,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat())) ||
 					GPUResources->CachedGeerPBF != bCurrentGeerPBF ||
 					GPUResources->CachedGeerSort != bCurrentGeerSort ||
-					GPUResources->CachedGeerAAOpacity != bCurrentGeerAAOpacity)
+					GPUResources->CachedGeerAAOpacity != bCurrentGeerAAOpacity ||
+					GPUResources->CachedNativeGeer != bNativeGeerView)
 				{
 					bCanSkip = false;
 					break;
@@ -1050,6 +1122,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		{
 			MaxRenderBudget = 0;  // Unlimited — debug mode overrides budget
 		}
+		if (bNativeGeerView)
+		{
+			MaxRenderBudget = 0;  // Gate B1's explicit four-splat cap is the only native budget.
+		}
 
 		GraphBuilder.AddPass(
 			RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
@@ -1059,7 +1135,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
 			 CurrentDebugForceLODLevel, CurrentGeerMode, bCurrentGeerPBF, bCurrentGeerSort,
 			 bCurrentGeerAAOpacity, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
-			 bUseNormalConfidenceFade, bWriteSplatDepth](FRHICommandListImmediate& RHICmdList)
+			 bUseNormalConfidenceFade, bWriteSplatDepth, bNativeGeerView, NativeGeerRaymap,
+			 NativeGeerRaymapSize](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
@@ -1089,6 +1166,12 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				{
 					return;
 				}
+				if (bNativeGeerView && NewTotalSplatCount > 4u)
+				{
+					// Proxy mutation after graph construction must fail closed too. SceneColor was already
+					// cleared by the native pre-pass, so returning cannot expose a pinhole substitute.
+					return;
+				}
 
 				// Invalidate cache skip if the proxy list changed (some proxies were destroyed)
 				// This ensures we don't use stale cached data when the scene has changed
@@ -1110,7 +1193,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				RawAccumulator->ResizeIfNeeded(RHICmdList, NewTotalSplatCount);
 
 				// Re-check if all valid proxies support Nanite compaction
-				bool bAllValidNanite = true;
+				bool bAllValidNanite = !bNativeGeerView;
 				for (const auto& Info : ValidProxies)
 				{
 					FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
@@ -1245,6 +1328,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						RawAccumulator->bHasCachedSortData = true;
 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
+						RawAccumulator->CachedNativeGeer = false;
 
 						for (int32 i = 0; i < ValidProxies.Num(); i++)
 						{
@@ -1266,6 +1350,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								GPUResources->CachedGeerPBF = bCurrentGeerPBF;
 								GPUResources->CachedGeerSort = bCurrentGeerSort;
 								GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
+								GPUResources->CachedNativeGeer = false;
 								GPUResources->bHasCachedSortData = true;
 							}
 							else
@@ -1318,7 +1403,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							if (!GPUResources) continue;  // Extra safety check
 
 							// Cluster culling for Nanite-enabled proxies
-							if (GPUResources->bEnableNanite && GPUResources->bHasClusterData)
+							if (!bNativeGeerView && GPUResources->bEnableNanite && GPUResources->bHasClusterData)
 							{
 								FGaussianSplatRenderer::DispatchClusterCulling(
 									RHICmdList, *SceneView, GPUResources,
@@ -1341,19 +1426,23 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								Info.bUseLODRendering,
 								Info.GlobalBaseOffset,
 								RawAccumulator,
-								bProxyGeer);
+								bProxyGeer,
+								bNativeGeerView);
 						}
 
 						// --------------------------------------------------
 						// Phase 2: Single global CalcDistances + RadixSort
 						// --------------------------------------------------
-						FGaussianSplatRenderer::DispatchCalcDistancesGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount, bAnyGeerVisible);
+						FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
+							RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount,
+							bAnyGeerVisible, bNativeGeerView);
 						FGaussianSplatRenderer::DispatchRadixSortGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
 
 						// Update caches
 						RawAccumulator->bHasCachedSortData = true;
 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
+						RawAccumulator->CachedNativeGeer = bNativeGeerView;
 
 						for (const auto& Info : ValidProxies)
 						{
@@ -1372,6 +1461,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							GPUResources->CachedGeerPBF = bCurrentGeerPBF;
 							GPUResources->CachedGeerSort = bCurrentGeerSort;
 							GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
+							GPUResources->CachedNativeGeer = bNativeGeerView;
 							GPUResources->bHasCachedSortData = true;
 						}
 					}
@@ -1381,7 +1471,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						RHICmdList, *SceneView, RawAccumulator,
 						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode, bWriteSplatDepth,
 						bOutputDepth, bOutputNormal,
-						bUseNormalConfidenceFade);
+						bUseNormalConfidenceFade,
+						nullptr, 0.05f,
+						bNativeGeerView, NativeGeerRaymap, NativeGeerRaymapSize);
 				}
 			}
 		);
