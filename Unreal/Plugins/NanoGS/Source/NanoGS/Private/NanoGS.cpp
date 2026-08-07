@@ -1133,9 +1133,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			return;
 		}
 
-		// Gate B1 is intentionally brute-force and non-scalable. Refuse anything beyond the tiny
-		// analytic scene before allocating/drawing, and refuse any proxy that would take legacy EWA.
-		constexpr uint32 MaxNativeGeerGateB1Splats = 4;
+		// Bounded Gate-C candidate generation has passed its analytic coverage matrix, so NativeGEER
+		// can now accept complete GEER assets. A proxy that would take legacy EWA still fails closed:
+		// mixing projection contracts in one native output would produce plausible but invalid data.
 		bool bAllNativeProxiesUseGeer = true;
 		if (bNativeGeerView)
 		{
@@ -1145,15 +1145,14 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
 				bAllNativeProxiesUseGeer &= bProxyGeer;
 			}
-			if (TotalSplatCount > MaxNativeGeerGateB1Splats || !bAllNativeProxiesUseGeer)
+			if (!bAllNativeProxiesUseGeer)
 			{
 				if (!GNanoGSLoggedNativeGeerRefusals.Contains(NativeGeerView.registration_serial))
 				{
 					GNanoGSLoggedNativeGeerRefusals.Add(NativeGeerView.registration_serial);
 					UE_LOG(LogTemp, Error,
-						TEXT("[NanoGS][NativeGEER][GateB1] REFUSED camera=%s splats=%u cap=%u all_geer=%s; output remains black"),
-						*NativeGeerView.camera_name, TotalSplatCount, MaxNativeGeerGateB1Splats,
-						bAllNativeProxiesUseGeer ? TEXT("true") : TEXT("false"));
+						TEXT("[NanoGS][NativeGEER][GateB1] REFUSED camera=%s splats=%u all_geer=false; output remains black"),
+						*NativeGeerView.camera_name, TotalSplatCount);
 				}
 				return;
 			}
@@ -1243,7 +1242,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		}
 		if (bNativeGeerView)
 		{
-			MaxRenderBudget = 0;  // Gate B1's explicit four-splat cap is the only native budget.
+			// Native correctness requires the complete GEER set; classic LOD/budget truncation has not
+			// been admitted into the exact-ray output contract.
+			MaxRenderBudget = 0;
 		}
 
 		GraphBuilder.AddPass(
@@ -1287,13 +1288,6 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				{
 					return;
 				}
-				if (bNativeGeerView && NewTotalSplatCount > 4u)
-				{
-					// Proxy mutation after graph construction must fail closed too. SceneColor was already
-					// cleared by the native pre-pass, so returning cannot expose a pinhole substitute.
-					return;
-				}
-
 				// Invalidate cache skip if the proxy list changed (some proxies were destroyed)
 				// This ensures we don't use stale cached data when the scene has changed
 				bool bCanSkipAdjusted = bCanSkip;
