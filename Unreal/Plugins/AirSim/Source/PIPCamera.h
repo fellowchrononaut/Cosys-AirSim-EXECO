@@ -23,6 +23,8 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "PIPCamera.generated.h"
 
+class FRenderTarget;
+
 UCLASS()
 class AIRSIM_API APIPCamera : public ACineCameraActor //CinemAirSim
 {
@@ -81,7 +83,9 @@ public:
     bool GetAnnotationNameExist(std::string annotation_name);
     void updateAnnotation(TArray<TWeakObjectPtr<UPrimitiveComponent> >& ComponentList, FString annotation_name, bool only_hide = false);
     void addAnnotationCamera(FString name, FObjectAnnotator::AnnotatorType type, float max_view_distance = -1.0f);
-    void setupCameraFromSettings(const APIPCamera::CameraSetting& camera_setting, const NedTransform& ned_transform);
+    void setupCameraFromSettings(const APIPCamera::CameraSetting& camera_setting,
+                                 const NedTransform& ned_transform,
+                                 const std::string& configured_camera_name);
     void setCameraPose(const msr::airlib::Pose& relative_pose);
     void setCameraFoV(float fov_degrees);
     msr::airlib::CameraInfo getCameraInfo() const;
@@ -101,6 +105,7 @@ public:
     // component or render target is ever constructed. The face-orientation convention is stated
     // in full above getCubeFaceRotation() in PIPCamera.cpp - read it before consuming a face.
     bool hasCameraModel() const;
+    bool usesNativeGeerBackend() const;
     int getCubeFaceCount() const;
     int getCubeFaceResolution() const;
     static const TCHAR* getCubeFaceName(int face);
@@ -141,6 +146,10 @@ private: //members
     // UObjects. Stays null for a camera with no CameraModel block, so an ordinary camera pays
     // one null pointer.
     FAirSimRaymapResourcePtr raymap_;
+
+    // Identity only; never dereferenced after assignment. Registration/removal themselves are
+    // enqueued and the render-thread registry owns a shared reference to the raymap.
+    FRenderTarget* native_geer_registered_target_ = nullptr;
 
     // Phase 3b step 7 recommendations derived from the built raymap. Explicit settings still
     // win; these values serve only CameraModel Faces: Auto / CubeFaceResolution: 0.
@@ -188,6 +197,7 @@ private: //members
     FObjectFilter object_filter_;
 
     msr::airlib::AirSimSettings::CameraSetting sensor_params_;
+    FString configured_camera_name_;
 
     TArray<AActor*> ignore_actors_;
 private: //methods
@@ -204,6 +214,7 @@ private: //methods
     void ensureFaceRig(const ImageType type);
     void setFaceRigEnabled(const ImageType type, bool is_enabled);
     void buildRaymapResource();
+    void unregisterNativeGeerView();
     static void updateCaptureComponentSetting(USceneCaptureComponent2D* capture, UTextureRenderTarget2D* render_target,
                                               bool auto_format, const EPixelFormat& pixel_format, const CaptureSetting& setting, const NedTransform& ned_transform,
                                               bool force_linear_gamma);

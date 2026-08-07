@@ -3,6 +3,7 @@
 #include "Components/SceneCaptureComponent2D.h"
 #include "Camera/CameraComponent.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "TextureResource.h"
 #include "Engine/World.h"
 #include "ImageUtils.h"
 #include "Annotation/AnnotationComponent.h"
@@ -14,6 +15,7 @@
 #include "EngineUtils.h"
 #include "Engine/Engine.h"
 #include "cameras/Raymap.hpp"
+#include "NativeGeerViewRegistry.h"
 
 /** I-G diagnostic and candidate fix.
  *
@@ -392,6 +394,10 @@ void APIPCamera::Tick(float DeltaTime)
 
 void APIPCamera::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    //Queue removal while the Scene target identity and raymap are still available. The queued
+    //unregister executes before the queued raymap release below.
+    unregisterNativeGeerView();
+
     int image_count_to_delete = static_cast<int>(Utils::toNumeric(ImageType::Count));
     if (noise_materials_.Num()) {
         for (int image_type = 0; image_type < image_count_to_delete - 3; ++image_type) {
@@ -727,7 +733,9 @@ void APIPCamera::addAnnotationCamera(FString name, FObjectAnnotator::AnnotatorTy
     copyCameraSettingsToSceneCapture(camera_, captures_[render_index]);	
 }
 
-void APIPCamera::setupCameraFromSettings(const APIPCamera::CameraSetting& camera_setting, const NedTransform& ned_transform)
+void APIPCamera::setupCameraFromSettings(const APIPCamera::CameraSetting& camera_setting,
+                                        const NedTransform& ned_transform,
+                                        const std::string& configured_camera_name)
 {
     //TODO: should we be ignoring position and orientation settings here?
 
@@ -736,6 +744,7 @@ void APIPCamera::setupCameraFromSettings(const APIPCamera::CameraSetting& camera
     ned_transform_ = &ned_transform;
 
     sensor_params_ = camera_setting;
+    configured_camera_name_ = UTF8_TO_TCHAR(configured_camera_name.c_str());
 
     gimbal_stabilization_ = Utils::clip(camera_setting.gimbal.stabilization, 0.0f, 1.0f);
     if (gimbal_stabilization_ > 0) {
@@ -1141,8 +1150,11 @@ void APIPCamera::enableCaptureComponent(const APIPCamera::ImageType type, bool i
             }
         }
         //C2 / F5: the cube face rig follows camera_type_enabled_ exactly rather than inventing a
-        //second mechanism. Without a CameraModel block this is one bool test and returns.
-        setFaceRigEnabled(type, is_enabled);
+        //second mechanism. NativeGEER Scene is the one deliberate exception: it renders the
+        //ordinary output view so NanoGS can consume the output raymap and must neither allocate
+        //nor activate cube faces. Other native-camera modalities remain cube-backed for now.
+        if (!(usesNativeGeerBackend() && type == ImageType::Scene))
+            setFaceRigEnabled(type, is_enabled);
 
         if (type == ImageType::Annotation)
 			camera_type_enabled_[annotator_name_to_index_map_[FString(annotation_name.c_str())]] = is_enabled;
@@ -1237,6 +1249,13 @@ FRotator APIPCamera::getCubeFaceRotation(int face)
 bool APIPCamera::hasCameraModel() const
 {
     return sensor_params_.camera_model.enabled;
+}
+
+bool APIPCamera::usesNativeGeerBackend() const
+{
+    return sensor_params_.camera_model.enabled &&
+           sensor_params_.camera_model.render_backend ==
+               AirSimSettings::CameraModelSetting::RenderBackend::NativeGEER;
 }
 
 int APIPCamera::getCubeFaceCount() const
@@ -1538,6 +1557,7 @@ const FAirSimRaymapResourcePtr& APIPCamera::getRaymapResource() const
 void APIPCamera::buildRaymapResource()
 {
     //setupCameraFromSettings can run more than once for a camera; never leak the previous one
+    unregisterNativeGeerView();
     if (raymap_.IsValid())
         AirSimReleaseRaymap(raymap_);
     auto_cube_face_resolution_ = 0;
@@ -1600,15 +1620,45 @@ void APIPCamera::buildRaymapResource()
     raymap_ = AirSimCreateRaymapResource();
     AirSimUploadRaymap(raymap_, MoveTemp(values), map.width, map.height, map.central);
 
+    //Gate A registers ONLY the ordinary Scene output target of an explicitly selected native
+    //camera. Cube face targets and Cube-backend outputs never enter this registry. Upload and
+    //registration are enqueued in this order, so ready must be true when registration executes.
+    if (usesNativeGeerBackend()) {
+        if (!IsInGameThread()) {
+            UE_LOG(LogTemp, Error,
+                   TEXT("[AirSim][NativeGEER][GateA] %s configured off the game thread; ")
+                   TEXT("the native Scene output was not registered"), *GetName());
+        }
+        else {
+            UTextureRenderTarget2D* scene_target =
+                render_targets_[Utils::toNumeric(ImageType::Scene)];
+            FTextureRenderTargetResource* scene_resource = scene_target != nullptr
+                ? scene_target->GameThread_GetRenderTargetResource()
+                : nullptr;
+            if (scene_target == nullptr || scene_resource == nullptr) {
+                UE_LOG(LogTemp, Error,
+                       TEXT("[AirSim][NativeGEER][GateA] %s has no Scene output target; ")
+                       TEXT("native registration failed"), *GetName());
+            }
+            else {
+                native_geer_registered_target_ = scene_resource;
+                AirSimRegisterNativeGeerView(
+                    native_geer_registered_target_,
+                    configured_camera_name_.IsEmpty() ? GetName() : configured_camera_name_,
+                    FIntPoint(scene_target->SizeX, scene_target->SizeY), raymap_, map.central);
+            }
+        }
+    }
+
     //One line per raymap actually uploaded. Its absence is the other half of the runtime
     //non-invasiveness check, alongside the cube face rig line: no CameraModel block, no line.
     UE_LOG(LogTemp, Log,
-           TEXT("[AirSim] raymap uploaded: %s model %s %ux%u, 6 floats/texel, %.1f MB, ")
+           TEXT("[AirSim] raymap uploaded: %s model %s %ux%u, backend=%s, 6 floats/texel, %.1f MB, ")
            TEXT("%llu of %llu texels outside the model's valid domain, central=%s, ")
            TEXT("cube auto=%d faces at %d (FOV %.2f/%.2f deg, axis step %.5f/%.5f deg)"),
            *GetName(),
            UTF8_TO_TCHAR(msr::airlib::cameras::toString(sensor_params_.camera_model.model.type)),
-           map.width, map.height, megabytes,
+           map.width, map.height, usesNativeGeerBackend() ? TEXT("NativeGEER") : TEXT("Cube"), megabytes,
            static_cast<unsigned long long>(stats.invalid),
            static_cast<unsigned long long>(stats.texels),
            map.central ? TEXT("true") : TEXT("false"),
@@ -1617,6 +1667,15 @@ void APIPCamera::buildRaymapResource()
            FMath::RadiansToDegrees(cube_sampling.vertical_fov_radians),
            FMath::RadiansToDegrees(cube_sampling.horizontal_axis_step_radians),
            FMath::RadiansToDegrees(cube_sampling.vertical_axis_step_radians));
+}
+
+void APIPCamera::unregisterNativeGeerView()
+{
+    if (native_geer_registered_target_ == nullptr)
+        return;
+
+    AirSimUnregisterNativeGeerView(native_geer_registered_target_);
+    native_geer_registered_target_ = nullptr;
 }
 
 UTextureRenderTarget2D* APIPCamera::getRenderTarget(const APIPCamera::ImageType type, bool if_active, std::string annotation_name)

@@ -1958,6 +1958,12 @@ std::string AirsimROSWrapperMultiAgent::generate_camera_model_json(const CameraS
         json << ", \"Faces\": \"Auto\"";
     else
         json << ", \"Faces\": " << setting.faces;
+    json << ", \"RenderBackend\": \""
+         << (setting.render_backend == AirSimSettings::CameraModelSetting::RenderBackend::NativeGEER
+                 ? "NativeGEER"
+                 : "Cube")
+         << "\"";
+    //Retained for consumers of the schema reserved before RenderBackend was introduced.
     json << ", \"SplatOnly\": " << (setting.splat_only ? "true" : "false");
     json << "}";
     return json.str();

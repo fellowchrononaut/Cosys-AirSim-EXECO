@@ -11,6 +11,7 @@
 #include "SceneViewExtension.h"
 #include "Misc/CoreDelegates.h"
 #include "Engine/Engine.h"
+#include "UnrealClient.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "SceneView.h"
@@ -20,8 +21,16 @@
 #include "SceneManagement.h"    // FLightRenderParameters (SpotAngles for spot cone reconstruction)
 #include "NanoGSLightingSettings.h" // Project Settings page that drives the gs.* lighting CVars
 #include "SceneTextureParameters.h" // FSceneTextureUniformParameters::CustomDepthTexture (GeometryMode 1)
+#include "NativeGeerViewRegistry.h"
 
 #define LOCTEXT_NAMESPACE "FNanoGSModule"
+
+namespace
+{
+	//Gate-A instrumentation is bounded to one line per registry generation even when a capture
+	//component renders continuously. Mutated only by the render-thread callback below.
+	TSet<uint64> GNanoGSLoggedNativeGeerRegistrations;
+}
 
 // Pass 2 parameter struct: declares IntermediateTexture, DepthAccumTexture, and CustomDepthTexture
 // as RDG-tracked shader resource inputs so that RDG inserts the required RTV→SRV (or, for
@@ -137,14 +146,15 @@ TAutoConsoleVariable<float> CVarGeerNearCull(
  *  pinhole branch). The EWA quad is sized from the PROJECTED 2D covariance, so for splats
  *  elongated along the view direction it is too SMALL and clips the density with a hard straight
  *  edge; PBF derives the bound from the 3D covariance instead. This visibly changes the image for
- *  those splats — that is the fix, not a regression. Default off so it stays an explicit A/B knob;
- *  the bound follows gs.GeerCutoff so the geometric and per-ray 3-sigma bounds cannot disagree. */
+ *  those splats — that is the fix, not a regression. Phase 2 gated PBF on both the analytic scene
+ *  and a real checkpoint, so it is the GEER default; classic splats still use their EWA quad.
+ *  The bound follows gs.GeerCutoff so the geometric and per-ray 3-sigma bounds cannot disagree. */
 TAutoConsoleVariable<int32> CVarGeerPBF(
 	TEXT("gs.GeerPBF"),
-	0,
+	1,
 	TEXT("GEER exact footprint (Particle Bounding Frustum) instead of the inflated EWA quad.\n")
-	TEXT(" 0: EWA quad x gs.GeerQuadInflation (default)\n")
-	TEXT(" 1: PBF rect, bounded at gs.GeerCutoff sigma and clamped to the viewport"),
+	TEXT(" 0: EWA quad x gs.GeerQuadInflation (diagnostic fallback)\n")
+	TEXT(" 1: PBF rect, bounded at gs.GeerCutoff sigma and clamped to the viewport (default)"),
 	ECVF_RenderThreadSafe);
 
 /** DIAGNOSTIC (2026-08-07): split the Euclidean sort key away from the GEER evaluation, which
@@ -163,17 +173,18 @@ TAutoConsoleVariable<int32> CVarGeerSort(
 	TEXT(" 1: Euclidean camera->splat distance, matching forward.cu (default)"),
 	ECVF_RenderThreadSafe);
 
-/** DIAGNOSTIC: isolate the sort order from NanoGS's hardware depth-write policy. The GEER
- *  reference composites splats without letting one splat reject another through a depth buffer,
- *  whereas NanoGS writes each accepted fragment's centre depth. Leave this enabled by default so
- *  existing behaviour is unchanged; disable it only for the sort/depth interaction test. Scene
- *  depth is still tested and the temporal-responsive stencil mask is still written. */
+/** Splat hardware depth-write policy. The GEER reference composites splats without letting one
+ *  splat reject another through a depth buffer, while legacy NanoGS writes each accepted
+ *  fragment's centre depth. Auto mode preserves the legacy path for classic-only views and turns
+ *  splat depth writes off whenever at least one visible proxy takes the GEER evaluation path.
+ *  Scene depth is still tested and the temporal-responsive stencil mask is still written. */
 TAutoConsoleVariable<int32> CVarGeerDepthWrite(
 	TEXT("gs.GeerDepthWrite"),
-	1,
-	TEXT("Diagnostic hardware depth-write policy for the splat pass.\n")
+	-1,
+	TEXT("Hardware depth-write policy for the splat pass.\n")
+	TEXT("-1: auto — write for classic-only views, read-only when GEER is visible (default)\n")
 	TEXT(" 0: test existing scene depth, but do not let splats write depth\n")
-	TEXT(" 1: write splat centre depth (legacy NanoGS behaviour, default)"),
+	TEXT(" 1: force splat centre-depth writes (legacy NanoGS diagnostic)"),
 	ECVF_RenderThreadSafe);
 
 /** DIAGNOSTIC (2026-08-07): disable the GEER antialiasing opacity scaling (forward.cu omni_hvar).
@@ -685,6 +696,43 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	FRDGBuilder& GraphBuilder = *Parameters.GraphBuilder;
 	const FSceneView* SceneView = reinterpret_cast<const FSceneView*>(Parameters.View);
 
+	FAirSimNativeGeerView NativeGeerView;
+	const FRenderTarget* FamilyRenderTarget = SceneView->Family != nullptr
+		? SceneView->Family->RenderTarget
+		: nullptr;
+	if (AirSimFindNativeGeerView_RenderThread(FamilyRenderTarget, NativeGeerView) &&
+		!GNanoGSLoggedNativeGeerRegistrations.Contains(NativeGeerView.registration_serial))
+	{
+		GNanoGSLoggedNativeGeerRegistrations.Add(NativeGeerView.registration_serial);
+		const FIntPoint FamilyExtent = FamilyRenderTarget->GetSizeXY();
+		const bool bDimensionsMatch = FamilyExtent == NativeGeerView.output_extent;
+		const bool bRaymapReady = NativeGeerView.raymap.IsValid() && NativeGeerView.raymap->ready;
+		const bool bRaymapDimensionsMatch = bRaymapReady &&
+			NativeGeerView.raymap->width == static_cast<uint32>(NativeGeerView.output_extent.X) &&
+			NativeGeerView.raymap->height == static_cast<uint32>(NativeGeerView.output_extent.Y);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("[NanoGS][NativeGEER][GateA] matched camera=%s target=%p serial=%llu ")
+			TEXT("registered=%dx%d family=%dx%d view_rect=%dx%d raymap=%ux%u ready=%s central=%s status=%s"),
+			*NativeGeerView.camera_name, FamilyRenderTarget,
+			static_cast<unsigned long long>(NativeGeerView.registration_serial),
+			NativeGeerView.output_extent.X, NativeGeerView.output_extent.Y,
+			FamilyExtent.X, FamilyExtent.Y,
+			SceneView->UnscaledViewRect.Width(), SceneView->UnscaledViewRect.Height(),
+			NativeGeerView.raymap.IsValid() ? NativeGeerView.raymap->width : 0,
+			NativeGeerView.raymap.IsValid() ? NativeGeerView.raymap->height : 0,
+			bRaymapReady ? TEXT("true") : TEXT("false"),
+			NativeGeerView.central ? TEXT("true") : TEXT("false"),
+			(bDimensionsMatch && bRaymapDimensionsMatch) ? TEXT("OK") : TEXT("MISMATCH"));
+		if (!bDimensionsMatch || !bRaymapDimensionsMatch)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[NanoGS][NativeGEER][GateA] camera=%s matched the target identity but its ")
+				TEXT("output/raymap dimensions or readiness are invalid; native rendering must not proceed"),
+				*NativeGeerView.camera_name);
+		}
+	}
+
 	TArray<FGaussianSplatSceneProxy*> Proxies;
 	Ext->GetRegisteredProxies(Proxies);
 
@@ -749,6 +797,37 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		// parameter struct; a single "->" would resolve against the wrapper class itself.
 		CustomDepthTexture = Parameters.SceneTexturesUniformParams->GetContents()->CustomDepthTexture;
 	}
+
+	// Resolve the frame's depth-write policy before RDG declares depth access and before the draw
+	// chooses its depth-stencil PSO. Auto mode is deliberately based on the same CPU-visible proxy
+	// tests used by the global path below. GEER splats still test against opaque scene depth, but
+	// they must not reject one another by writing their centre depth into the hardware depth buffer.
+	const int32 CurrentGeerMode = CVarGeerEval.GetValueOnRenderThread();
+	bool bAnyGeerVisibleForDepth = false;
+	for (FGaussianSplatSceneProxy* Proxy : Proxies)
+	{
+		if (!Proxy) continue;
+		if (&Proxy->GetScene() != SceneView->Family->Scene) continue;
+		if (!Proxy->IsShown(SceneView)) continue;
+
+		const FBoxSphereBounds& Bounds = Proxy->GetBounds();
+		if (!SceneView->ViewFrustum.IntersectBox(Bounds.Origin, Bounds.BoxExtent)) continue;
+
+		FGaussianSplatGPUResources* GPUResources = Proxy->GetGPUResources();
+		if (!GPUResources || !GPUResources->IsValid()) continue;
+
+		const bool bProxyGeer = (CurrentGeerMode == 2) ||
+			(CurrentGeerMode == 1 && Proxy->IsGeerSplat());
+		if (bProxyGeer)
+		{
+			bAnyGeerVisibleForDepth = true;
+			break;
+		}
+	}
+
+	const int32 GeerDepthWriteMode = CVarGeerDepthWrite.GetValueOnRenderThread();
+	const bool bWriteSplatDepth = (GeerDepthWriteMode > 0) ||
+		(GeerDepthWriteMode < 0 && !bAnyGeerVisibleForDepth);
 
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
@@ -816,13 +895,13 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	}
 	if (DepthTexture)
 	{
-		// The diagnostic read-only mode still permits the depth test and stencil write; it removes
-		// only splat centre-depth writes so splats cannot reject one another through hardware depth.
+		// Read-only mode still permits the depth test and stencil write; it removes only splat
+		// centre-depth writes so GEER splats cannot reject one another through hardware depth.
 		Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
 			DepthTexture,
 			ERenderTargetLoadAction::ELoad,
 			ERenderTargetLoadAction::ELoad,
-			(CVarGeerDepthWrite.GetValueOnRenderThread() != 0)
+			bWriteSplatDepth
 				? FExclusiveDepthStencil::DepthWrite_StencilWrite
 				: FExclusiveDepthStencil::DepthRead_StencilWrite
 		);
@@ -914,9 +993,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		FMatrix CurrentVP = SceneView->ViewMatrices.GetViewMatrix() * SceneView->ViewMatrices.GetProjectionNoAAMatrix();
 		int32 CurrentDebugMode = DebugMode;
 		int32 CurrentDebugForceLODLevel = CVarDebugForceLODLevel.GetValueOnRenderThread();
-		// GEER eval mode for this frame. Resolved per proxy below; captured here so the
-		// camera-static skip can notice a change (cached W2O rows / AA opacity go stale).
-		const int32 CurrentGeerMode = CVarGeerEval.GetValueOnRenderThread();
+		// GEER eval mode for this frame was resolved before depth binding. It is captured below so
+		// the camera-static skip can notice a change (cached W2O rows / AA opacity go stale).
 		// GEER footprint mode, captured for the same reason: toggling it changes the quad axes and
 		// the PBF rect offset the vertex shader adds, neither of which the skip would recompute.
 		const bool bCurrentGeerPBF = CVarGeerPBF.GetValueOnRenderThread() != 0;
@@ -981,7 +1059,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
 			 CurrentDebugForceLODLevel, CurrentGeerMode, bCurrentGeerPBF, bCurrentGeerSort,
 			 bCurrentGeerAAOpacity, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
-			 bUseNormalConfidenceFade](FRHICommandListImmediate& RHICmdList)
+			 bUseNormalConfidenceFade, bWriteSplatDepth](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
@@ -1201,7 +1279,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 					// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
 					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
-						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, bOutputDepth, bOutputNormal,
+						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, bWriteSplatDepth,
+						bOutputDepth, bOutputNormal,
 						bUseNormalConfidenceFade);
 				}
 				else
@@ -1300,7 +1379,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					// Single draw call for ALL proxies (capped to render budget)
 					FGaussianSplatRenderer::DrawSplatsGlobal(
 						RHICmdList, *SceneView, RawAccumulator,
-						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode, bOutputDepth, bOutputNormal,
+						SharedIndexBuffer, (int32)CappedTotalSplatCount, DebugMode, bWriteSplatDepth,
+						bOutputDepth, bOutputNormal,
 						bUseNormalConfidenceFade);
 				}
 			}
@@ -1338,7 +1418,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					DepthTexture,
 					ERenderTargetLoadAction::ELoad,
 					ERenderTargetLoadAction::ELoad,
-					(CVarGeerDepthWrite.GetValueOnRenderThread() != 0)
+					bWriteSplatDepth
 						? FExclusiveDepthStencil::DepthWrite_StencilWrite
 						: FExclusiveDepthStencil::DepthRead_StencilWrite
 				);
@@ -1352,7 +1432,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				Pass1bParameters,
 				ERDGPassFlags::Raster,
 				[SceneView, RawAccumulatorForProximity, SharedIndexBuffer, DebugMode,
-				 bUseNormalConfidenceFade, DepthAccumTexture, DepthProximitySigma](FRHICommandListImmediate& RHICmdList)
+				 bUseNormalConfidenceFade, DepthAccumTexture, DepthProximitySigma,
+				 bWriteSplatDepth](FRHICommandListImmediate& RHICmdList)
 				{
 					if (!SceneView || !RawAccumulatorForProximity) return;
 					FRHITexture* DepthAccumRHI = DepthAccumTexture ? DepthAccumTexture->GetRHI() : nullptr;
@@ -1360,7 +1441,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 
 					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 						RHICmdList, *SceneView, RawAccumulatorForProximity, SharedIndexBuffer, DebugMode,
-						/*bOutputDepth=*/false, /*bOutputNormal=*/true, bUseNormalConfidenceFade,
+						bWriteSplatDepth, /*bOutputDepth=*/false, /*bOutputNormal=*/true,
+						bUseNormalConfidenceFade,
 						DepthAccumRHI, DepthProximitySigma);
 				}
 			);

@@ -172,7 +172,8 @@ public:
 		FRHICommandListImmediate& RHICmdList,
 		const FSceneView& View,
 		FGaussianSplatGPUResources* GPUResources,
-		int32 SplatCount
+		int32 SplatCount,
+		bool bWriteSplatDepth
 	);
 
 	/**
@@ -300,6 +301,7 @@ public:
 		FBufferRHIRef IndexBuffer,
 		int32 TotalSplatCount,
 		int32 DebugMode,
+		bool bWriteSplatDepth,
 		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
 		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
 		bool bUseNormalConfidenceFade = true, // GeometryMode 2: weight NormalAccum by per-splat confidence
@@ -388,6 +390,7 @@ public:
 		FGaussianGlobalAccumulator* GlobalAccumulator,
 		FBufferRHIRef IndexBuffer,
 		int32 DebugMode,
+		bool bWriteSplatDepth,
 		bool bOutputDepth = false,   // also write the alpha-weighted depth MRT (RT2) for lighting (GeometryMode 0/1)
 		bool bOutputNormal = false,  // also write the alpha-weighted normal MRT (RT2) for lighting (GeometryMode 2)
 		bool bUseNormalConfidenceFade = true, // GeometryMode 2: weight NormalAccum by per-splat confidence

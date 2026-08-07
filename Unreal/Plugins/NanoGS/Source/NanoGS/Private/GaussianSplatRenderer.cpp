@@ -30,12 +30,11 @@ extern TAutoConsoleVariable<int32> CVarGeerResidualDebug;
 extern TAutoConsoleVariable<float> CVarGeerNearCull;
 extern TAutoConsoleVariable<int32> CVarGeerPBF;
 extern TAutoConsoleVariable<int32> CVarGeerSort;
-extern TAutoConsoleVariable<int32> CVarGeerDepthWrite;
 extern TAutoConsoleVariable<int32> CVarGeerAAOpacity;
 
-static FRHIDepthStencilState* GetGaussianSplatDepthStencilState()
+static FRHIDepthStencilState* GetGaussianSplatDepthStencilState(bool bWriteSplatDepth)
 {
-	if (CVarGeerDepthWrite.GetValueOnRenderThread() != 0)
+	if (bWriteSplatDepth)
 	{
 		return TStaticDepthStencilState<
 			true, CF_DepthNearOrEqual,
@@ -658,7 +657,8 @@ void FGaussianSplatRenderer::DrawSplats(
 	FRHICommandListImmediate& RHICmdList,
 	const FSceneView& View,
 	FGaussianSplatGPUResources* GPUResources,
-	int32 SplatCount)
+	int32 SplatCount,
+	bool bWriteSplatDepth)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDraw);
 
@@ -691,11 +691,11 @@ void FGaussianSplatRenderer::DrawSplats(
 	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
 
 	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-	// Always test against existing scene depth. gs.GeerDepthWrite selects whether accepted splat
-	// fragments also update depth (legacy NanoGS) or only blend among themselves (diagnostic).
+	// Always test against existing scene depth. The caller resolves whether accepted splat
+	// fragments also update depth or only blend among themselves.
 	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
 	// reduces temporal history weight for splat pixels, preventing ghost trails
-	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState();
+	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState(bWriteSplatDepth);
 
 	// Blend mode for MRT:
 	// RT0 (Color): Premultiplied alpha "over" for back-to-front compositing in sRGB space
@@ -1319,6 +1319,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	FBufferRHIRef IndexBuffer,
 	int32 TotalSplatCount,
 	int32 DebugMode,
+	bool bWriteSplatDepth,
 	bool bOutputDepth,
 	bool bOutputNormal,
 	bool bUseNormalConfidenceFade,
@@ -1354,11 +1355,11 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
 
 	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-	// Always test against existing scene depth. gs.GeerDepthWrite selects whether accepted splat
-	// fragments also update depth (legacy NanoGS) or only blend among themselves (diagnostic).
+	// Always test against existing scene depth. The caller resolves whether accepted splat
+	// fragments also update depth or only blend among themselves.
 	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
 	// reduces temporal history weight for splat pixels, preventing ghost trails
-	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState();
+	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState(bWriteSplatDepth);
 	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
 	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
 	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.
@@ -1811,6 +1812,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	FGaussianGlobalAccumulator* GlobalAccumulator,
 	FBufferRHIRef IndexBuffer,
 	int32 DebugMode,
+	bool bWriteSplatDepth,
 	bool bOutputDepth,
 	bool bOutputNormal,
 	bool bUseNormalConfidenceFade,
@@ -1844,11 +1846,11 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
 
 	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
-	// Always test against existing scene depth. gs.GeerDepthWrite selects whether accepted splat
-	// fragments also update depth (legacy NanoGS) or only blend among themselves (diagnostic).
+	// Always test against existing scene depth. The caller resolves whether accepted splat
+	// fragments also update depth or only blend among themselves.
 	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
 	// reduces temporal history weight for splat pixels, preventing ghost trails
-	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState();
+	GraphicsPSOInit.DepthStencilState = GetGaussianSplatDepthStencilState(bWriteSplatDepth);
 	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
 	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
 	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.

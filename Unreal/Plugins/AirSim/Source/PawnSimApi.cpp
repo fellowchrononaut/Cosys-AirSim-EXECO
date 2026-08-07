@@ -114,7 +114,7 @@ void PawnSimApi::setupCamerasFromSettings(const common_utils::UniqueValueMap<std
     for (auto& pair : cameras_.getMap()) {
         const auto& camera_setting = Utils::findOrDefault(getVehicleSetting()->cameras, pair.first, camera_defaults);
         APIPCamera* camera = pair.second;
-        camera->setupCameraFromSettings(camera_setting, getNedTransform());
+        camera->setupCameraFromSettings(camera_setting, getNedTransform(), pair.first);
     }
 }
 

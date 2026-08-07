@@ -299,6 +299,12 @@ namespace airlib
         //it, so behaviour is identical to before. The maths lives in AirLib/include/cameras/.
         struct CameraModelSetting
         {
+            enum class RenderBackend
+            {
+                Cube,
+                NativeGEER
+            };
+
             bool enabled = false; //true only when a CameraModel block was present
 
             cameras::CameraModelParams model;
@@ -307,7 +313,8 @@ namespace airlib
             //stable from the start: users write config files against these names
             int cube_face_resolution = 0; //0 = auto
             int faces = 0; //0 = Auto, else 5 (<=180 deg) or 6
-            bool splat_only = false; //content declaration; no effect until the native path exists
+            RenderBackend render_backend = RenderBackend::Cube; //explicit per-camera render path
+            bool splat_only = false; //deprecated alias: true selects NativeGEER when RenderBackend is absent
         };
 
         using CaptureSettingsMap = std::map<int, CaptureSetting>;
@@ -1733,7 +1740,33 @@ namespace airlib
 
             camera_model_setting.cube_face_resolution = settings_json.getInt("CubeFaceResolution", camera_model_setting.cube_face_resolution);
             camera_model_setting.faces = createCameraModelFacesSetting(settings_json);
-            camera_model_setting.splat_only = settings_json.getBool("SplatOnly", camera_model_setting.splat_only);
+
+            //RenderBackend is independent of the camera model/calibration: two colocated named
+            //cameras can use the same raymap while one keeps the universal cube path and the
+            //other selects Phase 3c-1's native GEER path. Cube is the compatibility default.
+            const bool has_render_backend = settings_json.hasKey("RenderBackend");
+            const bool has_splat_only = settings_json.hasKey("SplatOnly");
+            const bool legacy_splat_only = settings_json.getBool("SplatOnly", false);
+            if (has_render_backend) {
+                const std::string render_backend = Utils::toLower(settings_json.getString("RenderBackend", ""));
+                if (render_backend == "cube")
+                    camera_model_setting.render_backend = CameraModelSetting::RenderBackend::Cube;
+                else if (render_backend == "nativegeer")
+                    camera_model_setting.render_backend = CameraModelSetting::RenderBackend::NativeGEER;
+                else
+                    throw std::invalid_argument(std::string("CameraModel RenderBackend must be Cube or NativeGEER in settings_json"));
+
+                if (has_splat_only && legacy_splat_only !=
+                    (camera_model_setting.render_backend == CameraModelSetting::RenderBackend::NativeGEER))
+                    throw std::invalid_argument(std::string("CameraModel SplatOnly conflicts with RenderBackend in settings_json"));
+            }
+            else if (legacy_splat_only) {
+                //Backward compatibility with the Phase-3c schema reserved before RenderBackend
+                //was introduced. Keep accepting it, but new files should name the backend.
+                camera_model_setting.render_backend = CameraModelSetting::RenderBackend::NativeGEER;
+            }
+            camera_model_setting.splat_only =
+                camera_model_setting.render_backend == CameraModelSetting::RenderBackend::NativeGEER;
 
             std::string error_message;
             if (!cameras::resolveParams(model, error_message))

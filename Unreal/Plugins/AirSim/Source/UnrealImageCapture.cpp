@@ -126,7 +126,13 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
                           static_cast<int>(ImageType::Count) == 12,
                       "AirSimCubeResampleModeForImageType's table is keyed on these values");
 
+        //NativeGEER Scene must produce an actual FSceneView for this output target so NanoGS can
+        //match it and, in Gate B, shade its raymap directly. Other modalities remain on the cube
+        //path; a colocated camera with RenderBackend=Cube is completely unchanged.
+        const bool native_geer_scene = camera->usesNativeGeerBackend() &&
+            requests[i].image_type == ImageType::Scene;
         if (capture != nullptr && textureTarget != nullptr && camera->hasCameraModel() &&
+            !native_geer_scene &&
             resample_mode != EAirSimCubeResampleMode::Unsupported) {
 
             //The raymap is ONE RAY PER OUTPUT PIXEL, and buildRaymapResource already refuses any

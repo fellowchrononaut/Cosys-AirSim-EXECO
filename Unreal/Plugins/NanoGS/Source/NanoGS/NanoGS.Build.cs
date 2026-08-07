@@ -38,6 +38,7 @@ public class NanoGS : ModuleRules
 		PrivateDependencyModuleNames.AddRange(
 			new string[]
 			{
+				"AirSim",
 				"Slate",
 				"SlateCore"
 			}
