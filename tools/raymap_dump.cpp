@@ -245,6 +245,8 @@ int main(int argc, char** argv)
     if (camera->camera_model.model.type == cameras::CameraModelType::KannalaBrandt)
         reportKbIterations(camera->camera_model.model);
 
+    const cameras::CubeSamplingRecommendation cube_sampling = cameras::recommendCubeSampling(raymap);
+
     const bool as_float64 = args.count("f64") != 0;
     if (!cameras::writeRaymap(raymap, args.at("out"), as_float64, error)) {
         std::cerr << "raymap write failed: " << error << "\n";
@@ -253,6 +255,13 @@ int main(int argc, char** argv)
 
     std::cout << "  texels : " << stats.texels << " (" << stats.invalid
               << " outside the model's valid domain)\n"
+              << "  cube   : " << cube_sampling.face_count << " faces at "
+              << cube_sampling.face_resolution << "x" << cube_sampling.face_resolution
+              << " (horizontal FOV " << cube_sampling.horizontal_fov_radians * 180.0 / cameras::kPi
+              << " deg, vertical FOV " << cube_sampling.vertical_fov_radians * 180.0 / cameras::kPi
+              << " deg; axis step "
+              << cube_sampling.horizontal_axis_step_radians * 180.0 / cameras::kPi << "/"
+              << cube_sampling.vertical_axis_step_radians * 180.0 / cameras::kPi << " deg)\n"
               << "  wrote  : " << args.at("out") << " as "
               << (as_float64 ? "float64" : "float32") << ", "
               << cameras::Raymap::kChannels << " channels per texel\n";

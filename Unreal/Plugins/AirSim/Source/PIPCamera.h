@@ -142,6 +142,11 @@ private: //members
     // one null pointer.
     FAirSimRaymapResourcePtr raymap_;
 
+    // Phase 3b step 7 recommendations derived from the built raymap. Explicit settings still
+    // win; these values serve only CameraModel Faces: Auto / CubeFaceResolution: 0.
+    int auto_cube_face_resolution_ = 0;
+    int auto_cube_face_count_ = 6;
+
     UPROPERTY() UStaticMesh* annotation_sphere_static_;
 
     //CinemAirSim

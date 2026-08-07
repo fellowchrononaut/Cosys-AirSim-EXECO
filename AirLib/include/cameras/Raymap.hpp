@@ -42,9 +42,12 @@
 
 #include "CameraModel.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -113,8 +116,86 @@ namespace airlib
             size_t invalid = 0; //outside the model's valid domain
         };
 
+        // Phase 3b step 7: cube sampling derived from the camera's actual ray field.  Keeping
+        // this beside Raymap makes the rule work for named models and AIRRAYM1 files alike.
+        struct CubeSamplingRecommendation
+        {
+            unsigned int face_resolution = 0;
+            unsigned int face_count = 6;
+            double horizontal_fov_radians = 0.0;
+            double vertical_fov_radians = 0.0;
+            double horizontal_axis_step_radians = 0.0;
+            double vertical_axis_step_radians = 0.0;
+        };
+
         namespace detail
         {
+
+            inline double directionAngle(const Ray& a, const Ray& b)
+            {
+                const double an = std::sqrt(a.dx * a.dx + a.dy * a.dy + a.dz * a.dz);
+                const double bn = std::sqrt(b.dx * b.dx + b.dy * b.dy + b.dz * b.dz);
+                if (!(an > 0.0) || !(bn > 0.0))
+                    return 0.0;
+                const double raw_dot = (a.dx * b.dx + a.dy * b.dy + a.dz * b.dz) / (an * bn);
+                const double dot = std::max(-1.0, std::min(1.0, raw_dot));
+                return std::acos(dot);
+            }
+
+            // Sum adjacent-ray angles along one contiguous valid row or column. Summing instead
+            // of taking acos(first,last) is essential beyond 180 degrees, where acos folds the
+            // answer back below pi. Invalid lens-circle texels split a path rather than inventing
+            // an angular jump across an unsampled region.
+            inline double angularSpan(const Raymap& map, bool horizontal, unsigned int line)
+            {
+                const unsigned int sample_count = horizontal ? map.width : map.height;
+                double widest = 0.0;
+                bool have_previous = false;
+                Ray previous;
+                double span = 0.0;
+                for (unsigned int sample = 0; sample < sample_count; ++sample) {
+                    const unsigned int x = horizontal ? sample : line;
+                    const unsigned int y = horizontal ? line : sample;
+                    const Ray current = map.at(x, y);
+                    if (!current.valid) {
+                        widest = std::max(widest, span);
+                        span = 0.0;
+                        have_previous = false;
+                        continue;
+                    }
+                    if (have_previous)
+                        span += directionAngle(previous, current);
+                    previous = current;
+                    have_previous = true;
+                }
+                return std::max(widest, span);
+            }
+
+            // Smallest valid one-pixel angular step next to the optical-axis sample. The smaller
+            // side is the stricter sampling requirement and also makes the estimate robust to a
+            // principal point that lies between two pixels.
+            inline double axisAngularStep(const Raymap& map, unsigned int x, unsigned int y,
+                                          bool horizontal)
+            {
+                const Ray centre = map.at(x, y);
+                if (!centre.valid)
+                    return 0.0;
+
+                double step = std::numeric_limits<double>::infinity();
+                if (horizontal) {
+                    if (x > 0 && map.at(x - 1u, y).valid)
+                        step = std::min(step, directionAngle(centre, map.at(x - 1u, y)));
+                    if (x + 1u < map.width && map.at(x + 1u, y).valid)
+                        step = std::min(step, directionAngle(centre, map.at(x + 1u, y)));
+                }
+                else {
+                    if (y > 0 && map.at(x, y - 1u).valid)
+                        step = std::min(step, directionAngle(centre, map.at(x, y - 1u)));
+                    if (y + 1u < map.height && map.at(x, y + 1u).valid)
+                        step = std::min(step, directionAngle(centre, map.at(x, y + 1u)));
+                }
+                return std::isfinite(step) ? step : 0.0;
+            }
 
             inline void writeU32(std::ostream& s, uint32_t v)
             {
@@ -137,6 +218,74 @@ namespace airlib
         static constexpr char kRaymapMagic[9] = "AIRRAYM1";
         static constexpr uint32_t kRaymapVersion = 1;
         static constexpr size_t kRaymapHeaderBytes = 40;
+
+        inline CubeSamplingRecommendation recommendCubeSampling(const Raymap& map)
+        {
+            CubeSamplingRecommendation result;
+            if (map.width == 0 || map.height == 0)
+                return result;
+
+            // Locate the sampled ray closest to the optical axis. A fisheye row away from the
+            // axis traces a curved path on the sphere and its accumulated turning angle is not
+            // the camera's horizontal FOV. The optical cross-sections remain useful diagnostics;
+            // the sampling recommendation itself uses the local angular steps at this axis.
+            unsigned int axis_x = 0, axis_y = 0;
+            double best_forward_cosine = -2.0;
+            for (unsigned int y = 0; y < map.height; ++y) {
+                for (unsigned int x = 0; x < map.width; ++x) {
+                    const Ray ray = map.at(x, y);
+                    if (!ray.valid)
+                        continue;
+                    const double norm = std::sqrt(ray.dx * ray.dx + ray.dy * ray.dy + ray.dz * ray.dz);
+                    if (norm > 0.0 && ray.dz / norm > best_forward_cosine) {
+                        best_forward_cosine = ray.dz / norm;
+                        axis_x = x;
+                        axis_y = y;
+                    }
+                }
+            }
+            result.horizontal_fov_radians = detail::angularSpan(map, true, axis_y);
+            result.vertical_fov_radians = detail::angularSpan(map, false, axis_x);
+            result.horizontal_axis_step_radians = detail::axisAngularStep(map, axis_x, axis_y, true);
+            result.vertical_axis_step_radians = detail::axisAngularStep(map, axis_x, axis_y, false);
+
+            // Design section 6, corrected by the runtime gate: cube tangent coordinate is
+            // x=2*(pixel+0.5)/R-1 and theta=atan(x), so at the face centre dtheta/dpixel=2/R.
+            // Match that COARSEST cube sampling to the output's optical-axis angular step.
+            // The previous width*(pi/2)/FOV rule used the face's average angular spacing even
+            // though section 6 explicitly requires its centre; on the project Double Sphere it
+            // selected 534 where the measured centre density requires 666 and produced >1 px
+            // band medians in the runtime projection gate.
+            double recommended = 0.0;
+            if (result.horizontal_axis_step_radians > 0.0)
+                recommended = std::max(recommended, 2.0 / result.horizontal_axis_step_radians);
+            if (result.vertical_axis_step_radians > 0.0)
+                recommended = std::max(recommended, 2.0 / result.vertical_axis_step_radians);
+            if (std::isfinite(recommended) && recommended > 0.0) {
+                const double bounded = std::min(recommended,
+                                                static_cast<double>(std::numeric_limits<unsigned int>::max()));
+                // AIRRAYM1 is float32 by default. A mathematically exact 1280 pinhole measures
+                // as 1280.0038 after quantisation; a relative 1e-5 tolerance prevents that noise
+                // from allocating an extra row/column without changing a real non-integer result.
+                result.face_resolution = static_cast<unsigned int>(std::ceil(bounded * (1.0 - 1.0e-5)));
+            }
+
+            // The cube convention omits only face 5 (Back).  In the optical raymap frame that is
+            // safe exactly when no valid direction has negative forward (z) extent.  A zero-z
+            // horizon ray belongs to one of the four side faces and does not require Back.
+            bool needs_back_face = false;
+            for (unsigned int y = 0; y < map.height && !needs_back_face; ++y) {
+                for (unsigned int x = 0; x < map.width; ++x) {
+                    const Ray ray = map.at(x, y);
+                    if (ray.valid && ray.dz < 0.0) {
+                        needs_back_face = true;
+                        break;
+                    }
+                }
+            }
+            result.face_count = needs_back_face ? 6u : 5u;
+            return result;
+        }
 
         // Builds the raymap for a resolved CameraModelParams. Type == Raymap loads the
         // file instead; that is the escape hatch for any calibration the named models

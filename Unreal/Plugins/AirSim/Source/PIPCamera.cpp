@@ -1244,10 +1244,11 @@ int APIPCamera::getCubeFaceCount() const
     if (!sensor_params_.camera_model.enabled)
         return 0;
 
-    //"Faces": Auto resolves to six here. Choosing five automatically needs the model's largest
-    //incidence angle, which is the same computation the automatic face resolution of design
-    //section 6 needs - both belong to step 7. An explicit "Faces": 5 is honoured now.
-    return sensor_params_.camera_model.faces == 5 ? 5 : kCubeFaceCount;
+    if (sensor_params_.camera_model.faces == 5)
+        return 5;
+    if (sensor_params_.camera_model.faces == 6)
+        return kCubeFaceCount;
+    return auto_cube_face_count_;
 }
 
 int APIPCamera::getCubeFaceResolution() const
@@ -1258,17 +1259,12 @@ int APIPCamera::getCubeFaceResolution() const
     if (sensor_params_.camera_model.cube_face_resolution > 0)
         return sensor_params_.camera_model.cube_face_resolution;
 
-    //Documented default for "CubeFaceResolution": 0, until step 7 derives it from the angular
-    //density at the face centre (design section 6). The rule is one face texel per output texel
-    //along the longer output axis. Section 6's value is width * (pi/2) / fov, so this default is
-    //at or above it for every field of view of 90 degrees or more - it therefore never
-    //undersamples a camera wide enough to need this path at all - and it oversamples a 180
-    //degree lens by 2x linear. Oversampling costs render and readback time, undersampling costs
-    //image quality that cannot be recovered later, so the default errs the way section 6 says to
-    //err. Set CubeFaceResolution explicitly to trade it back.
-    //
-    //A Raymap model carries no Width or Height in settings, so it lands on the 64 floor and must
-    //set CubeFaceResolution explicitly until step 4 loads the map itself.
+    if (auto_cube_face_resolution_ > 0)
+        return auto_cube_face_resolution_;
+
+    //Defensive fallback for a call before buildRaymapResource. In the normal configuration path
+    //the built raymap supplies the step-7 angular-density recommendation, including for a
+    //file-backed Raymap model whose dimensions are not present in settings.
     const int widest = FMath::Max(static_cast<int>(sensor_params_.camera_model.model.width),
                                   static_cast<int>(sensor_params_.camera_model.model.height));
     return FMath::Clamp(widest, 64, 2048);
@@ -1544,6 +1540,8 @@ void APIPCamera::buildRaymapResource()
     //setupCameraFromSettings can run more than once for a camera; never leak the previous one
     if (raymap_.IsValid())
         AirSimReleaseRaymap(raymap_);
+    auto_cube_face_resolution_ = 0;
+    auto_cube_face_count_ = kCubeFaceCount;
 
     if (!sensor_params_.camera_model.enabled)
         return; //no CameraModel block: nothing allocated, no render command enqueued, no log line
@@ -1557,6 +1555,12 @@ void APIPCamera::buildRaymapResource()
                *GetName(), UTF8_TO_TCHAR(error.c_str()));
         return;
     }
+
+    const msr::airlib::cameras::CubeSamplingRecommendation cube_sampling =
+        msr::airlib::cameras::recommendCubeSampling(map);
+    const unsigned int capped_face_resolution = FMath::Min(cube_sampling.face_resolution, 2048u);
+    auto_cube_face_resolution_ = FMath::Clamp(static_cast<int>(capped_face_resolution), 64, 2048);
+    auto_cube_face_count_ = cube_sampling.face_count == 5u ? 5 : kCubeFaceCount;
 
     //The output image IS the camera model's image: fx, fy, cx and cy are expressed in the
     //model's own pixels, so a Scene target of a different size is a different camera. Rescaling
@@ -1600,13 +1604,19 @@ void APIPCamera::buildRaymapResource()
     //non-invasiveness check, alongside the cube face rig line: no CameraModel block, no line.
     UE_LOG(LogTemp, Log,
            TEXT("[AirSim] raymap uploaded: %s model %s %ux%u, 6 floats/texel, %.1f MB, ")
-           TEXT("%llu of %llu texels outside the model's valid domain, central=%s"),
+           TEXT("%llu of %llu texels outside the model's valid domain, central=%s, ")
+           TEXT("cube auto=%d faces at %d (FOV %.2f/%.2f deg, axis step %.5f/%.5f deg)"),
            *GetName(),
            UTF8_TO_TCHAR(msr::airlib::cameras::toString(sensor_params_.camera_model.model.type)),
            map.width, map.height, megabytes,
            static_cast<unsigned long long>(stats.invalid),
            static_cast<unsigned long long>(stats.texels),
-           map.central ? TEXT("true") : TEXT("false"));
+           map.central ? TEXT("true") : TEXT("false"),
+           auto_cube_face_count_, auto_cube_face_resolution_,
+           FMath::RadiansToDegrees(cube_sampling.horizontal_fov_radians),
+           FMath::RadiansToDegrees(cube_sampling.vertical_fov_radians),
+           FMath::RadiansToDegrees(cube_sampling.horizontal_axis_step_radians),
+           FMath::RadiansToDegrees(cube_sampling.vertical_axis_step_radians));
 }
 
 UTextureRenderTarget2D* APIPCamera::getRenderTarget(const APIPCamera::ImageType type, bool if_active, std::string annotation_name)
