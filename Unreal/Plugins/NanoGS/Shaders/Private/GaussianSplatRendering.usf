@@ -303,9 +303,9 @@ FVertexOutput MainVS(
 	Output.Color = color;
 
 	#if NATIVE_GEER
-	// Gate B1 deliberately emits every splat over the complete output. The exact ray equation in
-	// MainPS is the only coverage test; no pinhole projected centre or footprint survives here.
-	Output.Position = float4(corner, 0.5, 1.0);
+	// Gate C stores either the mode-0 full-output rectangle or the conservative binned rectangle
+	// directly in ClipPosition/Axis. The exact ray equation in MainPS remains the final rejector.
+	Output.Position = float4(ndc + offset, 0.5, 1.0);
 	Output.LocalPos = corner;
 	return Output;
 	#endif

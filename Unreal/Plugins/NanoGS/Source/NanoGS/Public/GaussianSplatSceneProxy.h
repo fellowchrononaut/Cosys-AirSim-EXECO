@@ -347,6 +347,10 @@ public:
 	bool CachedGeerAAOpacity = false;
 	/** Backend is part of view-data identity: native data deliberately contains no pinhole projection. */
 	bool CachedNativeGeer = false;
+	/** Native candidate mode changes the native ClipPosition/Axis rectangle written by CalcViewData. */
+	int32 CachedNativeGeerCandidateMode = 0;
+	/** Resource generation is part of native view-data identity (lookup and common origin can change). */
+	uint64 CachedNativeGeerRegistrationSerial = 0;
 	bool bHasCachedSortData = false;
 };
 

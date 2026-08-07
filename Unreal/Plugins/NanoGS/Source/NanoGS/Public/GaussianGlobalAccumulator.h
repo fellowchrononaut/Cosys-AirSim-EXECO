@@ -102,6 +102,8 @@ struct NANOGS_API FGaussianGlobalAccumulator
 	uint32 CachedTotalSplatCount = 0;
 	FMatrix CachedViewProjectionMatrix = FMatrix::Identity;
 	bool CachedNativeGeer = false;
+	int32 CachedNativeGeerCandidateMode = 0;
+	uint64 CachedNativeGeerRegistrationSerial = 0;
 
 	//----------------------------------------------------------------------
 	// Previous frame data for velocity calculation (per-view)

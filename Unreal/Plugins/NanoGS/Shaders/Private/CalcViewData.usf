@@ -30,6 +30,7 @@ float4x4 LocalToWorld;
 float4x4 WorldToPLY;   // Transforms world direction to PLY/SH space for SH evaluation
 float4x4 WorldToClip;
 float4x4 WorldToView;
+float4x4 ViewToWorld;
 float3 PreViewTranslation;  // For translating world position (velocity calculation)
 float3 CameraPosition;
 float2 ScreenSize;
@@ -44,6 +45,11 @@ float SplatScale;
 float QuadInflation;   // GEER: multiply EWA quad axes (footprint only); 1.0 = off
 uint  UseGeerEval;     // 1 = fill W2O rows / AA opacity (ViewDistance is always filled)
 uint  UseNativeGeer;   // 1 = full-output native raymap path; no pinhole projection/culling
+StructuredBuffer<uint4> NativeGeerInverseDirection;
+int2 NativeGeerInverseGrid;
+int2 NativeGeerOutputSize;
+float3 NativeGeerCommonOriginCameraCm;
+uint NativeGeerCandidateMode; // 0 = full-output oracle, 1 = bounded-bin conservative rectangle
 float GeerNearCull;    // GEER: cull splats nearer than this view-space z (cm); 0 = off
 uint  UseGeerPBF;      // 1 = replace the EWA quad with the exact PBF rect (gs.GeerPBF)
 float GeerPBFLambda;   // PBF bound radius in sigma (follows gs.GeerCutoff; 3.0 when it is off)
@@ -133,7 +139,17 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// the splat renders at full opacity everywhere. The reference drops these rather than
 	// shading them. GEER splats only — the classic EWA path is bit-identical without this,
 	// because its falloff is in quad-local coords and decays regardless of proximity.
-	float nativeViewDistance = length(worldPos.xyz - CameraPosition);
+	float3 nativeRayOrigin = CameraPosition;
+	if (UseNativeGeer != 0)
+	{
+		// The raymap origin is in Unreal camera axes (+X forward,+Y right,+Z up). UE view axes
+		// are (right,up,forward), matching the exact native PS conversion.
+		float3 originView = float3(NativeGeerCommonOriginCameraCm.y,
+		                           NativeGeerCommonOriginCameraCm.z,
+		                           NativeGeerCommonOriginCameraCm.x);
+		nativeRayOrigin += mul(float4(originView, 0.0), ViewToWorld).xyz;
+	}
+	float nativeViewDistance = length(worldPos.xyz - nativeRayOrigin);
 	if (UseGeerEval != 0 && GeerNearCull > 0.0 &&
 		((UseNativeGeer != 0 && nativeViewDistance <= GeerNearCull) ||
 		 (UseNativeGeer == 0 && viewPos.z <= GeerNearCull)))
@@ -166,6 +182,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// scale, so evaluating in UE world space (cm) is exact as long as the actor
 	// scale is uniform (warned C++-side; non-uniform scale is unsupported).
 	float3 w2oRow0 = 0, w2oRow1 = 0, w2oRow2 = 0;
+	float3 geerSigmaEff = float3(0.0, 0.0, 0.0);
 	if (UseGeerEval)
 	{
 		float3x3 R = QuatToMatrix(rotation);
@@ -177,6 +194,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		const float H_VAR = GEER_H_VAR;
 		float3 sw = scale * actorScale;                       // world sigma per axis (cm)
 		float3 sigmaEff = sqrt(sw * sw + H_VAR);
+		geerSigmaEff = sigmaEff;
 		// Splat local axis j is COLUMN j of R (see CalcSplatLocalNormal).
 		float3 ax0 = normalize(mul(float3(R[0][0], R[1][0], R[2][0]), localToWorldRot));
 		float3 ax1 = normalize(mul(float3(R[0][1], R[1][1], R[2][1]), localToWorldRot));
@@ -199,10 +217,12 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 
 	if (UseNativeGeer != 0)
 	{
-		// Full-output-per-splat Gate-B1 representation. The VS ignores ClipPosition/Axis for
-		// placement, but a positive W keeps the common validity/sort machinery deterministic.
+		// Mode 0 preserves the Gate-B full-output oracle. Mode 1 below replaces these defaults
+		// with one conservative pixel-edge-aligned rectangle from the selected raymap lookup.
 		clipPos = float4(0.0, 0.0, 0.5, 1.0);
-		float3 cameraToCenter = worldPos.xyz - CameraPosition;
+		axis1 = float2(1.0, 0.0);
+		axis2 = float2(0.0, 1.0);
+		float3 cameraToCenter = worldPos.xyz - nativeRayOrigin;
 		float3 centerObj = float3(dot(cameraToCenter, w2oRow0),
 			                         dot(cameraToCenter, w2oRow1),
 			                         dot(cameraToCenter, w2oRow2));
@@ -212,6 +232,151 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		{
 			WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
 			return;
+		}
+
+		if (NativeGeerCandidateMode == 1)
+		{
+			if (NativeGeerInverseGrid.x <= 0 || NativeGeerInverseGrid.y <= 0 ||
+				NativeGeerOutputSize.x <= 0 || NativeGeerOutputSize.y <= 0)
+			{
+				WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+				return;
+			}
+
+			float sphereRadius = GeerPBFLambda * max(geerSigmaEff.x,
+				max(geerSigmaEff.y, geerSigmaEff.z));
+			// If the conservative sphere contains the common origin while the exact ellipsoid rule
+			// above did not cull, retain the diagnostic full-domain fallback. No tangent cone exists.
+			if (!(nativeViewDistance <= sphereRadius))
+			{
+				float3 centerView = mul(float4(cameraToCenter, 0.0), WorldToView).xyz;
+				float3 coneDirectionCamera = normalize(float3(
+					centerView.z, centerView.x, centerView.y));
+				float coneHalfAngle = asin(clamp(sphereRadius / nativeViewDistance, 0.0, 1.0));
+
+				const float PI = 3.14159265358979323846;
+				float longitudeStep = (2.0 * PI) / (float)NativeGeerInverseGrid.x;
+				float latitudeStep = PI / (float)NativeGeerInverseGrid.y;
+				float halfLongitude = 0.5 * longitudeStep;
+				float halfLatitude = 0.5 * latitudeStep;
+				// On the unit sphere, equirectangular cell distance is no greater than the planar
+				// longitude/latitude diagonal. This global bound is deliberately broad at the poles.
+				float cellHalfDiagonal = sqrt(
+					halfLongitude * halfLongitude + halfLatitude * halfLatitude);
+				float paddedHalfAngle = min(PI, coneHalfAngle + cellHalfDiagonal + 1.0e-5);
+				float minimumDot = cos(paddedHalfAngle);
+				float coneLatitude = asin(clamp(coneDirectionCamera.z, -1.0, 1.0));
+				float coneLongitude = atan2(coneDirectionCamera.y, coneDirectionCamera.x);
+				if (coneLongitude >= PI)
+					coneLongitude -= 2.0 * PI;
+
+				// Bounded C3 query. Latitude differs by no more than spherical angle, so the padded
+				// cone bounds a contiguous row interval. One extra row/bin is deliberate tolerance.
+				int centerBinY = clamp((int)floor(
+					(coneLatitude + 0.5 * PI) / latitudeStep),
+					0, NativeGeerInverseGrid.y - 1);
+				int latitudeRadiusBins = (int)ceil(paddedHalfAngle / latitudeStep) + 1;
+				int minBinY = max(0, centerBinY - latitudeRadiusBins);
+				int maxBinY = min(NativeGeerInverseGrid.y - 1,
+					centerBinY + latitudeRadiusBins);
+				int centerBinX = clamp((int)floor(
+					(coneLongitude + PI) / longitudeStep),
+					0, NativeGeerInverseGrid.x - 1);
+				bool coneTouchesPole = abs(coneLatitude) + paddedHalfAngle >= 0.5 * PI - 1.0e-6;
+
+				uint2 rectMin = uint2(0xffffffffu, 0xffffffffu);
+				uint2 rectMax = uint2(0u, 0u);
+				uint selectedValidBins = 0u;
+				[loop]
+				for (int binY = minBinY; binY <= maxBinY; ++binY)
+				{
+					float latitude = ((float)binY + 0.5) * latitudeStep - 0.5 * PI;
+					float cosLatitude = cos(latitude);
+					bool enumerateAllLongitudes = coneTouchesPole;
+					int longitudeRadiusBins = 0;
+					if (!enumerateAllLongitudes)
+					{
+						float longitudeDenominator = cos(coneLatitude) * cosLatitude;
+						if (longitudeDenominator <= 1.0e-8)
+						{
+							enumerateAllLongitudes = true;
+						}
+						else
+						{
+							float minimumLongitudeCos = (minimumDot -
+								sin(coneLatitude) * sin(latitude)) / longitudeDenominator;
+							if (minimumLongitudeCos > 1.0 + 1.0e-6)
+								continue;
+							if (minimumLongitudeCos <= -1.0)
+							{
+								enumerateAllLongitudes = true;
+							}
+							else
+							{
+								float longitudeHalfAngle = acos(clamp(
+									minimumLongitudeCos, -1.0, 1.0));
+								longitudeRadiusBins = (int)ceil(
+									longitudeHalfAngle / longitudeStep) + 1;
+								enumerateAllLongitudes =
+									2 * longitudeRadiusBins + 1 >= NativeGeerInverseGrid.x;
+							}
+						}
+					}
+
+					int longitudeIterations = enumerateAllLongitudes
+						? NativeGeerInverseGrid.x : 2 * longitudeRadiusBins + 1;
+					[loop]
+					for (int longitudeIteration = 0;
+						 longitudeIteration < longitudeIterations; ++longitudeIteration)
+					{
+						int binX = enumerateAllLongitudes
+							? longitudeIteration
+							: centerBinX + longitudeIteration - longitudeRadiusBins;
+						binX = ((binX % NativeGeerInverseGrid.x) +
+							NativeGeerInverseGrid.x) % NativeGeerInverseGrid.x;
+						float longitude = ((float)binX + 0.5) * longitudeStep - PI;
+						float3 binDirectionCamera = float3(
+							cosLatitude * cos(longitude),
+							cosLatitude * sin(longitude),
+							sin(latitude));
+						if (dot(coneDirectionCamera, binDirectionCamera) < minimumDot)
+							continue;
+
+						uint binIndex = (uint)(binY * NativeGeerInverseGrid.x + binX);
+						uint4 binRect = NativeGeerInverseDirection[binIndex];
+						if (binRect.x == 0xffffffffu)
+							continue;
+						rectMin = min(rectMin, binRect.xy);
+						rectMax = max(rectMax, binRect.zw);
+						selectedValidBins++;
+					}
+				}
+
+				if (selectedValidBins == 0u || rectMin.x == 0xffffffffu)
+				{
+					WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+					return;
+				}
+
+				// Convert the inclusive pixel rectangle to exact pixel-edge NDC bounds. Output pixels
+				// are top-down while clip/NDC y is up, hence the deliberate y reversal.
+				float2 outputSize = (float2)NativeGeerOutputSize;
+				float left = -1.0 + 2.0 * ((float)rectMin.x / outputSize.x);
+				float right = -1.0 + 2.0 * (((float)rectMax.x + 1.0) / outputSize.x);
+				float top = 1.0 - 2.0 * ((float)rectMin.y / outputSize.y);
+				float bottom = 1.0 - 2.0 * (((float)rectMax.y + 1.0) / outputSize.y);
+				float2 rectCenter = 0.5 * float2(left + right, bottom + top);
+				float2 rectHalf = 0.5 * float2(right - left, top - bottom);
+				if (any(isnan(rectCenter)) || any(isinf(rectCenter)) ||
+					any(isnan(rectHalf)) || any(isinf(rectHalf)) || any(rectHalf <= 0.0))
+				{
+					WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+					return;
+				}
+				clipPos = float4(rectCenter, 0.5, 1.0);
+				axis1 = float2(rectHalf.x, 0.0);
+				axis2 = float2(0.0, rectHalf.y);
+			}
 		}
 	}
 	else

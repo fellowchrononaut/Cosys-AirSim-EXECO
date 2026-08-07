@@ -268,7 +268,12 @@ public:
 		uint32 GlobalBaseOffset,
 		FGaussianGlobalAccumulator* GlobalAccumulator,
 		bool bGeerEval = false,
-		bool bNativeGeer = false
+		bool bNativeGeer = false,
+		FShaderResourceViewRHIRef NativeGeerInverseDirection = FShaderResourceViewRHIRef(),
+		FIntPoint NativeGeerInverseGrid = FIntPoint::ZeroValue,
+		FIntPoint NativeGeerOutputSize = FIntPoint::ZeroValue,
+		FVector3f NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector,
+		int32 NativeGeerCandidateMode = 0
 	);
 
 	/**

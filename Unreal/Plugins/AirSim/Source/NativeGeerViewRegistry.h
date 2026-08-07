@@ -16,8 +16,12 @@ struct AIRSIM_API FAirSimNativeGeerView
     FString camera_name;
     FIntPoint output_extent = FIntPoint::ZeroValue;
     FAirSimRaymapResourcePtr raymap;
+    FShaderResourceViewRHIRef inverse_direction_srv;
+    FIntPoint inverse_direction_grid = FIntPoint::ZeroValue;
+    FVector3f common_origin_camera_cm = FVector3f::ZeroVector;
     uint64 registration_serial = 0;
     bool central = true;
+    bool inverse_direction_ready = false;
 };
 
 // Game-thread entry points. Both enqueue their mutation so the registry and its TSharedPtr

@@ -294,6 +294,7 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	Parameters.WorldToClip = FMatrix44f(View.ViewMatrices.GetViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix());
 	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
 	Parameters.WorldToView = FMatrix44f(View.ViewMatrices.GetViewMatrix());
+	Parameters.ViewToWorld = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	Parameters.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
 
 	FIntRect ViewRect = ViewInfo.ViewRect;
@@ -320,6 +321,11 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	Parameters.SplatScale = SplatScale;
 	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
 	Parameters.UseNativeGeer = 0;
+	Parameters.NativeGeerInverseDirection = GPUResources->ChunkBufferSRV;
+	Parameters.NativeGeerInverseGrid = FIntPoint::ZeroValue;
+	Parameters.NativeGeerOutputSize = FIntPoint::ZeroValue;
+	Parameters.NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
+	Parameters.NativeGeerCandidateMode = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -953,6 +959,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	Parameters.WorldToClip = FMatrix44f(View.ViewMatrices.GetViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix());
 	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
 	Parameters.WorldToView = FMatrix44f(View.ViewMatrices.GetViewMatrix());
+	Parameters.ViewToWorld = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	Parameters.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
 
 	FIntRect ViewRect = ViewInfo.ViewRect;
@@ -979,6 +986,11 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	Parameters.SplatScale = SplatScale;
 	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
 	Parameters.UseNativeGeer = 0;
+	Parameters.NativeGeerInverseDirection = GPUResources->ChunkBufferSRV;
+	Parameters.NativeGeerInverseGrid = FIntPoint::ZeroValue;
+	Parameters.NativeGeerOutputSize = FIntPoint::ZeroValue;
+	Parameters.NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
+	Parameters.NativeGeerCandidateMode = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1054,7 +1066,12 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	uint32 GlobalBaseOffset,
 	FGaussianGlobalAccumulator* GlobalAccumulator,
 	bool bGeerEval,
-	bool bNativeGeer)
+	bool bNativeGeer,
+	FShaderResourceViewRHIRef NativeGeerInverseDirection,
+	FIntPoint NativeGeerInverseGrid,
+	FIntPoint NativeGeerOutputSize,
+	FVector3f NativeGeerCommonOriginCameraCm,
+	int32 NativeGeerCandidateMode)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataGlobal);
 
@@ -1114,6 +1131,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	Parameters.WorldToClip = FMatrix44f(View.ViewMatrices.GetViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix());
 	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
 	Parameters.WorldToView = FMatrix44f(View.ViewMatrices.GetViewMatrix());
+	Parameters.ViewToWorld = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	Parameters.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
 
 	FIntRect ViewRect = ViewInfo.ViewRect;
@@ -1140,6 +1158,15 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	Parameters.SplatScale = SplatScale;
 	Parameters.UseGeerEval = bGeerEval ? 1u : 0u;
 	Parameters.UseNativeGeer = bNativeGeer ? 1u : 0u;
+	Parameters.NativeGeerInverseDirection =
+		(bNativeGeer && NativeGeerInverseDirection.IsValid())
+		? NativeGeerInverseDirection : GPUResources->ChunkBufferSRV;
+	Parameters.NativeGeerInverseGrid = bNativeGeer ? NativeGeerInverseGrid : FIntPoint::ZeroValue;
+	Parameters.NativeGeerOutputSize = bNativeGeer ? NativeGeerOutputSize : FIntPoint::ZeroValue;
+	Parameters.NativeGeerCommonOriginCameraCm = bNativeGeer
+		? NativeGeerCommonOriginCameraCm : FVector3f::ZeroVector;
+	Parameters.NativeGeerCandidateMode = bNativeGeer
+		? static_cast<uint32>(FMath::Clamp(NativeGeerCandidateMode, 0, 1)) : 0u;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1632,6 +1659,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	Parameters.WorldToClip     = FMatrix44f(View.ViewMatrices.GetViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix());
 	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
 	Parameters.WorldToView     = FMatrix44f(View.ViewMatrices.GetViewMatrix());
+	Parameters.ViewToWorld     = FMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 	Parameters.CameraPosition  = FVector3f(View.ViewMatrices.GetViewOrigin());
 
 	FIntRect ViewRect = ViewInfo.ViewRect;
@@ -1658,6 +1686,11 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	Parameters.SplatScale    = SplatScale;
 	Parameters.UseGeerEval   = bGeerEval ? 1u : 0u;
 	Parameters.UseNativeGeer = 0;
+	Parameters.NativeGeerInverseDirection = GPUResources->ChunkBufferSRV;
+	Parameters.NativeGeerInverseGrid = FIntPoint::ZeroValue;
+	Parameters.NativeGeerOutputSize = FIntPoint::ZeroValue;
+	Parameters.NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
+	Parameters.NativeGeerCandidateMode = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval

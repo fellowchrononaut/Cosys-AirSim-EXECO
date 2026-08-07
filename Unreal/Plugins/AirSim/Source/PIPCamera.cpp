@@ -1599,6 +1599,11 @@ void APIPCamera::buildRaymapResource()
     TArray<float> values;
     values.SetNumUninitialized(static_cast<int32>(map.width) * static_cast<int32>(map.height) * channels);
 
+    FVector3f common_origin_camera_cm = FVector3f::ZeroVector;
+    bool validated_central = map.central;
+    bool have_common_origin = false;
+    constexpr float CommonOriginToleranceCm = 1.0e-4f;
+
     for (unsigned int y = 0; y < map.height; ++y) {
         for (unsigned int x = 0; x < map.width; ++x) {
             const msr::airlib::cameras::Ray ray = map.at(x, y);
@@ -1612,13 +1617,76 @@ void APIPCamera::buildRaymapResource()
             values[base + 3] = static_cast<float>(ray.dz);
             values[base + 4] = static_cast<float>(ray.dx);
             values[base + 5] = static_cast<float>(-ray.dy);
+
+            const FVector3f origin_camera_cm(values[base + 0], values[base + 1], values[base + 2]);
+            if (!have_common_origin) {
+                common_origin_camera_cm = origin_camera_cm;
+                have_common_origin = true;
+            }
+            else if (validated_central &&
+                     !origin_camera_cm.Equals(common_origin_camera_cm, CommonOriginToleranceCm)) {
+                validated_central = false;
+            }
+        }
+    }
+
+    if (map.central && !validated_central) {
+        UE_LOG(LogTemp, Error,
+               TEXT("[AirSim][NativeGEER][GateC] %s raymap claims central but its origins differ; ")
+               TEXT("candidate coverage and native registration will fail closed"), *GetName());
+    }
+
+    TArray<FAirSimRaymapBinRect> inverse_direction_rects;
+    uint32 inverse_direction_width = 0;
+    uint32 inverse_direction_height = 0;
+    if (usesNativeGeerBackend() && validated_central) {
+        inverse_direction_width = kAirSimNativeGeerInverseWidth;
+        inverse_direction_height = kAirSimNativeGeerInverseHeight;
+        inverse_direction_rects.SetNum(
+            static_cast<int32>(inverse_direction_width * inverse_direction_height));
+        constexpr double Pi = 3.1415926535897932384626433832795;
+        for (uint32 y = 0; y < map.height; ++y) {
+            for (uint32 x = 0; x < map.width; ++x) {
+                const int32 base = (static_cast<int32>(y) * static_cast<int32>(map.width) +
+                                    static_cast<int32>(x)) * channels;
+                const FVector3d direction(values[base + 3], values[base + 4], values[base + 5]);
+                const double direction_length = direction.Size();
+                if (!FMath::IsFinite(direction_length) || direction_length <= 1.0e-12)
+                    continue;
+                const FVector3d unit_direction = direction / direction_length;
+                double longitude = FMath::Atan2(unit_direction.Y, unit_direction.X);
+                if (longitude >= Pi)
+                    longitude -= 2.0 * Pi;
+                const double latitude = FMath::Asin(FMath::Clamp(unit_direction.Z, -1.0, 1.0));
+                const int32 bin_x = FMath::Clamp(FMath::FloorToInt(
+                    (longitude + Pi) * (static_cast<double>(inverse_direction_width) /
+                                        (2.0 * Pi))),
+                    0, static_cast<int32>(inverse_direction_width) - 1);
+                const int32 bin_y = FMath::Clamp(FMath::FloorToInt(
+                    (latitude + 0.5 * Pi) * (static_cast<double>(inverse_direction_height) / Pi)),
+                    0, static_cast<int32>(inverse_direction_height) - 1);
+                FAirSimRaymapBinRect& rect = inverse_direction_rects[
+                    bin_y * static_cast<int32>(inverse_direction_width) + bin_x];
+                if (rect.min_x == kAirSimNativeGeerInvalidRect) {
+                    rect.min_x = rect.max_x = x;
+                    rect.min_y = rect.max_y = y;
+                }
+                else {
+                    rect.min_x = FMath::Min(rect.min_x, x);
+                    rect.min_y = FMath::Min(rect.min_y, y);
+                    rect.max_x = FMath::Max(rect.max_x, x);
+                    rect.max_y = FMath::Max(rect.max_y, y);
+                }
+            }
         }
     }
 
     const double megabytes = static_cast<double>(values.Num()) * sizeof(float) / (1024.0 * 1024.0);
 
     raymap_ = AirSimCreateRaymapResource();
-    AirSimUploadRaymap(raymap_, MoveTemp(values), map.width, map.height, map.central);
+    AirSimUploadRaymap(raymap_, MoveTemp(values), map.width, map.height, validated_central,
+                       MoveTemp(inverse_direction_rects), inverse_direction_width,
+                       inverse_direction_height, common_origin_camera_cm);
 
     //Gate A registers ONLY the ordinary Scene output target of an explicitly selected native
     //camera. Cube face targets and Cube-backend outputs never enter this registry. Upload and
@@ -1645,7 +1713,7 @@ void APIPCamera::buildRaymapResource()
                 AirSimRegisterNativeGeerView(
                     native_geer_registered_target_,
                     configured_camera_name_.IsEmpty() ? GetName() : configured_camera_name_,
-                    FIntPoint(scene_target->SizeX, scene_target->SizeY), raymap_, map.central);
+                    FIntPoint(scene_target->SizeX, scene_target->SizeY), raymap_, validated_central);
             }
         }
     }
@@ -1661,7 +1729,7 @@ void APIPCamera::buildRaymapResource()
            map.width, map.height, usesNativeGeerBackend() ? TEXT("NativeGEER") : TEXT("Cube"), megabytes,
            static_cast<unsigned long long>(stats.invalid),
            static_cast<unsigned long long>(stats.texels),
-           map.central ? TEXT("true") : TEXT("false"),
+           validated_central ? TEXT("true") : TEXT("false"),
            auto_cube_face_count_, auto_cube_face_resolution_,
            FMath::RadiansToDegrees(cube_sampling.horizontal_fov_radians),
            FMath::RadiansToDegrees(cube_sampling.vertical_fov_radians),

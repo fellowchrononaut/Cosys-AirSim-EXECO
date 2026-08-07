@@ -32,6 +32,7 @@ namespace
 	TSet<uint64> GNanoGSLoggedNativeGeerRegistrations;
 	TSet<uint64> GNanoGSLoggedNativeGeerRefusals;
 	TSet<uint64> GNanoGSLoggedNativeGeerActive;
+	TSet<uint64> GNanoGSLoggedNativeGeerCandidateStates;
 }
 
 // Pass 2 parameter struct: declares IntermediateTexture, DepthAccumTexture, and CustomDepthTexture
@@ -157,6 +158,16 @@ TAutoConsoleVariable<int32> CVarGeerPBF(
 	TEXT("GEER exact footprint (Particle Bounding Frustum) instead of the inflated EWA quad.\n")
 	TEXT(" 0: EWA quad x gs.GeerQuadInflation (diagnostic fallback)\n")
 	TEXT(" 1: PBF rect, bounded at gs.GeerCutoff sigma and clamped to the viewport (default)"),
+	ECVF_RenderThreadSafe);
+
+/** Native raymap candidate coverage mode. Gate C keeps the Gate-B full-output path as an
+ *  explicit oracle/fallback while the raymap-binned path is brought up and gated. */
+TAutoConsoleVariable<int32> CVarNativeGeerCandidateMode(
+	TEXT("gs.NativeGeerCandidateMode"),
+	1,
+	TEXT("NativeGEER candidate coverage mode.\n")
+	TEXT(" 0: Gate-B full-output quad per splat (development oracle)\n")
+	TEXT(" 1: bounded raymap-bin conservative candidate rectangle (Gate C; default)"),
 	ECVF_RenderThreadSafe);
 
 /** DIAGNOSTIC (2026-08-07): split the Euclidean sort key away from the GEER evaluation, which
@@ -721,8 +732,29 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	const bool bNativeRaymapDimensionsMatch = bNativeRaymapReady &&
 		NativeGeerView.raymap->width == static_cast<uint32>(NativeGeerView.output_extent.X) &&
 		NativeGeerView.raymap->height == static_cast<uint32>(NativeGeerView.output_extent.Y);
-	const bool bNativeGeerView = bNativeGeerRegistered && bNativeDimensionsMatch &&
+	const bool bNativeGeerBaseView = bNativeGeerRegistered && bNativeDimensionsMatch &&
 		bNativeRaymapDimensionsMatch && NativeGeerView.central && NativeGeerView.raymap->central;
+	const int32 NativeGeerCandidateMode = FMath::Clamp(
+		CVarNativeGeerCandidateMode.GetValueOnRenderThread(), 0, 1);
+	const FIntPoint RequiredNativeGeerInverseGrid(
+		static_cast<int32>(kAirSimNativeGeerInverseWidth),
+		static_cast<int32>(kAirSimNativeGeerInverseHeight));
+	const bool bNativeCommonOriginFinite = bNativeGeerRegistered &&
+		FMath::IsFinite(NativeGeerView.common_origin_camera_cm.X) &&
+		FMath::IsFinite(NativeGeerView.common_origin_camera_cm.Y) &&
+		FMath::IsFinite(NativeGeerView.common_origin_camera_cm.Z);
+	const bool bNativeInverseReady = bNativeGeerRegistered &&
+		NativeGeerView.inverse_direction_ready &&
+		NativeGeerView.inverse_direction_srv.IsValid() &&
+		NativeGeerView.inverse_direction_grid == RequiredNativeGeerInverseGrid &&
+		NativeGeerView.raymap->inverse_direction_ready &&
+		NativeGeerView.raymap->inverse_direction_srv.IsValid() &&
+		NativeGeerView.raymap->inverse_direction_width == kAirSimNativeGeerInverseWidth &&
+		NativeGeerView.raymap->inverse_direction_height == kAirSimNativeGeerInverseHeight &&
+		NativeGeerView.inverse_direction_srv == NativeGeerView.raymap->inverse_direction_srv &&
+		bNativeCommonOriginFinite;
+	const bool bNativeGeerView = bNativeGeerBaseView &&
+		(NativeGeerCandidateMode == 0 || bNativeInverseReady);
 
 	if (bNativeGeerRegistered &&
 		!GNanoGSLoggedNativeGeerRegistrations.Contains(NativeGeerView.registration_serial))
@@ -741,8 +773,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			NativeGeerView.raymap.IsValid() ? NativeGeerView.raymap->height : 0,
 			bNativeRaymapReady ? TEXT("true") : TEXT("false"),
 			NativeGeerView.central ? TEXT("true") : TEXT("false"),
-			bNativeGeerView ? TEXT("OK") : TEXT("MISMATCH"));
-		if (!bNativeGeerView)
+			bNativeGeerBaseView ? TEXT("OK") : TEXT("MISMATCH"));
+		if (!bNativeGeerBaseView)
 		{
 			UE_LOG(LogTemp, Error,
 				TEXT("[NanoGS][NativeGEER][GateA] camera=%s matched the target identity but its ")
@@ -751,8 +783,46 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		}
 	}
 
+	if (bNativeGeerRegistered)
+	{
+		const uint64 CandidateLogKey =
+			(NativeGeerView.registration_serial << 1u) | static_cast<uint64>(NativeGeerCandidateMode);
+		if (!GNanoGSLoggedNativeGeerCandidateStates.Contains(CandidateLogKey))
+		{
+			GNanoGSLoggedNativeGeerCandidateStates.Add(CandidateLogKey);
+			UE_LOG(LogTemp, Log,
+				TEXT("[NanoGS][NativeGEER][GateC] camera=%s serial=%llu mode=%d inverse=%dx%d ")
+				TEXT("snapshot_ready=%s resource_ready=%s common_origin_cm=(%.6f,%.6f,%.6f) ")
+				TEXT("query=%s query_upper_bound_bins_per_splat=%u sphere_fallback=shader_dynamic status=%s"),
+				*NativeGeerView.camera_name,
+				static_cast<unsigned long long>(NativeGeerView.registration_serial),
+				NativeGeerCandidateMode,
+				NativeGeerView.inverse_direction_grid.X,
+				NativeGeerView.inverse_direction_grid.Y,
+				NativeGeerView.inverse_direction_ready ? TEXT("true") : TEXT("false"),
+				bNativeInverseReady ? TEXT("true") : TEXT("false"),
+				NativeGeerView.common_origin_camera_cm.X,
+				NativeGeerView.common_origin_camera_cm.Y,
+				NativeGeerView.common_origin_camera_cm.Z,
+				NativeGeerCandidateMode == 1 ? TEXT("bounded-latlon") : TEXT("full-output"),
+				NativeGeerCandidateMode == 1
+					? kAirSimNativeGeerInverseWidth * kAirSimNativeGeerInverseHeight : 0u,
+				bNativeGeerView ? TEXT("OK") : TEXT("MISMATCH"));
+			if (NativeGeerCandidateMode == 1 && !bNativeInverseReady)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("[NanoGS][NativeGEER][GateC] candidate mode 1 requires the exact 256x128 ")
+					TEXT("inverse resource; camera=%s will remain black"),
+					*NativeGeerView.camera_name);
+			}
+		}
+	}
+
 	FShaderResourceViewRHIRef NativeGeerRaymap;
+	FShaderResourceViewRHIRef NativeGeerInverseDirection;
 	FIntPoint NativeGeerRaymapSize = FIntPoint::ZeroValue;
+	FIntPoint NativeGeerInverseGrid = FIntPoint::ZeroValue;
+	FVector3f NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
 	if (bNativeGeerRegistered)
 	{
 		// NativeGEER Scene is explicitly splat-only in 3c-1. Clear UE mesh/sky output before any
@@ -764,6 +834,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		}
 		NativeGeerRaymap = NativeGeerView.raymap->srv;
 		NativeGeerRaymapSize = NativeGeerView.output_extent;
+		NativeGeerInverseDirection = NativeGeerView.inverse_direction_srv;
+		NativeGeerInverseGrid = NativeGeerView.inverse_direction_grid;
+		NativeGeerCommonOriginCameraCm = NativeGeerView.common_origin_camera_cm;
 	}
 
 	TArray<FGaussianSplatSceneProxy*> Proxies;
@@ -1052,9 +1125,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			{
 				GNanoGSLoggedNativeGeerActive.Add(NativeGeerView.registration_serial);
 				UE_LOG(LogTemp, Log,
-					TEXT("[NanoGS][NativeGEER][GateB1] ACTIVE camera=%s splats=%u raymap=%dx%d full_output=true depth=false lighting=false velocity=zero"),
+					TEXT("[NanoGS][NativeGEER][GateB1] ACTIVE camera=%s splats=%u raymap=%dx%d candidate_mode=%d depth=false lighting=false velocity=zero"),
 					*NativeGeerView.camera_name, TotalSplatCount,
-					NativeGeerRaymapSize.X, NativeGeerRaymapSize.Y);
+					NativeGeerRaymapSize.X, NativeGeerRaymapSize.Y,
+					NativeGeerCandidateMode);
 			}
 		}
 
@@ -1070,11 +1144,18 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		const bool bCurrentGeerPBF = CVarGeerPBF.GetValueOnRenderThread() != 0;
 		const bool bCurrentGeerSort = CVarGeerSort.GetValueOnRenderThread() != 0;
 		const bool bCurrentGeerAAOpacity = CVarGeerAAOpacity.GetValueOnRenderThread() != 0;
+		const int32 CurrentNativeGeerCandidateMode = bNativeGeerView
+			? FMath::Clamp(CVarNativeGeerCandidateMode.GetValueOnRenderThread(), 0, 1)
+			: 0;
+		const uint64 CurrentNativeGeerRegistrationSerial = bNativeGeerView
+			? NativeGeerView.registration_serial : 0;
 
 		bool bCanSkip = GlobalAccumulator->bHasCachedSortData &&
 			GlobalAccumulator->CachedTotalSplatCount == TotalSplatCount &&
 			GlobalAccumulator->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f) &&
-			GlobalAccumulator->CachedNativeGeer == bNativeGeerView;
+			GlobalAccumulator->CachedNativeGeer == bNativeGeerView &&
+			GlobalAccumulator->CachedNativeGeerCandidateMode == CurrentNativeGeerCandidateMode &&
+			GlobalAccumulator->CachedNativeGeerRegistrationSerial == CurrentNativeGeerRegistrationSerial;
 
 		if (bCanSkip)
 		{
@@ -1095,7 +1176,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					GPUResources->CachedGeerPBF != bCurrentGeerPBF ||
 					GPUResources->CachedGeerSort != bCurrentGeerSort ||
 					GPUResources->CachedGeerAAOpacity != bCurrentGeerAAOpacity ||
-					GPUResources->CachedNativeGeer != bNativeGeerView)
+					GPUResources->CachedNativeGeer != bNativeGeerView ||
+					GPUResources->CachedNativeGeerCandidateMode != CurrentNativeGeerCandidateMode ||
+					GPUResources->CachedNativeGeerRegistrationSerial != CurrentNativeGeerRegistrationSerial)
 				{
 					bCanSkip = false;
 					break;
@@ -1131,12 +1214,14 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
 			Pass1Parameters,
 			ERDGPassFlags::Raster,
-			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
-			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, CurrentGeerMode, bCurrentGeerPBF, bCurrentGeerSort,
-			 bCurrentGeerAAOpacity, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
-			 bUseNormalConfidenceFade, bWriteSplatDepth, bNativeGeerView, NativeGeerRaymap,
-			 NativeGeerRaymapSize](FRHICommandListImmediate& RHICmdList)
+				[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
+				 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
+				 CurrentDebugForceLODLevel, CurrentGeerMode, bCurrentGeerPBF, bCurrentGeerSort,
+				 bCurrentGeerAAOpacity, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
+				 bUseNormalConfidenceFade, bWriteSplatDepth, bNativeGeerView, NativeGeerRaymap,
+				 NativeGeerRaymapSize, NativeGeerInverseDirection, NativeGeerInverseGrid,
+				 NativeGeerCommonOriginCameraCm, CurrentNativeGeerCandidateMode,
+				 CurrentNativeGeerRegistrationSerial](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
@@ -1329,6 +1414,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
 						RawAccumulator->CachedNativeGeer = false;
+						RawAccumulator->CachedNativeGeerCandidateMode = 0;
+						RawAccumulator->CachedNativeGeerRegistrationSerial = 0;
 
 						for (int32 i = 0; i < ValidProxies.Num(); i++)
 						{
@@ -1351,6 +1438,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								GPUResources->CachedGeerSort = bCurrentGeerSort;
 								GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
 								GPUResources->CachedNativeGeer = false;
+								GPUResources->CachedNativeGeerCandidateMode = 0;
+								GPUResources->CachedNativeGeerRegistrationSerial = 0;
 								GPUResources->bHasCachedSortData = true;
 							}
 							else
@@ -1427,7 +1516,12 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								Info.GlobalBaseOffset,
 								RawAccumulator,
 								bProxyGeer,
-								bNativeGeerView);
+								bNativeGeerView,
+								NativeGeerInverseDirection,
+								NativeGeerInverseGrid,
+								NativeGeerRaymapSize,
+								NativeGeerCommonOriginCameraCm,
+								CurrentNativeGeerCandidateMode);
 						}
 
 						// --------------------------------------------------
@@ -1443,6 +1537,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
 						RawAccumulator->CachedNativeGeer = bNativeGeerView;
+						RawAccumulator->CachedNativeGeerCandidateMode = CurrentNativeGeerCandidateMode;
+						RawAccumulator->CachedNativeGeerRegistrationSerial = CurrentNativeGeerRegistrationSerial;
 
 						for (const auto& Info : ValidProxies)
 						{
@@ -1462,6 +1558,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							GPUResources->CachedGeerSort = bCurrentGeerSort;
 							GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
 							GPUResources->CachedNativeGeer = bNativeGeerView;
+							GPUResources->CachedNativeGeerCandidateMode = CurrentNativeGeerCandidateMode;
+							GPUResources->CachedNativeGeerRegistrationSerial = CurrentNativeGeerRegistrationSerial;
 							GPUResources->bHasCachedSortData = true;
 						}
 					}

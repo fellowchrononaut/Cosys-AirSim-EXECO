@@ -41,6 +41,7 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(FMatrix44f, WorldToPLY)  // Transforms world direction to PLY/SH space for SH evaluation
 		SHADER_PARAMETER(FMatrix44f, WorldToClip)
 		SHADER_PARAMETER(FMatrix44f, WorldToView)
+		SHADER_PARAMETER(FMatrix44f, ViewToWorld)
 		SHADER_PARAMETER(FVector3f, PreViewTranslation)  // For velocity calculation (TranslatedWorld = World + PreViewTranslation)
 		SHADER_PARAMETER(FVector3f, CameraPosition)
 		SHADER_PARAMETER(FVector2f, ScreenSize)
@@ -55,6 +56,11 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(float, QuadInflation)  // GEER footprint inflation (1.0 = off)
 		SHADER_PARAMETER(uint32, UseGeerEval)   // 1 = fill W2O rows / AA opacity
 		SHADER_PARAMETER(uint32, UseNativeGeer) // 1 = bypass all pinhole projection/culling for native raymap evaluation
+		SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, NativeGeerInverseDirection)
+		SHADER_PARAMETER(FIntPoint, NativeGeerInverseGrid)
+		SHADER_PARAMETER(FIntPoint, NativeGeerOutputSize)
+		SHADER_PARAMETER(FVector3f, NativeGeerCommonOriginCameraCm)
+		SHADER_PARAMETER(uint32, NativeGeerCandidateMode)
 		SHADER_PARAMETER(float, GeerNearCull)   // cull GEER splats nearer than this view z (cm)
 		SHADER_PARAMETER(uint32, UseGeerPBF)    // 1 = exact PBF rect instead of the EWA quad
 		SHADER_PARAMETER(float, GeerPBFLambda)  // PBF bound radius in sigma (follows gs.GeerCutoff)

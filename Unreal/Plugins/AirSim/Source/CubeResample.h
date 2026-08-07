@@ -25,6 +25,21 @@ class FRHICommandListImmediate;
 // array is not portable and the face is chosen per pixel. Keep in step with SampleCubeFace in
 // Shaders/Private/CubeResample.usf.
 static constexpr int32 kAirSimCubeResampleMaxFaces = 6;
+static constexpr uint32 kAirSimNativeGeerInverseWidth = 256;
+static constexpr uint32 kAirSimNativeGeerInverseHeight = 128;
+static constexpr uint32 kAirSimNativeGeerInvalidRect = 0xffffffffu;
+
+// Inclusive output-pixel union rectangle for one equirectangular direction bin. UINT32_MAX in
+// min_x is the invalid sentinel. Kept as four explicit uint32s so the GPU stride is exactly uint4.
+struct FAirSimRaymapBinRect
+{
+    uint32 min_x = kAirSimNativeGeerInvalidRect;
+    uint32 min_y = kAirSimNativeGeerInvalidRect;
+    uint32 max_x = kAirSimNativeGeerInvalidRect;
+    uint32 max_y = kAirSimNativeGeerInvalidRect;
+};
+static_assert(sizeof(FAirSimRaymapBinRect) == 4 * sizeof(uint32),
+              "NativeGEER inverse direction entries must match HLSL uint4");
 
 // How one ImageType is resampled - Phase 3b step 5.
 //
@@ -63,10 +78,16 @@ struct FAirSimRaymapResource
 {
     FBufferRHIRef buffer;
     FShaderResourceViewRHIRef srv;
+    FBufferRHIRef inverse_direction_buffer;
+    FShaderResourceViewRHIRef inverse_direction_srv;
     uint32 width = 0;
     uint32 height = 0;
+    uint32 inverse_direction_width = 0;
+    uint32 inverse_direction_height = 0;
+    FVector3f common_origin_camera_cm = FVector3f::ZeroVector;
     //all origins identical. A fetch hint for the shader; never a change of format (ADR-001).
     bool central = true;
+    bool inverse_direction_ready = false;
     //written on the render thread by the upload command, read on the render thread by the
     //resample. No barrier is needed: the upload is enqueued at camera configuration time and
     //every ExecuteTask is enqueued later, so the render thread runs them in that order.
@@ -80,7 +101,10 @@ FAirSimRaymapResourcePtr AirSimCreateRaymapResource();
 
 // Enqueues the upload. values is width * height * 6 floats, already in the Unreal camera frame.
 void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> values,
-                        uint32 width, uint32 height, bool central);
+                        uint32 width, uint32 height, bool central,
+                        TArray<FAirSimRaymapBinRect> inverse_direction_rects,
+                        uint32 inverse_direction_width, uint32 inverse_direction_height,
+                        FVector3f common_origin_camera_cm);
 
 // Enqueues the release and clears the caller's reference.
 void AirSimReleaseRaymap(FAirSimRaymapResourcePtr& resource);

@@ -267,14 +267,20 @@ FAirSimRaymapResourcePtr AirSimCreateRaymapResource()
 }
 
 void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> values,
-                        uint32 width, uint32 height, bool central)
+                        uint32 width, uint32 height, bool central,
+                        TArray<FAirSimRaymapBinRect> inverse_direction_rects,
+                        uint32 inverse_direction_width, uint32 inverse_direction_height,
+                        FVector3f common_origin_camera_cm)
 {
     if (!resource.IsValid() || values.Num() == 0)
         return;
 
     ENQUEUE_RENDER_COMMAND(AirSimUploadRaymap)
     (
-        [resource, values, width, height, central](FRHICommandListImmediate& cmd_list) {
+        [resource, values = MoveTemp(values), width, height, central,
+         inverse_direction_rects = MoveTemp(inverse_direction_rects),
+         inverse_direction_width, inverse_direction_height, common_origin_camera_cm]
+        (FRHICommandListImmediate& cmd_list) {
             const uint32 stride = static_cast<uint32>(sizeof(float));
             const uint32 bytes = static_cast<uint32>(values.Num()) * stride;
 
@@ -299,6 +305,32 @@ void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> 
             resource->width = width;
             resource->height = height;
             resource->central = central;
+            resource->common_origin_camera_cm = common_origin_camera_cm;
+
+            const uint32 expected_inverse_entries =
+                inverse_direction_width * inverse_direction_height;
+            if (central && inverse_direction_width > 0 && inverse_direction_height > 0 &&
+                inverse_direction_rects.Num() == static_cast<int32>(expected_inverse_entries)) {
+                const uint32 inverse_stride = static_cast<uint32>(sizeof(FAirSimRaymapBinRect));
+                const uint32 inverse_bytes = expected_inverse_entries * inverse_stride;
+                FRHIBufferCreateDesc inverse_desc = FRHIBufferCreateDesc::Create(
+                    TEXT("AirSimNativeGeerInverseDirection"), inverse_bytes, inverse_stride,
+                    BUF_Static | BUF_ShaderResource | BUF_StructuredBuffer)
+                    .SetInitialState(ERHIAccess::SRVMask);
+                resource->inverse_direction_buffer = cmd_list.CreateBuffer(inverse_desc);
+                void* inverse_dest = cmd_list.LockBuffer(
+                    resource->inverse_direction_buffer, 0, inverse_bytes, RLM_WriteOnly);
+                FMemory::Memcpy(inverse_dest, inverse_direction_rects.GetData(), inverse_bytes);
+                cmd_list.UnlockBuffer(resource->inverse_direction_buffer);
+                resource->inverse_direction_srv = cmd_list.CreateShaderResourceView(
+                    resource->inverse_direction_buffer,
+                    FRHIViewDesc::CreateBufferSRV()
+                        .SetType(FRHIViewDesc::EBufferType::Structured)
+                        .SetStride(inverse_stride));
+                resource->inverse_direction_width = inverse_direction_width;
+                resource->inverse_direction_height = inverse_direction_height;
+                resource->inverse_direction_ready = resource->inverse_direction_srv.IsValid();
+            }
             resource->ready = true;
         });
 }
@@ -317,6 +349,9 @@ void AirSimReleaseRaymap(FAirSimRaymapResourcePtr& resource)
     (
         [released](FRHICommandListImmediate&) {
             released->ready = false;
+            released->inverse_direction_ready = false;
+            released->inverse_direction_srv.SafeRelease();
+            released->inverse_direction_buffer.SafeRelease();
             released->srv.SafeRelease();
             released->buffer.SafeRelease();
         });

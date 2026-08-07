@@ -44,18 +44,29 @@ void AirSimRegisterNativeGeerView(FRenderTarget* output_target,
         view.camera_name = MoveTemp(camera_name);
         view.output_extent = output_extent;
         view.raymap = raymap;
+        view.inverse_direction_srv = raymap->inverse_direction_srv;
+        view.inverse_direction_grid = FIntPoint(
+            static_cast<int32>(raymap->inverse_direction_width),
+            static_cast<int32>(raymap->inverse_direction_height));
+        view.common_origin_camera_cm = raymap->common_origin_camera_cm;
         view.registration_serial = ++GAirSimNativeGeerRegistrationSerial;
         view.central = central;
+        view.inverse_direction_ready = raymap->inverse_direction_ready;
         GAirSimNativeGeerViews.Add(output_target, view);
 
         UE_LOG(LogTemp, Log,
                TEXT("[AirSim][NativeGEER][GateA] registered camera=%s target=%p serial=%llu ")
-               TEXT("output=%dx%d raymap=%ux%u ready=true central=%s"),
+               TEXT("output=%dx%d raymap=%ux%u ready=true central=%s inverse=%dx%d inverse_ready=%s ")
+               TEXT("common_origin_cm=(%.6f,%.6f,%.6f)"),
                *view.camera_name, output_target,
                static_cast<unsigned long long>(view.registration_serial),
                view.output_extent.X, view.output_extent.Y,
                view.raymap->width, view.raymap->height,
-               view.central ? TEXT("true") : TEXT("false"));
+               view.central ? TEXT("true") : TEXT("false"),
+               view.inverse_direction_grid.X, view.inverse_direction_grid.Y,
+               view.inverse_direction_ready ? TEXT("true") : TEXT("false"),
+               view.common_origin_camera_cm.X, view.common_origin_camera_cm.Y,
+               view.common_origin_camera_cm.Z);
     });
 }
 
