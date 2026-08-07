@@ -26,6 +26,12 @@ float2   FocalLength;    // pixels: (ProjM00*W/2, ProjM11*H/2)
 float2   ScreenSize;     // ViewRect extent in pixels (Width, Height)
 float2   ViewRectMin;    // ViewRect.Min (pixels), for SV_Position → view ray
 float3   CameraWorldPos;
+#if NATIVE_GEER
+// Exact AirSim output raymap: six floats per output pixel in Unreal camera axes,
+// (origin centimetres, unit direction). This is the same SRV sampled by the native splat PS.
+StructuredBuffer<float> NativeGeerRaymap;
+int2 NativeGeerRaymapSize;
+#endif
 
 // Flattened light arrays — MAX_LIGHTS is defined by the C++ ModifyCompilationEnvironment
 float4 LightPositionInvRadius[MAX_LIGHTS]; // xyz = world pos,  w = 1/attenuationRadius
@@ -173,20 +179,52 @@ bool SmoothViewZ(int2 pixel, out float outZ, out float outConf)
 	return true;
 }
 
-// Shared pinhole back-projection: given a linear view-space depth at a pixel, recover the
-// world-space position. Used by both geometry modes — only how viewZ is obtained differs.
-float3 ViewZAndPixelToWorld(int2 pixel, float viewZ)
+// Recover a world-space position from the active accumulation contract. Classic rendering uses
+// linear view-Z and pinhole back-projection. NativeGEER uses range along the exact selected ray:
+// origin + range * direction. Returning false for an invalid native ray keeps invalid-domain
+// texels out of normal/lighting reconstruction instead of inventing a pinhole fallback.
+bool DepthAndPixelToWorld(int2 pixel, float depth, out float3 worldPos)
 {
+#if NATIVE_GEER
+	worldPos = float3(0, 0, 0);
+	int2 rayPixel = pixel - int2(ViewRectMin);
+	if (any(rayPixel < int2(0, 0)) || any(rayPixel >= NativeGeerRaymapSize))
+	{
+		return false;
+	}
+
+	uint baseIndex = (uint)(rayPixel.y * NativeGeerRaymapSize.x + rayPixel.x) * 6u;
+	float3 originCamera = float3(NativeGeerRaymap[baseIndex + 0u],
+	                            NativeGeerRaymap[baseIndex + 1u],
+	                            NativeGeerRaymap[baseIndex + 2u]);
+	float3 dirCamera = float3(NativeGeerRaymap[baseIndex + 3u],
+	                         NativeGeerRaymap[baseIndex + 4u],
+	                         NativeGeerRaymap[baseIndex + 5u]);
+	if (dot(dirCamera, dirCamera) <= 1e-12)
+	{
+		return false;
+	}
+
+	// AirSim camera axes are +X forward,+Y right,+Z up; UE view axes are right,up,forward.
+	float3 originView = float3(originCamera.y, originCamera.z, originCamera.x);
+	float3 dirView = float3(dirCamera.y, dirCamera.z, dirCamera.x);
+	float3 originWorld = CameraWorldPos + mul(float4(originView, 0.0), InvViewMatrix).xyz;
+	float3 dirWorld = mul(float4(dirView, 0.0), InvViewMatrix).xyz;
+	worldPos = originWorld + depth * dirWorld;
+	return true;
+#else
 	float2 pv = float2(pixel) - ViewRectMin;               // pixel within ViewRect
 	float cx = ScreenSize.x * 0.5;
 	float cy = ScreenSize.y * 0.5;
 
 	float3 viewPos;
-	viewPos.x = (pv.x + 0.5 - cx) * viewZ / FocalLength.x;
-	viewPos.y = (cy - pv.y - 0.5) * viewZ / FocalLength.y;  // flip Y (pixel down → view up)
-	viewPos.z = viewZ;
+	viewPos.x = (pv.x + 0.5 - cx) * depth / FocalLength.x;
+	viewPos.y = (cy - pv.y - 0.5) * depth / FocalLength.y;  // flip Y (pixel down → view up)
+	viewPos.z = depth;
 
-	return mul(float4(viewPos, 1.0), InvViewMatrix).xyz;    // row-major UE convention
+	worldPos = mul(float4(viewPos, 1.0), InvViewMatrix).xyz; // row-major UE convention
+	return true;
+#endif
 }
 
 bool ReconstructWorld(int2 pixel, out float3 worldPos, out float outConf)
@@ -197,8 +235,7 @@ bool ReconstructWorld(int2 pixel, out float3 worldPos, out float outConf)
 	{
 		return false;  // no coverage here
 	}
-	worldPos = ViewZAndPixelToWorld(pixel, viewZ);
-	return true;
+	return DepthAndPixelToWorld(pixel, viewZ, worldPos);
 }
 
 // Mirrors the engine's ConvertFromDeviceZ() (Common.ush), using the per-frame transform the
@@ -218,14 +255,18 @@ bool ReconstructWorldFromCustomDepth(int2 pixel, out float3 worldPos, out float 
 {
 	worldPos = float3(0, 0, 0);
 	outConf = 1.0;
+#if NATIVE_GEER
+	// NativeGEER Phase 3c-1 is splat-only and has no UE proxy-mesh output contract.
+	return false;
+#else
 	float deviceZ = CustomDepthTexture.Load(int3(pixel, 0)).r;
 	if (deviceZ <= 0.0)
 	{
 		return false;  // no proxy-mesh coverage here
 	}
 	float viewZ = ConvertCustomDeviceZToViewZ(deviceZ);
-	worldPos = ViewZAndPixelToWorld(pixel, viewZ);
-	return true;
+	return DepthAndPixelToWorld(pixel, viewZ, worldPos);
+#endif
 }
 
 // Dispatches to whichever geometry source GeometryMode selects. Both reconstruction paths feed
@@ -400,6 +441,32 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 
 	// Convert sRGB to linear for UE's SceneColor buffer
 	float3 linearColor = pow(max(srgbColor, 0.0), 2.2);
+
+	// Gate D exact diagnostic. Encode the reconstructed position relative to the live camera in
+	// UE world axes, with [-10 m,+10 m] mapped to [0,1]. NativeGEER reaches this function through
+	// its exact raymap permutation, so an accidental pinhole ray or view-Z accumulator produces a
+	// spatially varying error that the CPU oracle can identify. Opaque output removes splat alpha
+	// from the measurement; uncovered pixels were already discarded above. Apply the same display
+	// preparation as ordinary splat colour so the expected byte encoding survives UE tonemapping.
+	if (DebugView == 2)
+	{
+		float2 depthAccum = DepthAccumTexture.Load(int3(PixelPos, 0)).rg;
+		if (depthAccum.g <= 1e-6)
+		{
+			discard;
+		}
+		float depth = depthAccum.r / depthAccum.g;
+		float3 worldPos;
+		if (!DepthAndPixelToWorld(PixelPos, depth, worldPos))
+		{
+			discard;
+		}
+		const float PositionScaleCm = 1000.0;
+		float3 encodedPosition = saturate(
+			0.5 + (worldPos - CameraWorldPos) / (2.0 * PositionScaleCm));
+		float3 encodedLinear = pow(encodedPosition, 2.2);
+		return float4(InverseACESTonemap(encodedLinear), 1.0);
+	}
 
 	// Screen-space dynamic lighting — when enabled and lights are present, OR when a debug
 	// visualization is requested (DebugView bypasses the per-light loop and tonemap entirely, so

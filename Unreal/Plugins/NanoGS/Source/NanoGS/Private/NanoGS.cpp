@@ -33,6 +33,7 @@ namespace
 	TSet<uint64> GNanoGSLoggedNativeGeerRefusals;
 	TSet<uint64> GNanoGSLoggedNativeGeerActive;
 	TSet<uint64> GNanoGSLoggedNativeGeerCandidateStates;
+	TSet<uint64> GNanoGSLoggedNativeGeerCompositeStates;
 }
 
 // Pass 2 parameter struct: declares IntermediateTexture, DepthAccumTexture, and CustomDepthTexture
@@ -252,6 +253,17 @@ TAutoConsoleVariable<float> CVarGSLightingBlend(
 	TEXT("Intermediate values blend between the two."),
 	ECVF_RenderThreadSafe);
 
+/** Gate D keeps native colour isolated by default. Enabling this opts NativeGEER into the
+ * raymap/range-aware GeometryMode-0 composite; it never enables pinhole reconstruction. */
+TAutoConsoleVariable<int32> CVarNativeGeerRelighting(
+	TEXT("gs.NativeGeerRelighting"),
+	0,
+	TEXT("Enable Gate-D raymap/range-aware relighting for NativeGEER Scene captures.\n")
+	TEXT(" 0: Unlit native colour (default; first colour gate)\n")
+	TEXT(" 1: Enable exact-ray range accumulation/composite using LightingGeometryMode 0\n")
+	TEXT("Classic and RenderBackend:Cube views are unaffected."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<float> CVarGSAmbientIntensity(
 	TEXT("gs.AmbientIntensity"),
 	0.1f,
@@ -412,7 +424,9 @@ TAutoConsoleVariable<int32> CVarGSLightingDebugView(
 	TEXT(" 0: Off (default).\n")
 	TEXT(" 1: Show the reconstructed per-pixel world-space normal as an RGB color (normal*0.5+0.5,\n")
 	TEXT("    standard normal-map encoding). Pixels with no valid geometry show the plain unlit\n")
-	TEXT("    splat color, which doubles as a coverage/confidence-fade visualization."),
+	TEXT("    splat color, which doubles as a coverage/confidence-fade visualization.\n")
+	TEXT(" 2: Gate D diagnostic: encode reconstructed camera-relative UE world position, with\n")
+	TEXT("    [-10m,+10m] mapped to RGB [0,1]. Covered pixels are opaque."),
 	ECVF_RenderThreadSafe);
 
 // Export for other modules
@@ -867,13 +881,34 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// Gather scene lights up front (render-thread access to Scene->Lights). Needed before Pass 1
 	// so we can decide whether to allocate + write the depth-accumulation MRT this frame.
 	FGaussianSceneLighting SceneLighting = GatherSceneLighting(SceneView);
+	const bool bNativeGeerRelighting = bNativeGeerView &&
+		CVarNativeGeerRelighting.GetValueOnRenderThread() != 0;
 	if (bNativeGeerView)
 	{
-		// Gate B1 validates ray evaluation in isolation. The existing compositor reconstructs
-		// pinhole view-Z and is not a valid consumer until the later range/raymap gate.
-		SceneLighting.LightingBlend = 0.0f;
-		SceneLighting.DebugView = 0;
+		// Gate D first validates colour with optional relighting disabled. Its explicit opt-in uses
+		// only GeometryMode 0: alpha-weighted range plus exact output rays. Proxy CustomDepth is UE
+		// geometry (excluded from 3c-1), while native analytic-normal accumulation is not gated yet.
+		if (!bNativeGeerRelighting)
+		{
+			SceneLighting.LightingBlend = 0.0f;
+			SceneLighting.DebugView = 0;
+		}
+		SceneLighting.GeometryMode = 0;
 		DebugMode = 0;
+
+		const uint64 CompositeLogKey =
+			(NativeGeerView.registration_serial << 1u) | (bNativeGeerRelighting ? 1u : 0u);
+		if (!GNanoGSLoggedNativeGeerCompositeStates.Contains(CompositeLogKey))
+		{
+			GNanoGSLoggedNativeGeerCompositeStates.Add(CompositeLogKey);
+			UE_LOG(LogTemp, Log,
+				TEXT("[NanoGS][NativeGEER][GateD] camera=%s serial=%llu relighting=%s ")
+				TEXT("depth_contract=range ray_reconstruction=exact-raymap geometry_mode=0 status=%s"),
+				*NativeGeerView.camera_name,
+				static_cast<unsigned long long>(NativeGeerView.registration_serial),
+				bNativeGeerRelighting ? TEXT("enabled") : TEXT("disabled"),
+				bNativeGeerRelighting ? TEXT("RANGE_COMPOSITE") : TEXT("UNLIT_COLOR"));
+		}
 	}
 
 	// Output the alpha-weighted depth MRT only when lighting actually needs it. RT2 requires RT1
@@ -883,7 +918,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// use this MRT at all — skip allocating it.
 	const bool bWantsLighting = (SceneLighting.LightingBlend > 0.f) && (SceneLighting.NumLights > 0);
 	const bool bWantsDebugView = (SceneLighting.DebugView != 0);
-	const bool bLightingActive = !bNativeGeerView && (bWantsLighting || bWantsDebugView)
+	const bool bLightingActive = (!bNativeGeerView || bNativeGeerRelighting)
+	                          && (bWantsLighting || bWantsDebugView)
 	                          && (VelocityTexture != nullptr)
 	                          && (DebugMode == 0);
 	const bool bOutputDepth = bLightingActive && (SceneLighting.GeometryMode == 0 || SceneLighting.GeometryMode == 2);
@@ -1666,7 +1702,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			Pass2Parameters,
 			ERDGPassFlags::Raster,
 			[SceneView, IntermediateTexture, DepthAccumTexture, CustomDepthTexture, NormalAccumTexture,
-			 bOutputDepth, bOutputNormal, SceneLightingRef](FRHICommandListImmediate& RHICmdList)
+			 bOutputDepth, bOutputNormal, SceneLightingRef, bNativeGeerView, NativeGeerRaymap,
+			 NativeGeerRaymapSize](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
 
@@ -1681,7 +1718,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				FRHITexture* NormalAccumRHI = (bOutputNormal && NormalAccumTexture) ? NormalAccumTexture->GetRHI() : nullptr;
 
 				FGaussianSplatRenderer::CompositeToSceneColor(
-					RHICmdList, *SceneView, IntermediateRHI, DepthAccumRHI, CustomDepthRHI, NormalAccumRHI, *SceneLightingRef);
+					RHICmdList, *SceneView, IntermediateRHI, DepthAccumRHI, CustomDepthRHI,
+					NormalAccumRHI, *SceneLightingRef, bNativeGeerView, NativeGeerRaymap,
+					NativeGeerRaymapSize);
 			}
 		);
 }

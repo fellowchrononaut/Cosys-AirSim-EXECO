@@ -2233,12 +2233,27 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	FTextureRHIRef DepthAccumTexture,
 	FTextureRHIRef CustomDepthTexture,
 	FTextureRHIRef NormalAccumTexture,
-	const FGaussianSceneLighting& Lighting)
+	const FGaussianSceneLighting& Lighting,
+	bool bNativeGeer,
+	FShaderResourceViewRHIRef NativeGeerRaymap,
+	FIntPoint NativeGeerRaymapSize)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatComposite);
+	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+	const FIntRect ViewRect = ViewInfo.ViewRect;
+	if (bNativeGeer &&
+		(!NativeGeerRaymap.IsValid() || NativeGeerRaymapSize != ViewRect.Size()))
+	{
+		// The caller has already cleared a NativeGEER output to black. Never bind a missing or
+		// mismatched raymap and never substitute the pinhole composite permutation.
+		return;
+	}
 
 	TShaderMapRef<FGaussianSplatCompositeVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	TShaderMapRef<FGaussianSplatCompositePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FGaussianSplatCompositePS::FPermutationDomain PSPermutation;
+	PSPermutation.Set<FGaussianSplatCompositePS::FNativeGeer>(bNativeGeer);
+	TShaderMapRef<FGaussianSplatCompositePS> PixelShader(
+		GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
 	{
@@ -2263,8 +2278,6 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 
 	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
 
-	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
-	FIntRect ViewRect = ViewInfo.ViewRect;
 	RHICmdList.SetViewport(
 		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
 		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
@@ -2278,9 +2291,10 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 		CVarGeerResidualDebug.GetValueOnRenderThread(), 0, 5);
 
 	// Screen-space lighting parameters.
-	// DepthAccumTexture (RG32F) holds alpha-weighted view-space depth, used for world-position
-	// reconstruction by GeometryMode 0 AND GeometryMode 2 (2 reuses 0's position, only overrides
-	// the normal). CustomDepthTexture is the proxy-mesh alternative (GeometryMode 1). NormalAccum
+	// DepthAccumTexture (RG32F) holds alpha-weighted classic view-Z or NativeGEER ray range, used
+	// for world-position reconstruction by GeometryMode 0 AND GeometryMode 2 (2 reuses 0's
+	// position, only overrides the normal). CustomDepthTexture is the proxy-mesh alternative
+	// (GeometryMode 1). NormalAccum
 	// holds GeometryMode 2's alpha-weighted per-splat normal. Any texture that's null (lighting
 	// disabled / not produced this frame) gets IntermediateTexture bound as a harmless stand-in.
 	// Whichever geometry source(s) the active mode needs gate LightingBlend to 0 if any are
@@ -2317,6 +2331,8 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	PSParameters.ScreenSize      = FVector2f((float)ViewRect.Width(), (float)ViewRect.Height());
 	PSParameters.ViewRectMin     = FVector2f((float)ViewRect.Min.X, (float)ViewRect.Min.Y);
 	PSParameters.CameraWorldPos  = FVector3f(View.ViewMatrices.GetViewOrigin());
+	PSParameters.NativeGeerRaymap = NativeGeerRaymap;
+	PSParameters.NativeGeerRaymapSize = NativeGeerRaymapSize;
 	PSParameters.NumLights           = (uint32)Lighting.NumLights;
 	PSParameters.AmbientColor        = Lighting.AmbientColor;
 	PSParameters.LightingBlend       = bGeometryReady ? Lighting.LightingBlend : 0.f;

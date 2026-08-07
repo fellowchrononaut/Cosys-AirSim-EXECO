@@ -86,9 +86,8 @@ struct FGaussianSceneLighting
 	// needed to linearize CustomDepth (GeometryMode == 1 only; unused for splat depth-accum).
 	FVector4f InvDeviceZToWorldZTransform = FVector4f(0, 0, 0, 0);
 
-	// Diagnostic visualization for the active GeometryMode's reconstructed geometry. 0 = off
-	// (default). 1 = show the reconstructed per-pixel normal as an RGB color. Bypasses the
-	// per-light loop and tonemap, and works even with LightingBlend at 0 / no scene lights.
+	// Diagnostic visualization for the active GeometryMode's reconstructed geometry. 0 = off;
+	// 1 = world normal; 2 = Gate-D camera-relative world position. Works with no scene lights.
 	int32     DebugView = 0;
 
 	// Shadows (gs.ShadowMode). 0 = off (default), 1 = Proxy Mesh, 2 = Splat Self-Shadow — see
@@ -422,7 +421,10 @@ public:
 		FTextureRHIRef DepthAccumTexture,           // alpha-weighted depth MRT (RG32F); null = no lighting
 		FTextureRHIRef CustomDepthTexture,          // proxy-mesh CustomDepth; null = GeometryMode 1 unavailable
 		FTextureRHIRef NormalAccumTexture,           // alpha-weighted per-splat normal MRT; null = GeometryMode 2 unavailable
-		const FGaussianSceneLighting& Lighting      // gathered scene lights
+		const FGaussianSceneLighting& Lighting,     // gathered scene lights
+		bool bNativeGeer,
+		FShaderResourceViewRHIRef NativeGeerRaymap,
+		FIntPoint NativeGeerRaymapSize
 	);
 
 private:

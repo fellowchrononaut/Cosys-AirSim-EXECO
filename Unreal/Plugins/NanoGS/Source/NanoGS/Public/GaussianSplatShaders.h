@@ -272,8 +272,10 @@ class FGaussianSplatPS : public FGlobalShader
 			return false;
 		}
 		const FPermutationDomain PermutationVector(Parameters.PermutationId);
+		// Gate D enables native range accumulation for GeometryMode 0. Native analytic-normal
+		// accumulation remains outside the first range/composite gate.
 		return !PermutationVector.Get<FNativeGeer>() ||
-			(!PermutationVector.Get<FOutputDepth>() && !PermutationVector.Get<FOutputNormal>());
+			!PermutationVector.Get<FOutputNormal>();
 	}
 };
 
@@ -304,6 +306,8 @@ class FGaussianSplatCompositePS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FGaussianSplatCompositePS);
 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCompositePS, FGlobalShader);
+	class FNativeGeer : SHADER_PERMUTATION_BOOL("NATIVE_GEER");
+	using FPermutationDomain = TShaderPermutationDomain<FNativeGeer>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
@@ -311,8 +315,8 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		// Decodes the diagnostic accumulator instead of compositing ordinary splat colour.
 		SHADER_PARAMETER(uint32, GeerResidualDebug)
 		// Screen-space lighting: alpha-weighted depth accumulation + scene lights.
-		// DepthAccumTexture (RG32F): R = sum(viewZ * alpha * T), G = sum(alpha * T).
-		// Expected view-space depth at a pixel = R / G.
+		// DepthAccumTexture (RG32F): R = sum(depth * alpha * T), G = sum(alpha * T).
+		// Depth is classic view-Z or, for NativeGEER, range along the exact output ray.
 		SHADER_PARAMETER_TEXTURE(Texture2D, DepthAccumTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, DepthAccumSampler)
 		// GeometryMode 2: alpha-weighted per-splat analytic normal accumulation (RGBA16F).
@@ -324,6 +328,10 @@ class FGaussianSplatCompositePS : public FGlobalShader
 		SHADER_PARAMETER(FVector2f,  ScreenSize)        // ViewRect extent (pixels)
 		SHADER_PARAMETER(FVector2f,  ViewRectMin)       // ViewRect.Min for SV_Position -> view ray
 		SHADER_PARAMETER(FVector3f,  CameraWorldPos)
+		// Gate D: native range reconstruction samples the same exact six-float AirSim raymap as
+		// the splat pixel shader. Unbound from the classic composite permutation.
+		SHADER_PARAMETER_SRV(StructuredBuffer<float>, NativeGeerRaymap)
+		SHADER_PARAMETER(FIntPoint, NativeGeerRaymapSize)
 		// Flattened light array (MAX_LIGHTS = 16, kept in sync with FGaussianSceneLighting::MaxLights)
 		SHADER_PARAMETER_ARRAY(FVector4f, LightPositionInvRadius, [16]) // xyz=pos, w=1/radius
 		SHADER_PARAMETER_ARRAY(FVector4f, LightColorType,         [16]) // rgb=tint, w=type

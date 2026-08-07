@@ -83,7 +83,7 @@ int2 NativeGeerRaymapSize;
 struct FSplatRay { float3 Origin; float3 Dir; };
 
 // Reconstruct this pixel's viewing ray. Mirrors the composite pass
-// (GaussianSplatComposite.usf, ViewZAndPixelToWorld), except SvPosition already carries the
+// (GaussianSplatComposite.usf, DepthAndPixelToWorld), except SvPosition already carries the
 // half-pixel centre offset, so there is no +0.5 here. Dir is NOT normalised: the GEER density
 // |d_obj x p_obj|^2 / |d_obj|^2 is scale-invariant in d, so normalising would be wasted work.
 FSplatRay GetPixelRay(float2 SvPosition)
@@ -194,9 +194,10 @@ struct FPixelOutput
 	float4 Color : SV_Target0;
 	float4 Velocity : SV_Target1;
 #if OUTPUT_DEPTH
-	// Alpha-weighted view-space depth accumulation for screen-space lighting.
-	// RG32F target: .r = viewZ * alpha, .g = alpha. The .a output is the blend factor
-	// (premultiplied "over"), so the buffer composites to .r = sum(viewZ*alpha*T),
+	// Alpha-weighted depth accumulation for screen-space lighting: classic permutations write
+	// view-Z; NativeGEER writes range along the exact output ray.
+	// RG32F target: .r = depth * alpha, .g = alpha. The .a output is the blend factor
+	// (premultiplied "over"), so the buffer composites to .r = sum(depth*alpha*T),
 	// .g = sum(alpha*T); expected depth = r/g. Same weights as the color blend.
 	float4 DepthAccum : SV_Target2;
 #endif
@@ -380,6 +381,13 @@ FPixelOutput MainPS(FVertexOutput Input)
 
 	float distSq = dot(Input.LocalPos, Input.LocalPos);
 	bool isGeerSplat = UseGeerEval != 0 && dot(Input.W2ORow0, Input.W2ORow0) > 0.0;
+	// Classic paths retain centre view-Z. NativeGEER starts without a pinhole-derived value and
+	// fills this from the exact closest-point parameter along its unit output ray below.
+#if NATIVE_GEER
+	float accumulatedDepth = 0.0;
+#else
+	float accumulatedDepth = Input.CenterClipPos.w;
+#endif
 	// Residual diagnostics deliberately exclude classic splats. They answer whether the GEER
 	// population presented to two adjacent cube faces, and its exact-ray alpha, agree.
 	if (GeerResidualDebug != 0 && !isGeerSplat)
@@ -400,8 +408,17 @@ FPixelOutput MainPS(FVertexOutput Input)
 		float3 pObj = float3(dot(p, Input.W2ORow0), dot(p, Input.W2ORow1), dot(p, Input.W2ORow2));
 		float3 dObj = float3(dot(Ray.Dir, Input.W2ORow0), dot(Ray.Dir, Input.W2ORow1), dot(Ray.Dir, Input.W2ORow2));
 		float3 nrm = cross(dObj, pObj);
-		float power = -0.5 * dot(nrm, nrm) / dot(dObj, dObj);
+		float rayDenom = dot(dObj, dObj);
+		float rayRange = dot(dObj, pObj) / rayDenom;
+		float power = -0.5 * dot(nrm, nrm) / rayDenom;
 		bool powerValid = power <= 0.0; // false for NaN and +Inf; matches the normal GEER guard
+	#if NATIVE_GEER
+		// Gate C's truth is the forward half-ray, and Gate D cannot reconstruct a surface from a
+		// negative range. Directions in every valid AirSim raymap texel are unit length, so this
+		// parameter is range in centimetres and composes as origin + range * direction.
+		powerValid = powerValid && rayRange > 0.0;
+		accumulatedDepth = rayRange;
+	#endif
 		bool cutoffPass = powerValid && !(GeerPowerCutoff < 0.0 && power < GeerPowerCutoff);
 		float evaluatedAlpha = powerValid ? min(0.99, color.a * exp(power)) : 0.0;
 		bool alphaPass = cutoffPass && evaluatedAlpha >= (1.0 / 255.0);
@@ -507,15 +524,11 @@ FPixelOutput MainPS(FVertexOutput Input)
 	Output.Color = color;
 	// Output velocity for TAA/TSR (Nanite-style encoding)
 	Output.Velocity = EncodeVelocityToTexture(Velocity);
-	// CenterClipPos.w is the splat center's linear view-space depth (clip.w under UE projection).
-	// Needed by OUTPUT_DEPTH (to accumulate it) and by OUTPUT_NORMAL's depth-proximity weighting
-	// (to compare it against the already-resolved surface depth), so compute it unconditionally.
-	float ViewZ = Input.CenterClipPos.w;
 #if OUTPUT_DEPTH
-	// Accumulate alpha-weighted view-space depth. color.a is the post-Gaussian per-fragment alpha
-	// (same weight the color blend uses). The .a output drives the premultiplied "over" blend
-	// factor on RT2.
-	Output.DepthAccum = float4(ViewZ * color.a, color.a, 0.0, color.a);
+	// Accumulate alpha-weighted classic view-Z or native ray range. color.a is the post-Gaussian
+	// per-fragment alpha (same weight the color blend uses). The .a output drives the
+	// premultiplied "over" blend factor on RT2.
+	Output.DepthAccum = float4(accumulatedDepth * color.a, color.a, 0.0, color.a);
 #endif
 #if OUTPUT_NORMAL
 	// Accumulate alpha-weighted analytic normal (GeometryMode 2), same premultiplied-"over"
@@ -536,7 +549,7 @@ FPixelOutput MainPS(FVertexOutput Input)
 		if (da.g > 1e-6)
 		{
 			float surfaceZ = da.r / da.g;
-			float dz = ViewZ - surfaceZ;
+			float dz = accumulatedDepth - surfaceZ;
 			float sigma = max(DepthProximitySigma * surfaceZ, 1e-3);
 			normalWeight *= exp(-dz * dz / (2.0 * sigma * sigma));
 		}
