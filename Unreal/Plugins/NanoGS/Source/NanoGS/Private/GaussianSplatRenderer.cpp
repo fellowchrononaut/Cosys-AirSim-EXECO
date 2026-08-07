@@ -27,6 +27,26 @@ extern TAutoConsoleVariable<float> CVarGeerQuadInflation;
 extern TAutoConsoleVariable<float> CVarGeerCutoff;
 extern TAutoConsoleVariable<int32> CVarGeerDebugView;
 extern TAutoConsoleVariable<float> CVarGeerNearCull;
+extern TAutoConsoleVariable<int32> CVarGeerPBF;
+extern TAutoConsoleVariable<int32> CVarGeerSort;
+extern TAutoConsoleVariable<int32> CVarGeerAAOpacity;
+
+// Helper: GEER exact footprint (gs.GeerPBF), shared by all four CalcViewData dispatch variants.
+// Effective per proxy: bGeerEval is already the resolved per-proxy decision, so a classic asset
+// keeps its EWA quad even while a GEER asset in the same frame uses the PBF rect.
+//
+// The PBF's geometric bound and gs.GeerCutoff's per-ray bound are the same cutoff by two routes,
+// so lambda follows the CVar rather than being hardcoded: a rect bounded tighter than the per-ray
+// cutoff would clip the density at the rect edge — exactly the hard edge PBF exists to remove.
+// With the cutoff off there is no per-ray bound to match, so fall back to the reference's own
+// constant (forward.cu:882, "cutoff = 3.0f").
+static void SetGeerPBFParameters(FGaussianSplatCalcViewDataCS::FParameters& Parameters, bool bGeerEval)
+{
+	Parameters.UseGeerPBF = (bGeerEval && CVarGeerPBF.GetValueOnRenderThread() != 0) ? 1u : 0u;
+	Parameters.UseGeerAAOpacity = (CVarGeerAAOpacity.GetValueOnRenderThread() != 0) ? 1u : 0u;
+	const float CutoffSigma = FMath::Max(CVarGeerCutoff.GetValueOnRenderThread(), 0.0f);
+	Parameters.GeerPBFLambda = (CutoffSigma > 0.0f) ? CutoffSigma : 3.0f;
+}
 
 // GEER eval is exact only under rigid + uniform-scale actor transforms (world-space
 // invariance argument in 3DGEERNanoGS.md §1.5). Warn once per session otherwise.
@@ -251,6 +271,7 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
 		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
+	SetGeerPBFParameters(Parameters, bGeerEval);
 
 	// Not using global compaction path
 	Parameters.GlobalBaseOffsetsBuffer = GPUResources->CompactedSplatIndicesBufferSRV;  // dummy
@@ -296,7 +317,7 @@ void FGaussianSplatRenderer::DispatchCalcDistances(
 	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
 	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
 	Parameters.SplatCount = SplatCount;
-	Parameters.UseGeerSort = bUseGeerSort ? 1u : 0u;
+	Parameters.UseGeerSort = (bUseGeerSort && CVarGeerSort.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	// Dispatch only for actual SplatCount — no power-of-2 padding needed for radix sort
 	const uint32 ThreadGroupSize = 256;
@@ -683,6 +704,7 @@ void FGaussianSplatRenderer::DrawSplats(
 	VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, CVarShowClusterBounds.GetValueOnRenderThread()));
 	// Pass Nanite enabled state for debug visualization (non-Nanite assets render black in debug mode)
 	VSParameters.EnableNanite = GPUResources->bEnableNanite ? 1 : 0;
+	VSParameters.UseGeerPBF = (CVarGeerPBF.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
 
@@ -902,6 +924,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
 		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
+	SetGeerPBFParameters(Parameters, bGeerEval);
 
 	// Per-proxy compaction path
 	Parameters.GlobalBaseOffsetsBuffer = GPUResources->CompactedSplatIndicesBufferSRV;  // dummy
@@ -946,7 +969,7 @@ void FGaussianSplatRenderer::DispatchCalcDistancesIndirect(
 	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
 	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
 	Parameters.SplatCount = GPUResources->TotalSplatCount;  // Max count for bounds
-	Parameters.UseGeerSort = bUseGeerSort ? 1u : 0u;
+	Parameters.UseGeerSort = (bUseGeerSort && CVarGeerSort.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	// INDIRECT DISPATCH
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
@@ -1060,6 +1083,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
 		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
+	SetGeerPBFParameters(Parameters, bGeerEval);
 
 	// KEY: tell the shader where to write in the global buffer
 	Parameters.GlobalBaseOffset = GlobalBaseOffset;
@@ -1105,7 +1129,7 @@ void FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
 	Parameters.DistanceBuffer = GlobalAccumulator->GlobalSortDistanceBufferUAV;
 	Parameters.KeyBuffer = GlobalAccumulator->GlobalSortKeysBufferUAV;
 	Parameters.SplatCount = TotalSplatCount;
-	Parameters.UseGeerSort = bUseGeerSort ? 1u : 0u;
+	Parameters.UseGeerSort = (bUseGeerSort && CVarGeerSort.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	const uint32 ThreadGroupSize = 256;
 	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)TotalSplatCount, ThreadGroupSize);
@@ -1353,6 +1377,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	VSParameters.SplatCount = TotalSplatCount;
 	VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, DebugMode));
 	VSParameters.EnableNanite = 1;
+	VSParameters.UseGeerPBF = (CVarGeerPBF.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
 
@@ -1566,6 +1591,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
 		? FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f) : 0.0f;
+	SetGeerPBFParameters(Parameters, bGeerEval);
 
 	// Use the per-proxy indirect dispatch args (filled by DispatchPrepareIndirectArgs)
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
@@ -1601,7 +1627,7 @@ void FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(
 	Parameters.KeyBuffer       = GlobalAccumulator->GlobalSortKeysBufferUAV;
 	// AllocatedCount is always >= TotalVisible — safe upper bound for the shader guard
 	Parameters.SplatCount      = GlobalAccumulator->AllocatedCount;
-	Parameters.UseGeerSort     = bUseGeerSort ? 1u : 0u;
+	Parameters.UseGeerSort     = (bUseGeerSort && CVarGeerSort.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	// GlobalCalcDistIndirectArgsBuffer is in IndirectArgs state from DispatchPrefixSumVisibleCounts
 	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
@@ -1844,6 +1870,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	VSParameters.SplatCount      = GlobalAccumulator->AllocatedCount;  // Upper bound for VS guard
 	VSParameters.DebugMode       = static_cast<uint32>(FMath::Max(0, DebugMode));
 	VSParameters.EnableNanite    = 1;
+	VSParameters.UseGeerPBF      = (CVarGeerPBF.GetValueOnRenderThread() != 0) ? 1u : 0u;
 
 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
 

@@ -334,6 +334,17 @@ public:
 	/** GEER eval state the cached view data was computed under. Cached W2O rows and the AA
 	 *  opacity scaling are stale if this changes, so the camera-static skip must not reuse them. */
 	bool CachedGeerEval = false;
+	/** GEER footprint mode (gs.GeerPBF) the cached view data was computed under. The cached quad
+	 *  axes and the PBF rect offset in W2OPad1/W2OPad2 are stale if this changes, and the vertex
+	 *  shader reads that offset every frame — so a static camera would otherwise shift every quad
+	 *  by an offset the compute pass never recomputed. */
+	bool CachedGeerPBF = false;
+	/** Diagnostic GEER toggles (gs.GeerSort, gs.GeerAAOpacity) the cached data was computed
+	 *  under. Both change ViewData or the sort key, so the camera-static skip must not reuse
+	 *  a frame taken with different settings — a knob that appears to do nothing is worse than
+	 *  no knob at all when it is the thing you are bisecting with. */
+	bool CachedGeerSort = false;
+	bool CachedGeerAAOpacity = false;
 	bool bHasCachedSortData = false;
 };
 

@@ -36,6 +36,10 @@ StructuredBuffer<uint> SortKeysBuffer;
 uint SplatCount;
 uint DebugMode;  // 0=off, 1=cluster colors (Nanite-style debug view)
 uint EnableNanite;  // 1=Nanite enabled, 0=disabled (non-Nanite assets hidden in debug mode)
+// GEER PBF footprint (gs.GeerPBF): the exact rect's centre is generally NOT the projected splat
+// centre, so CalcViewData stores the NDC offset in W2OPad1/W2OPad2 and it is added here. Global
+// kill-switch only; which splats take it is decided per splat by their W2O rows (zero otherwise).
+uint UseGeerPBF;
 #endif
 
 // Pixel shader parameters for velocity calculation
@@ -148,6 +152,11 @@ struct FVertexOutput
 	nointerpolation float3 W2ORow0 : TEXCOORD6;  // GEER canonical transform rows (gs.GeerEval)
 	nointerpolation float3 W2ORow1 : TEXCOORD7;
 	nointerpolation float3 W2ORow2 : TEXCOORD8;
+	// DIAGNOSTIC (gs.GeerDebugView 2/3): .x = the sort KEY this splat carries (ViewDistance, cm),
+	// .y = the sort RESULT (its position in the sorted draw order, 0..1). Painting them
+	// separately is what distinguishes "the key value is wrong" from "the key is fine but the
+	// order coming out is wrong" — see NEXT-SESSION.md.
+	nointerpolation float2 SortDebug : TEXCOORD9;
 };
 
 // Pixel shader output with velocity for TAA/TSR
@@ -201,6 +210,9 @@ FVertexOutput MainVS(
 	Output.W2ORow0 = viewData.W2ORow0;
 	Output.W2ORow1 = viewData.W2ORow1;
 	Output.W2ORow2 = viewData.W2ORow2;
+	// Diagnostic: the key this splat carries, and where the sort actually put it.
+	Output.SortDebug = float2(viewData.ViewDistance,
+		(SplatCount > 0) ? ((float)InstanceId / (float)SplatCount) : 0.0);
 
 	// Check validity (w <= 0 means invalid/behind camera)
 	if (viewData.ClipPosition.w <= 0.0)
@@ -212,11 +224,21 @@ FVertexOutput MainVS(
 		Output.TranslatedWorldPos = float3(0, 0, 0);
 		Output.CenterClipPos = float4(0, 0, 0, 1);
 		Output.SplatNormal = float4(0, 0, 0, 0);
+		Output.SortDebug = float2(0, 0);
 		return Output;
 	}
 
 	// NDC position of splat center
 	float2 ndc = viewData.ClipPosition.xy / viewData.ClipPosition.w;
+
+	// GEER PBF footprint: shift the QUAD to the exact rect's centre. Per-splat gate on nonzero W2O
+	// rows — the same discriminator the pixel shader uses — so classic assets are untouched even
+	// when a GEER asset is in the same draw. ClipPosition itself is deliberately not moved:
+	// velocity (CenterClipPos) and depth must keep using the true splat centre.
+	if (UseGeerPBF != 0 && dot(viewData.W2ORow0, viewData.W2ORow0) > 0.0)
+	{
+		ndc += float2(viewData.W2OPad1, viewData.W2OPad2);
+	}
 
 	// Use covariance-based axes for quad offset
 	float2 offset = corner.x * viewData.Axis1 + corner.y * viewData.Axis2;
@@ -244,6 +266,7 @@ FVertexOutput MainVS(
 			Output.Position = float4(0, 0, 0, 1);
 			Output.LocalPos = float2(0, 0);
 			Output.Color = float4(0, 0, 0, 0);
+			Output.SortDebug = float2(0, 0);
 			return Output;
 		}
 	}
@@ -342,7 +365,18 @@ FPixelOutput MainPS(FVertexOutput Input)
 		// gs.GeerDebugView 1: paint the canonical radius instead of shading, so the density
 		// field's iso-contours are directly measurable in pixels. Opaque, because this is
 		// meant for the single-splat analytic scene where nothing should blend over it.
-		if (GeerDebugView == 1)
+		// gs.GeerDebugView 2: the sort KEY (ViewDistance, cm, normalised over 10 m).
+		// gs.GeerDebugView 3: the sort RESULT (draw position 0..1).
+		// Both should read as a smooth depth ramp. If 2 is smooth and 3 is noise the key is
+		// right and the sort is not; if 2 is already noise, the key value itself is wrong.
+		if (GeerDebugView == 2 || GeerDebugView == 3)
+		{
+			float t = (GeerDebugView == 2) ? saturate(Input.SortDebug.x / 1000.0)
+			                               : saturate(Input.SortDebug.y);
+			color.rgb = float3(t, saturate(1.0 - abs(t - 0.5) * 4.0), 1.0 - t);
+			color.a = 1.0;
+		}
+		else if (GeerDebugView == 1)
 		{
 			float r = sqrt(max(-2.0 * power, 0.0));
 			color.rgb = float3(

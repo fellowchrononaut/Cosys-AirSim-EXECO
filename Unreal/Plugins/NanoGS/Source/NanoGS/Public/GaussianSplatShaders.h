@@ -55,6 +55,9 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(float, QuadInflation)  // GEER footprint inflation (1.0 = off)
 		SHADER_PARAMETER(uint32, UseGeerEval)   // 1 = fill W2O rows / AA opacity
 		SHADER_PARAMETER(float, GeerNearCull)   // cull GEER splats nearer than this view z (cm)
+		SHADER_PARAMETER(uint32, UseGeerPBF)    // 1 = exact PBF rect instead of the EWA quad
+		SHADER_PARAMETER(float, GeerPBFLambda)  // PBF bound radius in sigma (follows gs.GeerCutoff)
+		SHADER_PARAMETER(uint32, UseGeerAAOpacity)  // diagnostic: GEER AA opacity scaling on/off
 		SHADER_PARAMETER(uint32, GlobalBaseOffset)  // Offset into global ViewDataBuffer (non-compaction global path)
 		// Global compaction path: GPU prefix-sum offsets
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, GlobalBaseOffsetsBuffer)  // prefix sums per proxy
@@ -191,6 +194,7 @@ class FGaussianSplatVS : public FGlobalShader
 		SHADER_PARAMETER(uint32, SplatCount)
 		SHADER_PARAMETER(uint32, DebugMode)  // 0=off, 1=cluster colors (Nanite-style debug)
 		SHADER_PARAMETER(uint32, EnableNanite)  // 1=Nanite enabled, 0=disabled (hidden in debug mode)
+		SHADER_PARAMETER(uint32, UseGeerPBF)  // 1 = add the PBF rect centre offset (W2OPad1/2) to the quad
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

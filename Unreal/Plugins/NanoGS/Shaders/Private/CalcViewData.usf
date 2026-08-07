@@ -44,6 +44,9 @@ float SplatScale;
 float QuadInflation;   // GEER: multiply EWA quad axes (footprint only); 1.0 = off
 uint  UseGeerEval;     // 1 = fill W2O rows / AA opacity (ViewDistance is always filled)
 float GeerNearCull;    // GEER: cull splats nearer than this view-space z (cm); 0 = off
+uint  UseGeerPBF;      // 1 = replace the EWA quad with the exact PBF rect (gs.GeerPBF)
+float GeerPBFLambda;   // PBF bound radius in sigma (follows gs.GeerCutoff; 3.0 when it is off)
+uint  UseGeerAAOpacity; // diagnostic (gs.GeerAAOpacity): GEER antialiasing opacity scaling on/off
 uint GlobalBaseOffset; // Offset into global ViewDataBuffer (for multi-proxy global accumulator, non-compaction path)
 
 // Global compaction path: read per-proxy base offset from GPU prefix-sum buffer
@@ -139,6 +142,9 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float tanFovY = (ScreenSize.y * 0.5) / FocalLength.y;
 	float limX = 1.3 * tanFovX;
 	float limY = 1.3 * tanFovY;
+	// The clamp below is an EWA-specific guard on the projection Jacobian. The PBF bound is exact
+	// off-axis and would be biased by a moved centre, so it uses the true view position.
+	float3 viewPosUnclamped = viewPos.xyz;
 	viewPos.x = clamp(viewPos.x / viewPos.z, -limX, limX) * viewPos.z;
 	viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
 
@@ -173,7 +179,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		float actorScale = length(mul(float3(1, 0, 0), localToWorldRot));
 		// h_var = 1e-7 m^2 (GEER omni_hvar, forward.cu:154-170) = 1e-3 cm^2 in UE units.
 		// Also regularizes packed 8-bit scales that decode to exactly 0.
-		const float H_VAR = 1e-3;
+		// Shared with the PBF bound (ComputePBFPinhole) — both must use the same effective sigma.
+		const float H_VAR = GEER_H_VAR;
 		float3 sw = scale * actorScale;                       // world sigma per axis (cm)
 		float3 sigmaEff = sqrt(sw * sw + H_VAR);
 		// Splat local axis j is COLUMN j of R (see CalcSplatLocalNormal).
@@ -185,11 +192,17 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		w2oRow2 = ax2 / sigmaEff.z;
 		// GEER antialiasing opacity scaling (forward.cu omni_hvar): ~1 except thin splats.
 		// Must happen before opacity is packed into PackedColorBA below.
-		opacity *= (sw.x * sw.y * sw.z) / (sigmaEff.x * sigmaEff.y * sigmaEff.z);
+		// gs.GeerAAOpacity 0 disables it — diagnostic only, see NanoGS.cpp.
+		if (UseGeerAAOpacity != 0)
+		{
+			opacity *= (sw.x * sw.y * sw.z) / (sigmaEff.x * sigmaEff.y * sigmaEff.z);
+		}
 	}
 
 	float3x3 viewMat = (float3x3)WorldToView;
-	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
+	// View-space 3D covariance, shared by the EWA projection and the GEER PBF bound below.
+	float3x3 viewCov = CalcCovariance3DView(cov3D_world, viewMat);
+	float2x2 cov2D = CalcCovariance2D(viewCov, viewPos.xyz, FocalLength);
 
 	// Decompose to axes
 	float2 axis1, axis2;
@@ -204,25 +217,88 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	axis1 *= QuadInflation;
 	axis2 *= QuadInflation;
 
-	// Safety clamp
-	float maxAxisSize = 2.0;
-	if (any(isnan(axis1)) || any(isinf(axis1)) || length(axis1) > maxAxisSize)
+	float2 ndcCenter = clipPos.xy / clipPos.w;
+
+	// --- GEER exact footprint: Particle Bounding Frustum (gs.GeerPBF) ---
+	// The EWA quad above is sized from the PROJECTED 2D covariance, which is wrong in both
+	// directions for GEER: wasteful for some splats, and too SMALL for splats elongated along the
+	// view direction, whose density is then guillotined at the quad edge (measured 2026-08-06:
+	// arm-1 splat C fills 0.850 of its quad with straight edges, against ~0.79 for a Gaussian
+	// ellipse). PBF derives the bound from the 3D covariance instead, so the density falls off
+	// inside its own footprint. This CHANGES the image for those splats, and that is the fix.
+	float2 pbfNdcOffset = float2(0.0, 0.0);
+	bool bPBFRect = false;
+	if (UseGeerEval != 0 && UseGeerPBF != 0)
 	{
-		axis1 = float2(0.01, 0.0);
-	}
-	if (any(isnan(axis2)) || any(isinf(axis2)) || length(axis2) > maxAxisSize)
-	{
-		axis2 = float2(0.0, 0.01);
+		float2 tanCenter, tanHalfExtent;
+		bool bPBFCull;
+		bool bPBFOk = ComputePBFPinhole(viewCov, viewPosUnclamped, GeerPBFLambda,
+			float2(tanFovX, tanFovY), tanCenter, tanHalfExtent, bPBFCull);
+		if (bPBFCull)
+		{
+			// Camera inside this splat's lambda-sigma ellipsoid. The reference drops these
+			// (forward.cu:246-257) and so do we: r = |p|/sigma is ~0 across the whole viewport,
+			// so the splat would paint every pixel at its peak alpha. This is the sigma -> large
+			// half of the degeneracy gs.GeerNearCull guards at p -> 0.
+			WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+			return;
+		}
+		if (bPBFOk)
+		{
+			// Tangent bounds -> NDC: ndc = tan / tanFov, with no y flip (view y and NDC y are both
+			// up here). Taken as a DELTA against the projected centre so that whatever the
+			// projection matrix does to the centre — principal-point offset, near/far, TSR jitter —
+			// cancels, and ClipPosition stays the single source of truth for the centre itself.
+			float2 invTanFov = float2(1.0 / tanFovX, 1.0 / tanFovY);
+			float2 tanSplat = viewPosUnclamped.xy / viewPosUnclamped.z;
+			float2 rectCenter = ndcCenter + (tanCenter - tanSplat) * invTanFov;
+			float2 rectHalf = tanHalfExtent * invTanFov;
+
+			// Clamp the rect to the viewport rather than collapsing it. Pixels outside NDC [-1,1]
+			// are never rasterised, so intersecting with the viewport is lossless — and unlike the
+			// binary collapse the EWA path uses below, it cannot pop in and out under sub-pixel
+			// camera motion. Close splats and the full-FOV fallback both land here.
+			float2 rectMin = max(rectCenter - rectHalf, -1.0);
+			float2 rectMax = min(rectCenter + rectHalf,  1.0);
+			// Exact off-screen cull, replacing the conservative frustum test on this path. Negated
+			// comparisons so a NaN anywhere in the rect culls instead of leaking through.
+			if (!(rectMin.x <= rectMax.x) || !(rectMin.y <= rectMax.y))
+			{
+				WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+				return;
+			}
+			rectCenter = 0.5 * (rectMin + rectMax);
+			rectHalf   = 0.5 * (rectMax - rectMin);
+
+			// Axis-aligned rect: MainVS builds corner.x * Axis1 + corner.y * Axis2.
+			axis1 = float2(rectHalf.x, 0.0);
+			axis2 = float2(0.0, rectHalf.y);
+			pbfNdcOffset = rectCenter - ndcCenter;
+			bPBFRect = true;
+		}
 	}
 
-	// Frustum culling
-	float2 ndcCenter = clipPos.xy / clipPos.w;
-	float2 ndcExtent = abs(axis1) + abs(axis2);
-	if (ndcCenter.x - ndcExtent.x > 1.0 || ndcCenter.x + ndcExtent.x < -1.0 ||
-		ndcCenter.y - ndcExtent.y > 1.0 || ndcCenter.y + ndcExtent.y < -1.0)
+	if (!bPBFRect)
 	{
-		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
-		return;
+		// Safety clamp
+		float maxAxisSize = 2.0;
+		if (any(isnan(axis1)) || any(isinf(axis1)) || length(axis1) > maxAxisSize)
+		{
+			axis1 = float2(0.01, 0.0);
+		}
+		if (any(isnan(axis2)) || any(isinf(axis2)) || length(axis2) > maxAxisSize)
+		{
+			axis2 = float2(0.0, 0.01);
+		}
+
+		// Frustum culling
+		float2 ndcExtent = abs(axis1) + abs(axis2);
+		if (ndcCenter.x - ndcExtent.x > 1.0 || ndcCenter.x + ndcExtent.x < -1.0 ||
+			ndcCenter.y - ndcExtent.y > 1.0 || ndcCenter.y + ndcExtent.y < -1.0)
+		{
+			WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+			return;
+		}
 	}
 
 	// Compute final color
@@ -293,9 +369,9 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	viewData.W2ORow0 = w2oRow0;
 	viewData.ViewDistance = viewDistance;
 	viewData.W2ORow1 = w2oRow1;
-	viewData.W2OPad1 = 0;
+	viewData.W2OPad1 = pbfNdcOffset.x;  // PBF rect centre offset from the projected centre (NDC)
 	viewData.W2ORow2 = w2oRow2;
-	viewData.W2OPad2 = 0;
+	viewData.W2OPad2 = pbfNdcOffset.y;
 	ViewDataBuffer[outputIndex] = viewData;
 }
 

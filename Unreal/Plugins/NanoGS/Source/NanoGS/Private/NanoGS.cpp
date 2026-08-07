@@ -132,6 +132,47 @@ TAutoConsoleVariable<float> CVarGeerNearCull(
 	TEXT("Cull GEER splats closer than this view-space depth in cm (reference: 0.2 m = 20 cm). 0 = off."),
 	ECVF_RenderThreadSafe);
 
+/** Exact GEER footprint: replace the EWA-derived quad with the Particle Bounding Frustum, the
+ *  tight bound on the rays that pierce the splat's cutoff-sigma ellipsoid (forward.cu computePBF,
+ *  pinhole branch). The EWA quad is sized from the PROJECTED 2D covariance, so for splats
+ *  elongated along the view direction it is too SMALL and clips the density with a hard straight
+ *  edge; PBF derives the bound from the 3D covariance instead. This visibly changes the image for
+ *  those splats — that is the fix, not a regression. Default off so it stays an explicit A/B knob;
+ *  the bound follows gs.GeerCutoff so the geometric and per-ray 3-sigma bounds cannot disagree. */
+TAutoConsoleVariable<int32> CVarGeerPBF(
+	TEXT("gs.GeerPBF"),
+	0,
+	TEXT("GEER exact footprint (Particle Bounding Frustum) instead of the inflated EWA quad.\n")
+	TEXT(" 0: EWA quad x gs.GeerQuadInflation (default)\n")
+	TEXT(" 1: PBF rect, bounded at gs.GeerCutoff sigma and clamped to the viewport"),
+	ECVF_RenderThreadSafe);
+
+/** DIAGNOSTIC (2026-08-07): split the Euclidean sort key away from the GEER evaluation, which
+ *  gs.GeerEval otherwise switches together. Against the reference oracle at test view 23 our
+ *  render breaks into hard-edged shards while legacy EWA at the same pose is structurally
+ *  correct, and the two paths differ in exactly four things: the falloff, this sort key, the AA
+ *  opacity scaling, and the near cull. With gs.GeerEval 2 and this 0 you get the GEER falloff
+ *  with the legacy clip-z order, which is the bisect that separates shading from ordering.
+ *  Keep at 1 for normal use — Euclidean is what forward.cu sorts by (depths[] in preprocess),
+ *  and it is also what makes cube-face order consistent for Phase 3. */
+TAutoConsoleVariable<int32> CVarGeerSort(
+	TEXT("gs.GeerSort"),
+	1,
+	TEXT("Sort key used when a GEER asset is visible.\n")
+	TEXT(" 0: legacy clip-z key (diagnostic — isolates ordering from shading)\n")
+	TEXT(" 1: Euclidean camera->splat distance, matching forward.cu (default)"),
+	ECVF_RenderThreadSafe);
+
+/** DIAGNOSTIC (2026-08-07): disable the GEER antialiasing opacity scaling (forward.cu omni_hvar).
+ *  It is ~1 for ordinary splats but drops sharply for splats thinner than sqrt(h_var) = 0.032 cm,
+ *  so on a real checkpoint it is a per-splat opacity change that the analytic scene never
+ *  exercised. Part of the same four-way bisect as gs.GeerSort. */
+TAutoConsoleVariable<int32> CVarGeerAAOpacity(
+	TEXT("gs.GeerAAOpacity"),
+	1,
+	TEXT("GEER antialiasing opacity scaling (forward.cu omni_hvar). 0 = off (diagnostic)."),
+	ECVF_RenderThreadSafe);
+
 /** Diagnostic: visualise the GEER canonical radius instead of shading. Intended for the
  *  single-splat analytic scene (arm 1), where there is no blending to confuse the readout —
  *  it makes the density field's iso-contours directly measurable in pixels, so an effective
@@ -141,7 +182,11 @@ TAutoConsoleVariable<int32> CVarGeerDebugView(
 	0,
 	TEXT("Visualise GEER evaluation instead of shading it.\n")
 	TEXT(" 0: Off (normal shading)\n")
-	TEXT(" 1: Canonical radius r — green ring at r=1 sigma, blue ring at r=2, red ramps 0..3"),
+	TEXT(" 1: Canonical radius r — green ring at r=1 sigma, blue ring at r=2, red ramps 0..3\n")
+	TEXT(" 2: DIAGNOSTIC — the sort KEY (ViewDistance, cm, ramped over 10 m)\n")
+	TEXT(" 3: DIAGNOSTIC — the sort RESULT (position in the sorted draw order, 0..1)\n")
+	TEXT("    2 and 3 should both read as a smooth depth ramp. 2 smooth + 3 noisy means the\n")
+	TEXT("    key is right and the sort is not; 2 already noisy means the key value is wrong."),
 	ECVF_RenderThreadSafe);
 
 TAutoConsoleVariable<float> CVarGSLightingBlend(
@@ -833,6 +878,11 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		// GEER eval mode for this frame. Resolved per proxy below; captured here so the
 		// camera-static skip can notice a change (cached W2O rows / AA opacity go stale).
 		const int32 CurrentGeerMode = CVarGeerEval.GetValueOnRenderThread();
+		// GEER footprint mode, captured for the same reason: toggling it changes the quad axes and
+		// the PBF rect offset the vertex shader adds, neither of which the skip would recompute.
+		const bool bCurrentGeerPBF = CVarGeerPBF.GetValueOnRenderThread() != 0;
+		const bool bCurrentGeerSort = CVarGeerSort.GetValueOnRenderThread() != 0;
+		const bool bCurrentGeerAAOpacity = CVarGeerAAOpacity.GetValueOnRenderThread() != 0;
 
 		bool bCanSkip = GlobalAccumulator->bHasCachedSortData &&
 			GlobalAccumulator->CachedTotalSplatCount == TotalSplatCount &&
@@ -853,7 +903,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					GPUResources->CachedDebugMode != CurrentDebugMode ||
 					GPUResources->CachedDebugForceLODLevel != CurrentDebugForceLODLevel ||
 					GPUResources->CachedGeerEval != ((CurrentGeerMode == 2) ||
-						(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat())))
+						(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat())) ||
+					GPUResources->CachedGeerPBF != bCurrentGeerPBF ||
+					GPUResources->CachedGeerSort != bCurrentGeerSort ||
+					GPUResources->CachedGeerAAOpacity != bCurrentGeerAAOpacity)
 				{
 					bCanSkip = false;
 					break;
@@ -887,7 +940,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			ERDGPassFlags::Raster,
 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, bAllNanite, RawAccumulator,
 			 SharedIndexBuffer, CurrentVP, CurrentDebugMode,
-			 CurrentDebugForceLODLevel, CurrentGeerMode, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
+			 CurrentDebugForceLODLevel, CurrentGeerMode, bCurrentGeerPBF, bCurrentGeerSort,
+			 bCurrentGeerAAOpacity, DebugMode, MaxRenderBudget, bOutputDepth, bOutputNormal,
 			 bUseNormalConfidenceFade](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
@@ -1092,6 +1146,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
 								GPUResources->CachedGeerEval = (CurrentGeerMode == 2) ||
 									(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
+								GPUResources->CachedGeerPBF = bCurrentGeerPBF;
+								GPUResources->CachedGeerSort = bCurrentGeerSort;
+								GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
 								GPUResources->bHasCachedSortData = true;
 							}
 							else
@@ -1194,6 +1251,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
 							GPUResources->CachedGeerEval = (CurrentGeerMode == 2) ||
 								(CurrentGeerMode == 1 && Info.Proxy->IsGeerSplat());
+							GPUResources->CachedGeerPBF = bCurrentGeerPBF;
+							GPUResources->CachedGeerSort = bCurrentGeerSort;
+							GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
 							GPUResources->bHasCachedSortData = true;
 						}
 					}

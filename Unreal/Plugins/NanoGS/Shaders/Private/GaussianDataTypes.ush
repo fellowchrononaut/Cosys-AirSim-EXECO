@@ -6,6 +6,10 @@
 #define SPLATS_PER_CHUNK 256
 #define COLOR_TEXTURE_WIDTH 2048
 #define MORTON_TILE_SIZE 16
+// GEER antialiasing variance, added to each axis' variance (forward.cu omni_hvar: h_var = 1e-7 m^2
+// = 1e-3 cm^2 in UE units). Used by both the canonical transform rows (CalcViewData.usf) and the
+// PBF bound (ComputePBFPinhole), which must be derived from the SAME effective sigma.
+#define GEER_H_VAR 1e-3
 #define NUM_SH_HIGHER_COEFFICIENTS 15  // Higher-order coefficients (bands 1-3)
 #define NUM_SH_TOTAL_COEFFICIENTS 16   // Including DC (band 0)
 #define SH_C0 0.28209479177387814f
@@ -230,16 +234,22 @@ float CalcSplatNormalConfidence(float3 scale)
 	return saturate((mid - lo) / max(mid, 1e-6));
 }
 
-// Project 3D covariance to 2D screen space using EWA splatting formula
-// J is the Jacobian of the projection, W is the view matrix
-// viewPos is the position in view/camera space (x, y, z where z is depth)
-float2x2 CalcCovariance2D(float3x3 cov3D, float3x3 viewMatrix, float3 viewPos, float2 focal)
+// Transform a 3D covariance from world space to view/camera space
+// cov_view = W * cov_world * W^T
+// For row-major matrices: mul(transpose(W), mul(cov, W)) = W * cov * W^T
+// Factored out of CalcCovariance2D so the EWA projection and the GEER PBF bound
+// (ComputePBFPinhole) share one view-space covariance instead of recomputing it.
+float3x3 CalcCovariance3DView(float3x3 cov3D, float3x3 viewMatrix)
 {
-	// Transform covariance from world space to view/camera space
-	// cov_view = W * cov_world * W^T
-	// For row-major matrices: mul(transpose(W), mul(cov, W)) = W * cov * W^T
-	float3x3 viewCov = mul(transpose(viewMatrix), mul(cov3D, viewMatrix));
+	return mul(transpose(viewMatrix), mul(cov3D, viewMatrix));
+}
 
+// Project 3D covariance to 2D screen space using EWA splatting formula
+// J is the Jacobian of the projection
+// viewCov is the view-space 3D covariance (see CalcCovariance3DView)
+// viewPos is the position in view/camera space (x, y, z where z is depth)
+float2x2 CalcCovariance2D(float3x3 viewCov, float3 viewPos, float2 focal)
+{
 	// Depth in camera space
 	float z = viewPos.z;
 	float z2 = z * z;
@@ -280,6 +290,103 @@ float2x2 CalcCovariance2D(float3x3 cov3D, float3x3 viewMatrix, float3 viewPos, f
 	cov2D[1][1] += 0.3;
 
 	return cov2D;
+}
+
+// 3DGEER Particle Bounding Frustum (PBF), pinhole branch. Port of computePBF
+// (forward.cu:210-257); the omni/mirror candidate selection that follows it there
+// (forward.cu:259-345) is deliberately NOT ported — this is the pinhole path only.
+//
+// The PBF is the tight axis-aligned bound, in ray tangent space, of every ray that pierces the
+// splat's lambda-sigma ellipsoid. Unlike the EWA quad — which is sized from the PROJECTED 2D
+// covariance — it is derived from the 3D covariance, so it stays correct for splats whose extent
+// along the view direction exceeds their projected footprint. Those are exactly the splats whose
+// EWA quad is too SMALL, clipping the GEER density with a hard straight edge.
+//
+// Tangent space here is this codebase's view space: x right, y UP, z forward (see GetPixelRay in
+// GaussianSplatRendering.usf). That is also NDC's orientation, so tan -> NDC needs no y flip. The
+// reference's view space has y down; the bound is sign-symmetric in y (flipping p.y and the y row
+// of the covariance flips Tc_12 and the centre with it, leaving the half-extent unchanged), so
+// using our own convention throughout is equivalent, not an approximation.
+//
+// viewCov must NOT already carry the antialiasing variance: h_var is added here, per axis, exactly
+// as computeCov3D does (sigma_j^2 + h_var, with R orthonormal, hence + h_var * I), so the bound
+// comes from the same effective sigma as the pixel shader's density evaluation.
+//
+// ⚠ When the camera lies inside the ellipsoid's slab along an axis the tangent cone does not
+// close, and the splat must be DROPPED — as the reference drops it (forward.cu:246-257,
+// "if (neg) return false"). Do not be tempted to keep it with a full-FOV footprint instead:
+// r = |p| / sigma is then ~0 over the WHOLE viewport, so exp(power) ~ 1 and the splat paints
+// every pixel at its peak alpha. Measured 2026-08-07 on scnt_ph_st: 104 of its 176 055 splats
+// contain the camera in their 3-sigma ellipsoid, all at opacity 1.00 (median sigma 2.49 m, max
+// 42 m — training floaters), and keeping them turned the whole frame opaque grey.
+//
+// This is the SAME degeneracy gs.GeerNearCull guards, approached from the other side: the near
+// cull catches p -> 0, this catches sigma -> large. The near cull does not subsume it.
+//
+// Returns false when no rect could be built; bOutCull says which reason, because they need
+// opposite responses:
+//   bOutCull == false  degenerate algebra -> caller keeps its EWA footprint
+//   bOutCull == true   camera inside the lambda-sigma ellipsoid -> caller CULLS the splat
+bool ComputePBFPinhole(float3x3 viewCov, float3 viewPos, float lambda, float2 tanFov,
+	out float2 outTanCenter, out float2 outTanHalfExtent, out bool bOutCull)
+{
+	outTanCenter = float2(0.0, 0.0);
+	outTanHalfExtent = float2(0.0, 0.0);
+	bOutCull = false;
+
+	float lambdaSq = lambda * lambda;
+
+	// cov3D + h_var * I, matching computeCov3D's per-axis (sigma^2 + h_var)
+	float c00 = viewCov[0][0] + GEER_H_VAR;
+	float c11 = viewCov[1][1] + GEER_H_VAR;
+	float c22 = viewCov[2][2] + GEER_H_VAR;
+	float c02 = viewCov[0][2];
+	float c12 = viewCov[1][2];
+
+	// Tc = lambda^2 * cov - p * p^T, the quadric whose tangent cone from the origin bounds the
+	// ellipsoid. Tc_22 is the denominator of every term below; it is negative whenever the camera
+	// is outside the ellipsoid, which is the case this branch is for.
+	float Tc22 = lambdaSq * c22 - viewPos.z * viewPos.z;
+	if (Tc22 == 0.0)
+	{
+		return false;
+	}
+
+	float Tc00 = lambdaSq * c00 - viewPos.x * viewPos.x;
+	float Tc02 = lambdaSq * c02 - viewPos.x * viewPos.z;
+	float Tc11 = lambdaSq * c11 - viewPos.y * viewPos.y;
+	float Tc12 = lambdaSq * c12 - viewPos.y * viewPos.z;
+
+	outTanCenter = float2(Tc02, Tc12) / Tc22;
+
+	// The reference lets sqrt() of a negative discriminant produce a NaN and tests isnan(). We test
+	// the discriminant directly instead: UE compiles shaders with fast-math, under which isnan() is
+	// permitted to be optimised away entirely. Same branch, same values, no reliance on NaN.
+	float discX = Tc02 * Tc02 - Tc22 * Tc00;
+	float discY = Tc12 * Tc12 - Tc22 * Tc11;
+	float invAbsTc22 = 1.0 / abs(Tc22);
+
+	// Negative discriminant on either axis: the camera is inside the ellipsoid's slab there, the
+	// bound is unbounded, and the splat is dropped — see the header note. The reference fills a
+	// full-FOV extent here before returning false; that value is never used, so we skip it.
+	if (discX < 0.0 || discY < 0.0)
+	{
+		bOutCull = true;
+		return false;
+	}
+
+	// sqrt clamped at 0 purely defensively — the negative cases already returned above.
+	outTanHalfExtent.x = sqrt(max(discX, 0.0)) * invAbsTc22;
+	outTanHalfExtent.y = sqrt(max(discY, 0.0)) * invAbsTc22;
+
+	// Zero-area bound touches no rays (reference: the same test on the tan extents at
+	// forward.cu:911). Written so a NaN in either component also fails and falls back.
+	if (!(outTanHalfExtent.x > 0.0) || !(outTanHalfExtent.y > 0.0))
+	{
+		return false;
+	}
+
+	return true;
 }
 
 // Decompose 2D covariance into principal axes via eigendecomposition
