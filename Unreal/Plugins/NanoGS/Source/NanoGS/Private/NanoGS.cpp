@@ -163,6 +163,19 @@ TAutoConsoleVariable<int32> CVarGeerSort(
 	TEXT(" 1: Euclidean camera->splat distance, matching forward.cu (default)"),
 	ECVF_RenderThreadSafe);
 
+/** DIAGNOSTIC: isolate the sort order from NanoGS's hardware depth-write policy. The GEER
+ *  reference composites splats without letting one splat reject another through a depth buffer,
+ *  whereas NanoGS writes each accepted fragment's centre depth. Leave this enabled by default so
+ *  existing behaviour is unchanged; disable it only for the sort/depth interaction test. Scene
+ *  depth is still tested and the temporal-responsive stencil mask is still written. */
+TAutoConsoleVariable<int32> CVarGeerDepthWrite(
+	TEXT("gs.GeerDepthWrite"),
+	1,
+	TEXT("Diagnostic hardware depth-write policy for the splat pass.\n")
+	TEXT(" 0: test existing scene depth, but do not let splats write depth\n")
+	TEXT(" 1: write splat centre depth (legacy NanoGS behaviour, default)"),
+	ECVF_RenderThreadSafe);
+
 /** DIAGNOSTIC (2026-08-07): disable the GEER antialiasing opacity scaling (forward.cu omni_hvar).
  *  It is ~1 for ordinary splats but drops sharply for splats thinner than sqrt(h_var) = 0.032 cm,
  *  so on a real checkpoint it is a per-splat opacity change that the analytic scene never
@@ -779,13 +792,15 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	}
 	if (DepthTexture)
 	{
-		// Enable depth writes so TSR/TAA can properly detect disocclusion
-		// Splats will write their center depth for each rendered pixel
+		// The diagnostic read-only mode still permits the depth test and stencil write; it removes
+		// only splat centre-depth writes so splats cannot reject one another through hardware depth.
 		Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
 			DepthTexture,
 			ERenderTargetLoadAction::ELoad,
 			ERenderTargetLoadAction::ELoad,
-			FExclusiveDepthStencil::DepthWrite_StencilWrite
+			(CVarGeerDepthWrite.GetValueOnRenderThread() != 0)
+				? FExclusiveDepthStencil::DepthWrite_StencilWrite
+				: FExclusiveDepthStencil::DepthRead_StencilWrite
 		);
 	}
 
@@ -1299,7 +1314,9 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					DepthTexture,
 					ERenderTargetLoadAction::ELoad,
 					ERenderTargetLoadAction::ELoad,
-					FExclusiveDepthStencil::DepthWrite_StencilWrite
+					(CVarGeerDepthWrite.GetValueOnRenderThread() != 0)
+						? FExclusiveDepthStencil::DepthWrite_StencilWrite
+						: FExclusiveDepthStencil::DepthRead_StencilWrite
 				);
 			}
 
