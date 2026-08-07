@@ -247,6 +247,8 @@ class FGaussianSplatPS : public FGlobalShader
 		SHADER_PARAMETER(FVector3f, CameraTranslatedWorldPos) // ViewOrigin + PreViewTranslation
 		SHADER_PARAMETER(float, GeerPowerCutoff)              // -0.5*cutoff^2; discard below. 0 = off
 		SHADER_PARAMETER(uint32, GeerDebugView)               // 1 = visualise canonical radius
+		// Per-face residual diagnostics. 0 is the normal path; see gs.GeerResidualDebug.
+		SHADER_PARAMETER(uint32, GeerResidualDebug)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -286,6 +288,8 @@ class FGaussianSplatCompositePS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, IntermediateSampler)
+		// Decodes the diagnostic accumulator instead of compositing ordinary splat colour.
+		SHADER_PARAMETER(uint32, GeerResidualDebug)
 		// Screen-space lighting: alpha-weighted depth accumulation + scene lights.
 		// DepthAccumTexture (RG32F): R = sum(viewZ * alpha * T), G = sum(alpha * T).
 		// Expected view-space depth at a pixel = R / G.

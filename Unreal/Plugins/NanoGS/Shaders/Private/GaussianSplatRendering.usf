@@ -71,6 +71,7 @@ float2    ViewRectMin;                 // ViewRect.Min (viewport == ViewRect on 
 float3    CameraTranslatedWorldPos;    // ViewOrigin + PreViewTranslation
 float     GeerPowerCutoff;             // -0.5*cutoff^2 (cutoff in sigma); 0 = no cutoff
 uint      GeerDebugView;               // 1 = visualise canonical radius instead of shading
+uint      GeerResidualDebug;            // 1..5 = per-face coverage/evaluation diagnostics
 
 // ADR-001: a viewing ray is (origin, direction), never a direction alone.
 // Phase 1: Origin is the uniform camera position. Later phases may vary it per pixel
@@ -336,11 +337,18 @@ FPixelOutput MainPS(FVertexOutput Input)
 	}
 
 	float distSq = dot(Input.LocalPos, Input.LocalPos);
+	bool isGeerSplat = UseGeerEval != 0 && dot(Input.W2ORow0, Input.W2ORow0) > 0.0;
+	// Residual diagnostics deliberately exclude classic splats. They answer whether the GEER
+	// population presented to two adjacent cube faces, and its exact-ray alpha, agree.
+	if (GeerResidualDebug != 0 && !isGeerSplat)
+	{
+		discard;
+	}
 
 	// Per-splat mode: GEER splats carry nonzero W2O rows (row magnitude = 1/sigmaEff > 0);
 	// classic-asset splats have exactly zero rows and take the legacy branch below unchanged.
 	// UseGeerEval (gs.GeerEval != 0) is only the global kill-switch.
-	if (UseGeerEval != 0 && dot(Input.W2ORow0, Input.W2ORow0) > 0.0)
+	if (isGeerSplat)
 	{
 		// 3DGEER exact per-ray evaluation (forward.cu renderCUDA ~1089-1101):
 		// peak Gaussian density along this pixel's ray, in canonical splat space.
@@ -351,6 +359,33 @@ FPixelOutput MainPS(FVertexOutput Input)
 		float3 dObj = float3(dot(Ray.Dir, Input.W2ORow0), dot(Ray.Dir, Input.W2ORow1), dot(Ray.Dir, Input.W2ORow2));
 		float3 nrm = cross(dObj, pObj);
 		float power = -0.5 * dot(nrm, nrm) / dot(dObj, dObj);
+		bool powerValid = power <= 0.0; // false for NaN and +Inf; matches the normal GEER guard
+		bool cutoffPass = powerValid && !(GeerPowerCutoff < 0.0 && power < GeerPowerCutoff);
+		float evaluatedAlpha = powerValid ? min(0.99, color.a * exp(power)) : 0.0;
+		bool alphaPass = cutoffPass && evaluatedAlpha >= (1.0 / 255.0);
+
+		// Modes 1-4 use additive RT0 blending selected by the C++ draw path. Keeping the stages
+		// separate makes the first divergent gate visible: footprint -> cutoff -> alpha threshold
+		// -> evaluated weight. Output zero rather than discard for failed stages so the definition
+		// of each mode stays explicit. Other MRTs contribute nothing in this diagnostic pass.
+		if (GeerResidualDebug >= 1 && GeerResidualDebug <= 4)
+		{
+			float metric = 0.0;
+			if (GeerResidualDebug == 1) metric = 1.0;
+			else if (GeerResidualDebug == 2) metric = cutoffPass ? 1.0 : 0.0;
+			else if (GeerResidualDebug == 3) metric = alphaPass ? 1.0 : 0.0;
+			else metric = alphaPass ? evaluatedAlpha : 0.0;
+
+			Output.Color = float4(metric, metric, metric, metric);
+			Output.Velocity = EncodeVelocityToTexture(Velocity);
+		#if OUTPUT_DEPTH
+			Output.DepthAccum = float4(0, 0, 0, 0);
+		#endif
+		#if OUTPUT_NORMAL
+			Output.NormalAccum = float4(0, 0, 0, 0);
+		#endif
+			return Output;
+		}
 		// 3-sigma cutoff (gs.GeerCutoff). The reference bounds EVERY Gaussian at `cutoff` sigma
 		// and culls rays outside those bounds before shading (forward.cu:882, and the tan-bounds
 		// test in renderCUDA) — in all association modes, PBF and EWA alike. Without it the
@@ -358,7 +393,7 @@ FPixelOutput MainPS(FVertexOutput Input)
 		// the legacy falloff reached exactly zero; across millions of overlapping splats that
 		// accumulates into a milky, order-dependent wash. Applied per ray, so it is independent
 		// of the footprint's shape and stays correct when Phase 2 swaps the quad for a PBF rect.
-		if (GeerPowerCutoff < 0.0 && power < GeerPowerCutoff)
+		if (!cutoffPass)
 		{
 			discard;
 		}
@@ -392,13 +427,9 @@ FPixelOutput MainPS(FVertexOutput Input)
 			// alpha — the opposite behaviour. Mathematically power <= 0 always (both terms of
 			// -0.5*|n|^2/|d|^2 are non-negative), so this only fires on NaN/Inf, but match the
 			// reference rather than invert it.
-			if (!(power <= 0.0))
-			{
-				discard;
-			}
 			// No unit-circle discard on this path: the quad is only a footprint (and Phase 2's
 			// PBF rects must not be cut to a circle). The 1/255 alpha discard below remains.
-			color.a = min(0.99, color.a * exp(power));
+			color.a = evaluatedAlpha;
 		}
 	}
 	else

@@ -202,6 +202,23 @@ TAutoConsoleVariable<int32> CVarGeerDebugView(
 	TEXT("    key is right and the sort is not; 2 already noisy means the key value is wrong."),
 	ECVF_RenderThreadSafe);
 
+/** Diagnostic for cube-face residual attribution. Modes 1-4 switch RT0 to additive blending and
+ * accumulate one scalar per GEER fragment; mode 5 exposes the ordinary over-composite's final
+ * opacity. The composite pass writes a pure grayscale frame on black, so mesh shading and scene
+ * post colour cannot be mistaken for a splat residual. Off by default and inert in mode 0. */
+TAutoConsoleVariable<int32> CVarGeerResidualDebug(
+	TEXT("gs.GeerResidualDebug"),
+	0,
+	TEXT("Per-face GEER coverage/evaluation residual diagnostic.\n")
+	TEXT(" 0: Off (normal rendering)\n")
+	TEXT(" 1: Additive candidate count (rasterized quad/PBF footprint)\n")
+	TEXT(" 2: Additive finite-power/cutoff survivor count\n")
+	TEXT(" 3: Additive final contributor count (alpha >= 1/255)\n")
+	TEXT(" 4: Additive sum of accepted per-splat alpha\n")
+	TEXT(" 5: Final over-composited opacity, 1-product(1-alpha), order independent\n")
+	TEXT("Modes 1-4 are log2(1+x)/16 encoded for display; mode 5 is linear."),
+	ECVF_RenderThreadSafe);
+
 TAutoConsoleVariable<float> CVarGSLightingBlend(
 	TEXT("gs.LightingBlend"),
 	0.0f,
@@ -736,9 +753,16 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 	// Create intermediate render target for sRGB-space alpha blending.
 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
 	// to produce correct colors. After compositing, we convert sRGB→linear for SceneColor.
+	// Residual modes 1-4 add integer-like fragment counts. FP16 stops representing unit increments
+	// exactly above 2048 and can saturate in a dense checkpoint, so use FP32 only while one of those
+	// explicitly requested diagnostics is active. Mode 0 retains the normal format and cost.
+	const int32 GeerResidualMode = CVarGeerResidualDebug.GetValueOnRenderThread();
+	const EPixelFormat IntermediateFormat = (GeerResidualMode >= 1 && GeerResidualMode <= 4)
+		? PF_A32B32G32R32F
+		: PF_FloatRGBA;
 	FRDGTextureDesc IntermediateDesc = FRDGTextureDesc::Create2D(
 		ColorTexture->Desc.Extent,
-		PF_FloatRGBA,  // Need alpha channel for accumulation tracking
+		IntermediateFormat,  // Need alpha channel for accumulation tracking
 		FClearValueBinding(FLinearColor::Transparent),
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
 	FRDGTexture* IntermediateTexture = GraphBuilder.CreateTexture(IntermediateDesc, TEXT("GaussianSplatIntermediateRT"));

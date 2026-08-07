@@ -26,6 +26,7 @@ extern TAutoConsoleVariable<int32> CVarGeerEval;
 extern TAutoConsoleVariable<float> CVarGeerQuadInflation;
 extern TAutoConsoleVariable<float> CVarGeerCutoff;
 extern TAutoConsoleVariable<int32> CVarGeerDebugView;
+extern TAutoConsoleVariable<int32> CVarGeerResidualDebug;
 extern TAutoConsoleVariable<float> CVarGeerNearCull;
 extern TAutoConsoleVariable<int32> CVarGeerPBF;
 extern TAutoConsoleVariable<int32> CVarGeerSort;
@@ -49,6 +50,24 @@ static FRHIDepthStencilState* GetGaussianSplatDepthStencilState()
 		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,
 		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,
 		0x08, 0x08
+	>::GetRHI();
+}
+
+static bool IsGeerResidualAdditive()
+{
+	const int32 Mode = CVarGeerResidualDebug.GetValueOnRenderThread();
+	return Mode >= 1 && Mode <= 4;
+}
+
+// RT0 becomes a scalar sum for residual modes 1-4. Velocity remains replacement and diagnostic
+// passes intentionally do not write the optional lighting accumulators.
+static FRHIBlendState* GetGeerResidualAdditiveBlendState()
+{
+	return TStaticBlendState<
+		CW_RGBA, BO_Add, BF_One, BF_One, BO_Add, BF_One, BF_One,
+		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero,
+		CW_NONE, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero,
+		CW_NONE, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
 	>::GetRHI();
 }
 
@@ -163,6 +182,8 @@ static void SetVelocityPSParameters(
 	const float GeerCutoff = FMath::Max(CVarGeerCutoff.GetValueOnRenderThread(), 0.0f);
 	PSParameters.GeerPowerCutoff = (GeerCutoff > 0.0f) ? (-0.5f * GeerCutoff * GeerCutoff) : 0.0f;
 	PSParameters.GeerDebugView = (uint32)FMath::Max(CVarGeerDebugView.GetValueOnRenderThread(), 0);
+	PSParameters.GeerResidualDebug = (uint32)FMath::Clamp(
+		CVarGeerResidualDebug.GetValueOnRenderThread(), 0, 5);
 }
 
 FGaussianSplatRenderer::FGaussianSplatRenderer()
@@ -682,12 +703,19 @@ void FGaussianSplatRenderer::DrawSplats(
 	//   Using CW_RGBA: splats render to intermediate sRGB RT which needs alpha tracking.
 	//   The composite pass later converts sRGB→linear and writes to SceneColor with CW_RGB.
 	// RT1 (Velocity): Simple replacement - velocity values should not be blended
-	GraphicsPSOInit.BlendState = TStaticBlendState<
-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
-	>::GetRHI();
+	if (IsGeerResidualAdditive())
+	{
+		GraphicsPSOInit.BlendState = GetGeerResidualAdditiveBlendState();
+	}
+	else
+	{
+		GraphicsPSOInit.BlendState = TStaticBlendState<
+			// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
+			// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+			CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
+		>::GetRHI();
+	}
 
 	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
 	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
@@ -1334,7 +1362,11 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
 	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
 	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.
-	if (bOutputDepth && bOutputNormal)
+	if (IsGeerResidualAdditive())
+	{
+		GraphicsPSOInit.BlendState = GetGeerResidualAdditiveBlendState();
+	}
+	else if (bOutputDepth && bOutputNormal)
 	{
 		GraphicsPSOInit.BlendState = TStaticBlendState<
 			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
@@ -1820,7 +1852,11 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	// Blend mode for MRT: RT0 (sRGB intermediate) premultiplied alpha, RT1 (Velocity) replacement.
 	// GeometryMode 2 needs BOTH depth accum (for world-position, reused from GeometryMode 0) AND
 	// normal accum (RT2 + RT3) simultaneously; modes 0/1 need at most one of the two extra MRTs.
-	if (bOutputDepth && bOutputNormal)
+	if (IsGeerResidualAdditive())
+	{
+		GraphicsPSOInit.BlendState = GetGeerResidualAdditiveBlendState();
+	}
+	else if (bOutputDepth && bOutputNormal)
 	{
 		GraphicsPSOInit.BlendState = TStaticBlendState<
 			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0 color
@@ -2171,6 +2207,8 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	FGaussianSplatCompositePS::FParameters PSParameters;
 	PSParameters.IntermediateTexture = IntermediateTexture;
 	PSParameters.IntermediateSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PSParameters.GeerResidualDebug = (uint32)FMath::Clamp(
+		CVarGeerResidualDebug.GetValueOnRenderThread(), 0, 5);
 
 	// Screen-space lighting parameters.
 	// DepthAccumTexture (RG32F) holds alpha-weighted view-space depth, used for world-position

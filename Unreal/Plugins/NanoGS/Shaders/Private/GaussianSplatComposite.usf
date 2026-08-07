@@ -14,6 +14,7 @@
 
 Texture2D IntermediateTexture;
 SamplerState IntermediateSampler;
+uint GeerResidualDebug;
 
 // Screen-space lighting parameters (bound when LightingBlend > 0)
 // DepthAccumTexture (RG32F): .r = sum(viewZ*alpha*T), .g = sum(alpha*T).
@@ -375,6 +376,18 @@ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
 	// This avoids UV scaling issues when ViewRect != full texture extent
 	int2 PixelPos = int2(Input.Position.xy);
 	float4 srgbAccum = IntermediateTexture.Load(int3(PixelPos, 0));
+
+	// Pure diagnostic output: black means zero GEER contribution even when a mesh or sky exists
+	// underneath. Modes 1-4 contain additive scalar moments and use a fixed log encoding so dense
+	// real checkpoints do not saturate; mode 5 exposes ordinary final opacity directly. Alpha 1
+	// makes the full-screen composite replace SceneColor, removing the environment from the test.
+	if (GeerResidualDebug != 0)
+	{
+		float value = (GeerResidualDebug <= 4)
+			? saturate(log2(1.0 + max(srgbAccum.r, 0.0)) / 16.0)
+			: saturate(srgbAccum.a);
+		return float4(value.xxx, 1.0);
+	}
 
 	// Early out for fully transparent pixels (no splat contribution)
 	if (srgbAccum.a <= 0.0)

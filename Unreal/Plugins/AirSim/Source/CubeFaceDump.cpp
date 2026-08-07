@@ -92,6 +92,14 @@ static TAutoConsoleVariable<int32> CVarCubeFaceBench(
     TEXT(" N: N timed iterations per arm, render side only, no readback"),
     ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarCubeFaceDumpFloat(
+    TEXT("airsim.CubeFaceDumpFloat"),
+    0,
+    TEXT("Also write each airsim.CubeFaceDump face as a raw RGBA float32 file.\n")
+    TEXT("Header: four little-endian uint32 values: magic 'CF32', width, height, channels=4.\n")
+    TEXT("Payload: row-major FLinearColor RGBA float32. 0=off (default), 1=on."),
+    ECVF_Default);
+
 namespace
 {
     // Image-space edges of a face, named as they appear in the written PNG.
@@ -200,6 +208,27 @@ namespace
         FImageUtils::PNGCompressImageArray(width, height, TArrayView64<const FColor>(opaque.GetData(), opaque.Num()), png);
         if (!FFileHelper::SaveArrayToFile(png, *path)) {
             UE_LOG(LogTemp, Warning, TEXT("[CubeFace] could not write %s"), *path);
+        }
+    }
+
+    void WriteFloatDump(const TArray<FLinearColor>& pixels, int32 width, int32 height,
+                        const FString& path)
+    {
+        static_assert(sizeof(FLinearColor) == sizeof(float) * 4,
+                      "Cube-face float dump assumes four contiguous float32 channels");
+        if (pixels.Num() < width * height)
+            return;
+
+        constexpr uint32 magic_cf32 = 0x32334643; // ASCII "CF32" in little-endian byte order
+        const uint32 header[4] = { magic_cf32, static_cast<uint32>(width),
+                                   static_cast<uint32>(height), 4u };
+        const int32 payload_bytes = width * height * sizeof(FLinearColor);
+        TArray<uint8> bytes;
+        bytes.SetNumUninitialized(sizeof(header) + payload_bytes);
+        FMemory::Memcpy(bytes.GetData(), header, sizeof(header));
+        FMemory::Memcpy(bytes.GetData() + sizeof(header), pixels.GetData(), payload_bytes);
+        if (!FFileHelper::SaveArrayToFile(bytes, *path)) {
+            UE_LOG(LogTemp, Warning, TEXT("[CubeFace] could not write float dump %s"), *path);
         }
     }
 
@@ -333,6 +362,22 @@ namespace
                                                                           *camera->GetName(), face,
                                                                           APIPCamera::getCubeFaceName(face)));
                 WritePng(face_pixels[face], size, size, path);
+
+                if (CVarCubeFaceDumpFloat.GetValueOnGameThread() != 0) {
+                    TArray<FLinearColor> linear_pixels;
+                    const bool linear_ok = resource->ReadLinearColorPixels(linear_pixels);
+                    const FString float_path = FPaths::Combine(
+                        dir, FString::Printf(TEXT("%s_scene_face%d_%s.rgba32f"),
+                                             *camera->GetName(), face,
+                                             APIPCamera::getCubeFaceName(face)));
+                    if (linear_ok) {
+                        WriteFloatDump(linear_pixels, size, size, float_path);
+                    }
+                    else {
+                        UE_LOG(LogTemp, Warning, TEXT("[CubeFace] linear read failed for %s face %d"),
+                               *camera->GetName(), face);
+                    }
+                }
             }
 
             //The shared-edge check. cross is the difference across the cube edge; refA and refB
