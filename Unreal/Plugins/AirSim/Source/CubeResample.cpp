@@ -270,7 +270,7 @@ void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> 
                         uint32 width, uint32 height, bool central,
                         TArray<FAirSimRaymapBinRect> inverse_direction_rects,
                         uint32 inverse_direction_width, uint32 inverse_direction_height,
-                        FVector3f common_origin_camera_cm)
+                        FVector3f common_origin_camera_cm, float min_ray_forward_component)
 {
     if (!resource.IsValid() || values.Num() == 0)
         return;
@@ -279,7 +279,8 @@ void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> 
     (
         [resource, values = MoveTemp(values), width, height, central,
          inverse_direction_rects = MoveTemp(inverse_direction_rects),
-         inverse_direction_width, inverse_direction_height, common_origin_camera_cm]
+         inverse_direction_width, inverse_direction_height, common_origin_camera_cm,
+         min_ray_forward_component]
         (FRHICommandListImmediate& cmd_list) {
             const uint32 stride = static_cast<uint32>(sizeof(float));
             const uint32 bytes = static_cast<uint32>(values.Num()) * stride;
@@ -306,6 +307,7 @@ void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> 
             resource->height = height;
             resource->central = central;
             resource->common_origin_camera_cm = common_origin_camera_cm;
+            resource->min_ray_forward_component = min_ray_forward_component;
 
             const uint32 expected_inverse_entries =
                 inverse_direction_width * inverse_direction_height;

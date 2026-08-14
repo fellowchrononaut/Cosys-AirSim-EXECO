@@ -16,7 +16,8 @@ void AirSimRegisterNativeGeerView(FRenderTarget* output_target,
                                   FString camera_name,
                                   FIntPoint output_extent,
                                   const FAirSimRaymapResourcePtr& raymap,
-                                  bool central)
+                                  bool central,
+                                  float min_ray_forward_component)
 {
     if (output_target == nullptr || !raymap.IsValid()) {
         UE_LOG(LogTemp, Error,
@@ -26,7 +27,8 @@ void AirSimRegisterNativeGeerView(FRenderTarget* output_target,
     }
 
     ENQUEUE_RENDER_COMMAND(AirSimRegisterNativeGeerViewCommand)
-    ([output_target, camera_name = MoveTemp(camera_name), output_extent, raymap, central]
+    ([output_target, camera_name = MoveTemp(camera_name), output_extent, raymap, central,
+      min_ray_forward_component]
      (FRHICommandListImmediate&) mutable {
         check(IsInRenderingThread());
 
@@ -49,6 +51,7 @@ void AirSimRegisterNativeGeerView(FRenderTarget* output_target,
             static_cast<int32>(raymap->inverse_direction_width),
             static_cast<int32>(raymap->inverse_direction_height));
         view.common_origin_camera_cm = raymap->common_origin_camera_cm;
+        view.min_ray_forward_component = min_ray_forward_component;
         view.registration_serial = ++GAirSimNativeGeerRegistrationSerial;
         view.central = central;
         view.inverse_direction_ready = raymap->inverse_direction_ready;
@@ -57,7 +60,7 @@ void AirSimRegisterNativeGeerView(FRenderTarget* output_target,
         UE_LOG(LogTemp, Log,
                TEXT("[AirSim][NativeGEER][GateA] registered camera=%s target=%p serial=%llu ")
                TEXT("output=%dx%d raymap=%ux%u ready=true central=%s inverse=%dx%d inverse_ready=%s ")
-               TEXT("common_origin_cm=(%.6f,%.6f,%.6f)"),
+               TEXT("common_origin_cm=(%.6f,%.6f,%.6f) min_ray_forward=%.6f"),
                *view.camera_name, output_target,
                static_cast<unsigned long long>(view.registration_serial),
                view.output_extent.X, view.output_extent.Y,
@@ -66,7 +69,7 @@ void AirSimRegisterNativeGeerView(FRenderTarget* output_target,
                view.inverse_direction_grid.X, view.inverse_direction_grid.Y,
                view.inverse_direction_ready ? TEXT("true") : TEXT("false"),
                view.common_origin_camera_cm.X, view.common_origin_camera_cm.Y,
-               view.common_origin_camera_cm.Z);
+               view.common_origin_camera_cm.Z, view.min_ray_forward_component);
     });
 }
 

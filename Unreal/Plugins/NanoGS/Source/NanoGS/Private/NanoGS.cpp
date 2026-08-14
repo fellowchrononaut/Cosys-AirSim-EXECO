@@ -34,6 +34,7 @@ namespace
 	TSet<uint64> GNanoGSLoggedNativeGeerActive;
 	TSet<uint64> GNanoGSLoggedNativeGeerCandidateStates;
 	TSet<uint64> GNanoGSLoggedNativeGeerCompositeStates;
+	TSet<uint64> GNanoGSLoggedNativeGeerNearCullStates;
 }
 
 // Pass 2 parameter struct: declares IntermediateTexture, DepthAccumTexture, and CustomDepthTexture
@@ -142,8 +143,46 @@ TAutoConsoleVariable<float> CVarGeerCutoff(
 TAutoConsoleVariable<float> CVarGeerNearCull(
 	TEXT("gs.GeerNearCull"),
 	20.0f,
-	TEXT("Cull GEER splats closer than this view-space depth in cm (reference: 0.2 m = 20 cm). 0 = off."),
+	TEXT("Cull GEER splats closer than this distance in cm (reference: 0.2 m = 20 cm). 0 = off. ")
+	TEXT("WHICH distance on a native camera is gs.GeerNearCullMode; pinhole/cube always use view-space z."),
 	ECVF_RenderThreadSafe);
+
+/** Which distance gs.GeerNearCull measures on a NATIVE raymap camera.
+ *
+ *  The reference culls on view-space z (auxiliary.h in_frustum), a HALF-SPACE. The native path
+ *  culled on Euclidean range from the common ray origin, a BALL. Since r >= |z| the ball is
+ *  strictly inside the slab, so the native cull can never remove more than the reference's and
+ *  a splat close to the camera but off to the side survives here and is dropped there. Those
+ *  survivors are precisely the degenerate ones — p -> 0 shades the whole quad at near-full
+ *  opacity — so they arrive as a bright veil over the frame. Measured at Gate E test view 9:
+ *  the reference culled 1,328,067 splats, we culled 534, and 49,613 splats with 0 < z <= 0.2 m
+ *  were shaded here and dropped there. Not a tuning error: raising gs.GeerNearCull to 40 cm
+ *  recovered 2.35 dB but pushed the frame mean BELOW the reference, because the ball trades
+ *  peripheral splats it should keep for axial ones it should not.
+ *
+ *  Axial is not unconditionally right either. It is a distance only while every ray points into
+ *  the forward half-space; past 90 deg off axis, view-space z goes to zero and then negative for
+ *  rays that are perfectly valid, so an axial cull would erase the periphery of a wide fisheye.
+ *  Hence Auto, which reads the answer off the raymap itself (FAirSimNativeGeerView::
+ *  min_ray_forward_component) rather than trusting a declaration. Modes 1 and 2 pin it for A/B.
+ *
+ *  Native cameras only. The pinhole and cube paths already cull on view-space z and stay
+ *  bit-identical under every mode, which Gate F's non-invasiveness requirement needs. */
+TAutoConsoleVariable<int32> CVarGeerNearCullMode(
+	TEXT("gs.GeerNearCullMode"),
+	0,
+	TEXT("What gs.GeerNearCull measures on a NativeGEER camera (no effect on pinhole/cube).\n")
+	TEXT(" 0: Auto - axial when every valid raymap direction points forward, else Euclidean (default)\n")
+	TEXT(" 1: force axial (view-space z from the ray apex; matches the reference's in_frustum)\n")
+	TEXT(" 2: force Euclidean (range from the common ray origin)"),
+	ECVF_RenderThreadSafe);
+
+/** Auto needs a strictly forward ray set, not a merely non-backward one. A 180 deg lens produces
+ *  directions at exactly 90 deg whose forward component is zero only up to float rounding, and for
+ *  those axial distance is zero regardless of range — the cull would fire on every splat or none
+ *  depending on the sign of the noise. Requiring a margin sends that case to Euclidean, which is
+ *  the answer that stays a distance. */
+static constexpr float kNanoGSNativeGeerAxialCullMinForward = 1.0e-4f;
 
 /** Exact GEER footprint: replace the EWA-derived quad with the Particle Bounding Frustum, the
  *  tight bound on the rays that pierce the splat's cutoff-sigma ellipsoid (forward.cu computePBF,
@@ -750,6 +789,15 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		bNativeRaymapDimensionsMatch && NativeGeerView.central && NativeGeerView.raymap->central;
 	const int32 NativeGeerCandidateMode = FMath::Clamp(
 		CVarNativeGeerCandidateMode.GetValueOnRenderThread(), 0, 1);
+	// Near-cull criterion. Resolved here, where both the CVar and the registered raymap's measured
+	// ray spread are in hand, so the shader receives one already-decided flag rather than a policy.
+	const int32 NativeGeerNearCullModeCVar = FMath::Clamp(
+		CVarGeerNearCullMode.GetValueOnRenderThread(), 0, 2);
+	const bool bNativeGeerRaysAllForward = bNativeGeerRegistered &&
+		FMath::IsFinite(NativeGeerView.min_ray_forward_component) &&
+		NativeGeerView.min_ray_forward_component > kNanoGSNativeGeerAxialCullMinForward;
+	const bool bNativeGeerNearCullAxial = NativeGeerNearCullModeCVar == 1 ||
+		(NativeGeerNearCullModeCVar == 0 && bNativeGeerRaysAllForward);
 	const FIntPoint RequiredNativeGeerInverseGrid(
 		static_cast<int32>(kAirSimNativeGeerInverseWidth),
 		static_cast<int32>(kAirSimNativeGeerInverseHeight));
@@ -828,6 +876,44 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					TEXT("[NanoGS][NativeGEER][GateC] candidate mode 1 requires the exact 256x128 ")
 					TEXT("inverse resource; camera=%s will remain black"),
 					*NativeGeerView.camera_name);
+			}
+		}
+
+		// The resolved near-cull criterion, and the raymap evidence Auto resolved it from. Which
+		// criterion is live changes the image, so it has to be readable from the log rather than
+		// inferred from the CVar, whose Auto value does not say what it chose. Keyed on its own
+		// mode, NOT on the candidate state, so changing gs.GeerNearCullMode at runtime re-logs.
+		const uint64 NearCullLogKey = (NativeGeerView.registration_serial << 2u) |
+			static_cast<uint64>(NativeGeerNearCullModeCVar);
+		if (!GNanoGSLoggedNativeGeerNearCullStates.Contains(NearCullLogKey))
+		{
+			GNanoGSLoggedNativeGeerNearCullStates.Add(NearCullLogKey);
+			UE_LOG(LogTemp, Log,
+				TEXT("[NanoGS][NativeGEER][GateE] camera=%s serial=%llu near_cull_mode=%d (%s) ")
+				TEXT("resolved=%s min_ray_forward=%.6f (widest valid ray %.2f deg off axis) ")
+				TEXT("rays_all_forward=%s threshold=%.6f near_cull_cm=%.3f"),
+				*NativeGeerView.camera_name,
+				static_cast<unsigned long long>(NativeGeerView.registration_serial),
+				NativeGeerNearCullModeCVar,
+				NativeGeerNearCullModeCVar == 0 ? TEXT("auto")
+					: (NativeGeerNearCullModeCVar == 1 ? TEXT("force-axial")
+													   : TEXT("force-euclidean")),
+				bNativeGeerNearCullAxial ? TEXT("axial") : TEXT("euclidean"),
+				NativeGeerView.min_ray_forward_component,
+				FMath::RadiansToDegrees(FMath::Acos(
+					FMath::Clamp(NativeGeerView.min_ray_forward_component, -1.0f, 1.0f))),
+				bNativeGeerRaysAllForward ? TEXT("true") : TEXT("false"),
+				kNanoGSNativeGeerAxialCullMinForward,
+				FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f));
+			if (NativeGeerNearCullModeCVar == 1 && !bNativeGeerRaysAllForward)
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("[NanoGS][NativeGEER][GateE] camera=%s is forced to the axial near cull ")
+					TEXT("but its raymap reaches %.2f deg off axis; splats near the periphery ")
+					TEXT("will be culled on a signed z that is no longer their range"),
+					*NativeGeerView.camera_name,
+					FMath::RadiansToDegrees(FMath::Acos(
+						FMath::Clamp(NativeGeerView.min_ray_forward_component, -1.0f, 1.0f))));
 			}
 		}
 	}
@@ -1182,6 +1268,14 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		const int32 CurrentNativeGeerCandidateMode = bNativeGeerView
 			? FMath::Clamp(CVarNativeGeerCandidateMode.GetValueOnRenderThread(), 0, 1)
 			: 0;
+		// Near cull, captured for the same reason as the knobs above but with more force: this one
+		// decides WHICH splats CalcViewData writes at all, so a stale skip does not merely shade
+		// the old way, it returns the old splat set. Both the criterion and the threshold are in
+		// the key; the threshold was previously absent, which made every camera-static sweep of
+		// gs.GeerNearCull hand back the first arm's image.
+		const bool bCurrentNativeGeerNearCullAxial = bNativeGeerView && bNativeGeerNearCullAxial;
+		const float CurrentGeerNearCull =
+			FMath::Max(CVarGeerNearCull.GetValueOnRenderThread(), 0.0f);
 		const uint64 CurrentNativeGeerRegistrationSerial = bNativeGeerView
 			? NativeGeerView.registration_serial : 0;
 
@@ -1190,6 +1284,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 			GlobalAccumulator->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f) &&
 			GlobalAccumulator->CachedNativeGeer == bNativeGeerView &&
 			GlobalAccumulator->CachedNativeGeerCandidateMode == CurrentNativeGeerCandidateMode &&
+			GlobalAccumulator->CachedNativeGeerNearCullAxial == bCurrentNativeGeerNearCullAxial &&
+			GlobalAccumulator->CachedGeerNearCull == CurrentGeerNearCull &&
 			GlobalAccumulator->CachedNativeGeerRegistrationSerial == CurrentNativeGeerRegistrationSerial;
 
 		if (bCanSkip)
@@ -1213,6 +1309,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 					GPUResources->CachedGeerAAOpacity != bCurrentGeerAAOpacity ||
 					GPUResources->CachedNativeGeer != bNativeGeerView ||
 					GPUResources->CachedNativeGeerCandidateMode != CurrentNativeGeerCandidateMode ||
+					GPUResources->CachedNativeGeerNearCullAxial != bCurrentNativeGeerNearCullAxial ||
+					GPUResources->CachedGeerNearCull != CurrentGeerNearCull ||
 					GPUResources->CachedNativeGeerRegistrationSerial != CurrentNativeGeerRegistrationSerial)
 				{
 					bCanSkip = false;
@@ -1258,6 +1356,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				 bUseNormalConfidenceFade, bWriteSplatDepth, bNativeGeerView, NativeGeerRaymap,
 				 NativeGeerRaymapSize, NativeGeerInverseDirection, NativeGeerInverseGrid,
 				 NativeGeerCommonOriginCameraCm, CurrentNativeGeerCandidateMode,
+				 bCurrentNativeGeerNearCullAxial, CurrentGeerNearCull,
 				 CurrentNativeGeerRegistrationSerial](FRHICommandListImmediate& RHICmdList)
 			{
 				if (!SceneView) return;
@@ -1445,6 +1544,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
 						RawAccumulator->CachedNativeGeer = false;
 						RawAccumulator->CachedNativeGeerCandidateMode = 0;
+						RawAccumulator->CachedNativeGeerNearCullAxial = false;
+						RawAccumulator->CachedGeerNearCull = CurrentGeerNearCull;
 						RawAccumulator->CachedNativeGeerRegistrationSerial = 0;
 
 						for (int32 i = 0; i < ValidProxies.Num(); i++)
@@ -1469,6 +1570,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
 								GPUResources->CachedNativeGeer = false;
 								GPUResources->CachedNativeGeerCandidateMode = 0;
+								GPUResources->CachedNativeGeerNearCullAxial = false;
+								GPUResources->CachedGeerNearCull = CurrentGeerNearCull;
 								GPUResources->CachedNativeGeerRegistrationSerial = 0;
 								GPUResources->bHasCachedSortData = true;
 							}
@@ -1551,7 +1654,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 								NativeGeerInverseGrid,
 								NativeGeerRaymapSize,
 								NativeGeerCommonOriginCameraCm,
-								CurrentNativeGeerCandidateMode);
+								CurrentNativeGeerCandidateMode,
+								bCurrentNativeGeerNearCullAxial);
 						}
 
 						// --------------------------------------------------
@@ -1568,6 +1672,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
 						RawAccumulator->CachedNativeGeer = bNativeGeerView;
 						RawAccumulator->CachedNativeGeerCandidateMode = CurrentNativeGeerCandidateMode;
+						RawAccumulator->CachedNativeGeerNearCullAxial = bCurrentNativeGeerNearCullAxial;
+						RawAccumulator->CachedGeerNearCull = CurrentGeerNearCull;
 						RawAccumulator->CachedNativeGeerRegistrationSerial = CurrentNativeGeerRegistrationSerial;
 
 						for (const auto& Info : ValidProxies)
@@ -1589,6 +1695,8 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 							GPUResources->CachedGeerAAOpacity = bCurrentGeerAAOpacity;
 							GPUResources->CachedNativeGeer = bNativeGeerView;
 							GPUResources->CachedNativeGeerCandidateMode = CurrentNativeGeerCandidateMode;
+							GPUResources->CachedNativeGeerNearCullAxial = bCurrentNativeGeerNearCullAxial;
+							GPUResources->CachedGeerNearCull = CurrentGeerNearCull;
 							GPUResources->CachedNativeGeerRegistrationSerial = CurrentNativeGeerRegistrationSerial;
 							GPUResources->bHasCachedSortData = true;
 						}

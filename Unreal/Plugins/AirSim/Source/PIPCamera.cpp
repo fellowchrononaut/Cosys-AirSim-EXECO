@@ -1604,6 +1604,13 @@ void APIPCamera::buildRaymapResource()
     bool have_common_origin = false;
     constexpr float CommonOriginToleranceCm = 1.0e-4f;
 
+    //Smallest optical-axis component over the VALID rays, which is what tells NanoGS whether this
+    //lens fits inside the forward half-space and may therefore use the reference's axial near cull
+    //instead of the Euclidean one. Derived here, in the loop that already visits every texel, so
+    //no second pass and no change to the AIRRAYM1 format. Starts at 1 so a raymap with no valid
+    //texel reports "narrow", the conservative answer: it has no ray that could need the wide case.
+    float min_ray_forward_component = 1.0f;
+
     for (unsigned int y = 0; y < map.height; ++y) {
         for (unsigned int x = 0; x < map.width; ++x) {
             const msr::airlib::cameras::Ray ray = map.at(x, y);
@@ -1617,6 +1624,15 @@ void APIPCamera::buildRaymapResource()
             values[base + 3] = static_cast<float>(ray.dz);
             values[base + 4] = static_cast<float>(ray.dx);
             values[base + 5] = static_cast<float>(-ray.dy);
+
+            //an unprojectable texel keeps its all-zero direction (above), and the shader's own
+            //validity test is that same zero length; use it here so both agree on "valid"
+            const FVector3f direction_camera(values[base + 3], values[base + 4], values[base + 5]);
+            const float direction_length = direction_camera.Size();
+            if (FMath::IsFinite(direction_length) && direction_length > 1.0e-12f) {
+                min_ray_forward_component = FMath::Min(min_ray_forward_component,
+                                                       direction_camera.X / direction_length);
+            }
 
             const FVector3f origin_camera_cm(values[base + 0], values[base + 1], values[base + 2]);
             if (!have_common_origin) {
@@ -1686,7 +1702,8 @@ void APIPCamera::buildRaymapResource()
     raymap_ = AirSimCreateRaymapResource();
     AirSimUploadRaymap(raymap_, MoveTemp(values), map.width, map.height, validated_central,
                        MoveTemp(inverse_direction_rects), inverse_direction_width,
-                       inverse_direction_height, common_origin_camera_cm);
+                       inverse_direction_height, common_origin_camera_cm,
+                       min_ray_forward_component);
 
     //Gate A registers ONLY the ordinary Scene output target of an explicitly selected native
     //camera. Cube face targets and Cube-backend outputs never enter this registry. Upload and
@@ -1713,7 +1730,8 @@ void APIPCamera::buildRaymapResource()
                 AirSimRegisterNativeGeerView(
                     native_geer_registered_target_,
                     configured_camera_name_.IsEmpty() ? GetName() : configured_camera_name_,
-                    FIntPoint(scene_target->SizeX, scene_target->SizeY), raymap_, validated_central);
+                    FIntPoint(scene_target->SizeX, scene_target->SizeY), raymap_, validated_central,
+                    min_ray_forward_component);
             }
         }
     }
@@ -1723,6 +1741,7 @@ void APIPCamera::buildRaymapResource()
     UE_LOG(LogTemp, Log,
            TEXT("[AirSim] raymap uploaded: %s model %s %ux%u, backend=%s, 6 floats/texel, %.1f MB, ")
            TEXT("%llu of %llu texels outside the model's valid domain, central=%s, ")
+           TEXT("min_ray_forward=%.6f (widest valid ray %.2f deg off axis), ")
            TEXT("cube auto=%d faces at %d (FOV %.2f/%.2f deg, axis step %.5f/%.5f deg)"),
            *GetName(),
            UTF8_TO_TCHAR(msr::airlib::cameras::toString(sensor_params_.camera_model.model.type)),
@@ -1730,6 +1749,8 @@ void APIPCamera::buildRaymapResource()
            static_cast<unsigned long long>(stats.invalid),
            static_cast<unsigned long long>(stats.texels),
            validated_central ? TEXT("true") : TEXT("false"),
+           min_ray_forward_component,
+           FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(min_ray_forward_component, -1.0f, 1.0f))),
            auto_cube_face_count_, auto_cube_face_resolution_,
            FMath::RadiansToDegrees(cube_sampling.horizontal_fov_radians),
            FMath::RadiansToDegrees(cube_sampling.vertical_fov_radians),

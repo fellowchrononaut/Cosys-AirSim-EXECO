@@ -326,6 +326,7 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	Parameters.NativeGeerOutputSize = FIntPoint::ZeroValue;
 	Parameters.NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
 	Parameters.NativeGeerCandidateMode = 0;
+	Parameters.NativeGeerNearCullAxial = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -991,6 +992,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	Parameters.NativeGeerOutputSize = FIntPoint::ZeroValue;
 	Parameters.NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
 	Parameters.NativeGeerCandidateMode = 0;
+	Parameters.NativeGeerNearCullAxial = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1071,7 +1073,8 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	FIntPoint NativeGeerInverseGrid,
 	FIntPoint NativeGeerOutputSize,
 	FVector3f NativeGeerCommonOriginCameraCm,
-	int32 NativeGeerCandidateMode)
+	int32 NativeGeerCandidateMode,
+	bool bNativeGeerNearCullAxial)
 {
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataGlobal);
 
@@ -1167,6 +1170,9 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 		? NativeGeerCommonOriginCameraCm : FVector3f::ZeroVector;
 	Parameters.NativeGeerCandidateMode = bNativeGeer
 		? static_cast<uint32>(FMath::Clamp(NativeGeerCandidateMode, 0, 1)) : 0u;
+	// Native only. The pinhole/cube path already culls on view-space z, so leaving this at 0 there
+	// keeps its predicate literally unchanged — which is what Gate F's bit-identity check needs.
+	Parameters.NativeGeerNearCullAxial = (bNativeGeer && bNativeGeerNearCullAxial) ? 1u : 0u;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval
@@ -1691,6 +1697,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	Parameters.NativeGeerOutputSize = FIntPoint::ZeroValue;
 	Parameters.NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector;
 	Parameters.NativeGeerCandidateMode = 0;
+	Parameters.NativeGeerNearCullAxial = 0;
 	Parameters.QuadInflation = bGeerEval
 		? FMath::Max(CVarGeerQuadInflation.GetValueOnRenderThread(), 1.0f) : 1.0f;
 	Parameters.GeerNearCull = bGeerEval

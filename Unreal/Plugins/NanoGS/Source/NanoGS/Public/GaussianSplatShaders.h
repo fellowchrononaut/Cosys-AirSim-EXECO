@@ -61,7 +61,10 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(FIntPoint, NativeGeerOutputSize)
 		SHADER_PARAMETER(FVector3f, NativeGeerCommonOriginCameraCm)
 		SHADER_PARAMETER(uint32, NativeGeerCandidateMode)
-		SHADER_PARAMETER(float, GeerNearCull)   // cull GEER splats nearer than this view z (cm)
+		// 1 = GeerNearCull measures axial (optical-axis) distance from the ray apex, 0 = Euclidean
+		// range from it. Resolved on the CPU from gs.GeerNearCullMode and the raymap; native only.
+		SHADER_PARAMETER(uint32, NativeGeerNearCullAxial)
+		SHADER_PARAMETER(float, GeerNearCull)   // cull GEER splats nearer than this distance (cm)
 		SHADER_PARAMETER(uint32, UseGeerPBF)    // 1 = exact PBF rect instead of the EWA quad
 		SHADER_PARAMETER(float, GeerPBFLambda)  // PBF bound radius in sigma (follows gs.GeerCutoff)
 		SHADER_PARAMETER(uint32, UseGeerAAOpacity)  // diagnostic: GEER AA opacity scaling on/off

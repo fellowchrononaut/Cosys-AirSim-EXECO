@@ -272,7 +272,10 @@ public:
 		FIntPoint NativeGeerInverseGrid = FIntPoint::ZeroValue,
 		FIntPoint NativeGeerOutputSize = FIntPoint::ZeroValue,
 		FVector3f NativeGeerCommonOriginCameraCm = FVector3f::ZeroVector,
-		int32 NativeGeerCandidateMode = 0
+		int32 NativeGeerCandidateMode = 0,
+		// Already-resolved near-cull criterion (gs.GeerNearCullMode combined with the raymap's
+		// measured ray spread). Native only; the pinhole path culls on view-space z regardless.
+		bool bNativeGeerNearCullAxial = false
 	);
 
 	/**

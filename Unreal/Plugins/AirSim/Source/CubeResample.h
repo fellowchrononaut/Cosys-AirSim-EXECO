@@ -85,6 +85,13 @@ struct FAirSimRaymapResource
     uint32 inverse_direction_width = 0;
     uint32 inverse_direction_height = 0;
     FVector3f common_origin_camera_cm = FVector3f::ZeroVector;
+    //Smallest optical-axis component over all VALID unit directions (Unreal camera frame, so
+    //+X). 1.0 for a raymap with no valid texel at all, which is the conservative direction: a
+    //camera with nothing to look at cannot need the wide-angle criterion. This is the ONLY input
+    //to the automatic near-cull criterion (NanoGS gs.GeerNearCullMode 0); it is derived from the
+    //rays, not declared, so the AIRRAYM1 dump format is unchanged and raymap_check.py still
+    //validates the same six channels.
+    float min_ray_forward_component = 1.0f;
     //all origins identical. A fetch hint for the shader; never a change of format (ADR-001).
     bool central = true;
     bool inverse_direction_ready = false;
@@ -104,7 +111,7 @@ void AirSimUploadRaymap(const FAirSimRaymapResourcePtr& resource, TArray<float> 
                         uint32 width, uint32 height, bool central,
                         TArray<FAirSimRaymapBinRect> inverse_direction_rects,
                         uint32 inverse_direction_width, uint32 inverse_direction_height,
-                        FVector3f common_origin_camera_cm);
+                        FVector3f common_origin_camera_cm, float min_ray_forward_component);
 
 // Enqueues the release and clears the caller's reference.
 void AirSimReleaseRaymap(FAirSimRaymapResourcePtr& resource);

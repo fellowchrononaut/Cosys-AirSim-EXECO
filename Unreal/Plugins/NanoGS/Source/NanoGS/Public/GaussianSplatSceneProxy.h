@@ -349,6 +349,12 @@ public:
 	bool CachedNativeGeer = false;
 	/** Native candidate mode changes the native ClipPosition/Axis rectangle written by CalcViewData. */
 	int32 CachedNativeGeerCandidateMode = 0;
+	/** Which distance the near cull measures decides WHICH splats CalcViewData writes at all, so a
+	 *  gs.GeerNearCullMode change on a parked camera must invalidate or the frame will not move. */
+	bool CachedNativeGeerNearCullAxial = false;
+	/** Same for the threshold itself: gs.GeerNearCull was previously absent from this cache, so a
+	 *  sweep of it against a static camera silently returned the first arm's image every time. */
+	float CachedGeerNearCull = 0.0f;
 	/** Resource generation is part of native view-data identity (lookup and common origin can change). */
 	uint64 CachedNativeGeerRegistrationSerial = 0;
 	bool bHasCachedSortData = false;

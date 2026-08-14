@@ -103,6 +103,8 @@ struct NANOGS_API FGaussianGlobalAccumulator
 	FMatrix CachedViewProjectionMatrix = FMatrix::Identity;
 	bool CachedNativeGeer = false;
 	int32 CachedNativeGeerCandidateMode = 0;
+	bool CachedNativeGeerNearCullAxial = false;
+	float CachedGeerNearCull = 0.0f;
 	uint64 CachedNativeGeerRegistrationSerial = 0;
 
 	//----------------------------------------------------------------------

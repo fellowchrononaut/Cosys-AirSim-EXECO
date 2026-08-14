@@ -50,7 +50,8 @@ int2 NativeGeerInverseGrid;
 int2 NativeGeerOutputSize;
 float3 NativeGeerCommonOriginCameraCm;
 uint NativeGeerCandidateMode; // 0 = full-output oracle, 1 = bounded-bin conservative rectangle
-float GeerNearCull;    // GEER: cull splats nearer than this view-space z (cm); 0 = off
+uint NativeGeerNearCullAxial; // 1 = GeerNearCull is axial from the apex, 0 = Euclidean from it
+float GeerNearCull;    // GEER: cull splats nearer than this distance (cm); 0 = off
 uint  UseGeerPBF;      // 1 = replace the EWA quad with the exact PBF rect (gs.GeerPBF)
 float GeerPBFLambda;   // PBF bound radius in sigma (follows gs.GeerCutoff; 3.0 when it is off)
 uint  UseGeerAAOpacity; // diagnostic (gs.GeerAAOpacity): GEER antialiasing opacity scaling on/off
@@ -139,20 +140,32 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// the splat renders at full opacity everywhere. The reference drops these rather than
 	// shading them. GEER splats only — the classic EWA path is bit-identical without this,
 	// because its falloff is in quad-local coords and decays regardless of proximity.
-	float3 nativeRayOrigin = CameraPosition;
+	//
+	// WHAT distance is measured is not free. The reference measures view-space z, a HALF-SPACE;
+	// measuring Euclidean range instead gives a BALL, and since r >= |z| the ball sits strictly
+	// inside the slab — so an off-axis splat 5 cm from the camera clears a 20 cm Euclidean cull
+	// and arrives as an opaque sheet the reference never drew. Axial is only a distance while
+	// every ray points forward though, so which one applies is decided on the CPU (per camera,
+	// from the raymap, overridable by gs.GeerNearCullMode) and arrives already resolved.
+	float3 originView = float3(0.0, 0.0, 0.0);
 	if (UseNativeGeer != 0)
 	{
 		// The raymap origin is in Unreal camera axes (+X forward,+Y right,+Z up). UE view axes
 		// are (right,up,forward), matching the exact native PS conversion.
-		float3 originView = float3(NativeGeerCommonOriginCameraCm.y,
-		                           NativeGeerCommonOriginCameraCm.z,
-		                           NativeGeerCommonOriginCameraCm.x);
-		nativeRayOrigin += mul(float4(originView, 0.0), ViewToWorld).xyz;
+		originView = float3(NativeGeerCommonOriginCameraCm.y,
+		                    NativeGeerCommonOriginCameraCm.z,
+		                    NativeGeerCommonOriginCameraCm.x);
 	}
+	float3 nativeRayOrigin = CameraPosition + mul(float4(originView, 0.0), ViewToWorld).xyz;
 	float nativeViewDistance = length(worldPos.xyz - nativeRayOrigin);
-	if (UseGeerEval != 0 && GeerNearCull > 0.0 &&
-		((UseNativeGeer != 0 && nativeViewDistance <= GeerNearCull) ||
-		 (UseNativeGeer == 0 && viewPos.z <= GeerNearCull)))
+	// Both measured from the SAME apex, which is the whole point of ADR-001's common origin: the
+	// axial form is viewPos.z shifted by the apex's own forward offset, not raw viewPos.z. On the
+	// pinhole path originView is zero and NativeGeerNearCullAxial is 0, so this reduces literally
+	// to the previous `viewPos.z <= GeerNearCull` — bit-identical, as Gate F requires.
+	float nearCullDistance = (UseNativeGeer != 0 && NativeGeerNearCullAxial == 0)
+		? nativeViewDistance
+		: (viewPos.z - originView.z);
+	if (UseGeerEval != 0 && GeerNearCull > 0.0 && nearCullDistance <= GeerNearCull)
 	{
 		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
 		return;
