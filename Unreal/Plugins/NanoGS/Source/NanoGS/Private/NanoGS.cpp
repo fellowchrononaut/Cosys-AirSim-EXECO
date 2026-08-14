@@ -35,6 +35,9 @@ namespace
 	TSet<uint64> GNanoGSLoggedNativeGeerCandidateStates;
 	TSet<uint64> GNanoGSLoggedNativeGeerCompositeStates;
 	TSet<uint64> GNanoGSLoggedNativeGeerNearCullStates;
+	//separate from GNanoGSLoggedNativeGeerRefusals: that one is keyed on the bare registration
+	//serial, so any derived key packed into the same set could collide with a real serial
+	TSet<uint64> GNanoGSLoggedNativeGeerBudgetRefusals;
 }
 
 // Pass 2 parameter struct: declares IntermediateTexture, DepthAccumTexture, and CustomDepthTexture
@@ -200,14 +203,50 @@ TAutoConsoleVariable<int32> CVarGeerPBF(
 	TEXT(" 1: PBF rect, bounded at gs.GeerCutoff sigma and clamped to the viewport (default)"),
 	ECVF_RenderThreadSafe);
 
-/** Native raymap candidate coverage mode. Gate C keeps the Gate-B full-output path as an
- *  explicit oracle/fallback while the raymap-binned path is brought up and gated. */
+/** Native raymap candidate coverage mode.
+ *
+ *  ⚠ MODE 0 IS A SMALL-SCENE ORACLE ONLY. Gate C brought the bounded path up against mode 0 as its
+ *  reference, under the four-splat cap, where a full-output quad per splat costs nothing. That is
+ *  the ONLY regime in which mode 0 has been shown to behave. On a real checkpoint it does not:
+ *
+ *  Measured 2026-08-14 on scnt_kb_st (1,662,896 splats), same camera, same pose, nothing changed
+ *  between repeats — mode 1 returned sd 0.020 LSB over four repeats while mode 0 returned
+ *  sd 5.381, spread 12.463 (131.883 / 131.804 / 131.788 / 144.251). It usually agrees with mode 1
+ *  and intermittently returns a much brighter frame. At 1752x1168 it does not complete at all: 30
+ *  minutes without producing a frame, GPU at 0%, simGetImages blocking until RPC timeout, and it
+ *  does NOT recover when the CVar is set back — the editor has to be restarted.
+ *
+ *  Cost scales as splats x output pixels, so gs.NativeGeerFullOutputBudget refuses the combinations
+ *  that have been observed to fail rather than letting them wedge the render thread. Anything that
+ *  treats mode 0 as ground truth on a real checkpoint is measuring that distribution, not the
+ *  renderer; a monotonic-looking "trend" was reported as a coverage defect on 2026-08-14 and
+ *  retracted for exactly this reason. See logs/phase3c1/gate_e_arm1/MANIFEST.md. */
 TAutoConsoleVariable<int32> CVarNativeGeerCandidateMode(
 	TEXT("gs.NativeGeerCandidateMode"),
 	1,
 	TEXT("NativeGEER candidate coverage mode.\n")
-	TEXT(" 0: Gate-B full-output quad per splat (development oracle)\n")
+	TEXT(" 0: Gate-B full-output quad per splat. SMALL ANALYTIC SCENES ONLY — non-deterministic\n")
+	TEXT("    on real checkpoints (sd 5.4 LSB at 1.7M splats) and wedges the render thread at\n")
+	TEXT("    full resolution. Refused above gs.NativeGeerFullOutputBudget. NOT an oracle.\n")
 	TEXT(" 1: bounded raymap-bin conservative candidate rectangle (Gate C; default)"),
+	ECVF_RenderThreadSafe);
+
+/** Cost ceiling for candidate mode 0, in splat-pixels (splats x output pixels), because that
+ *  product is what the full-output path actually costs — one screen-sized quad per splat.
+ *
+ *  Reference points at 1,662,896 splats: 219x146 = 5.3e10 (completed, non-deterministic);
+ *  876x584 = 8.5e11 (completed, sd 5.4 LSB); 1314x876 = 1.9e12 (completed, 2.35 s);
+ *  1752x1168 = 3.4e12 (WEDGED). Gate C's four-splat analytic scenes at full resolution are 8.2e6,
+ *  five orders of magnitude below the default, so the regime mode 0 was validated in is unaffected.
+ *
+ *  The default deliberately sits below every real-checkpoint measurement above, not between the
+ *  ones that completed and the one that wedged: completing is not the same as being correct, and
+ *  every real-checkpoint run was non-deterministic. Raise it to override, having read why. */
+TAutoConsoleVariable<float> CVarNativeGeerFullOutputBudget(
+	TEXT("gs.NativeGeerFullOutputBudget"),
+	1.0e9f,
+	TEXT("Max splats x output pixels allowed for gs.NativeGeerCandidateMode 0. Above this the\n")
+	TEXT("full-output path is refused and the bounded path is used instead. 0 = no limit."),
 	ECVF_RenderThreadSafe);
 
 /** DIAGNOSTIC (2026-08-07): split the Euclidean sort key away from the GEER evaluation, which
@@ -1223,6 +1262,7 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		// can now accept complete GEER assets. A proxy that would take legacy EWA still fails closed:
 		// mixing projection contracts in one native output would produce plausible but invalid data.
 		bool bAllNativeProxiesUseGeer = true;
+		int32 EffectiveNativeGeerCandidateMode = NativeGeerCandidateMode;
 		if (bNativeGeerView)
 		{
 			for (const FProxyRenderInfo& Info : VisibleProxies)
@@ -1242,14 +1282,80 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 				}
 				return;
 			}
-			if (!GNanoGSLoggedNativeGeerActive.Contains(NativeGeerView.registration_serial))
+			// Full-output candidate coverage is a SMALL-SCENE oracle. Its cost is one screen-sized quad
+			// per splat, and on a real checkpoint it is both non-deterministic and, at full resolution,
+			// terminal: it stops producing frames entirely and does not recover when the CVar is set
+			// back. Refuse the combinations that have been measured to fail instead of wedging the
+			// render thread, and say so loudly — a silent downgrade would be its own trap, because the
+			// caller asked for the oracle and would otherwise believe it got one.
+			if (NativeGeerCandidateMode == 0)
 			{
-				GNanoGSLoggedNativeGeerActive.Add(NativeGeerView.registration_serial);
+				const double FullOutputCost = static_cast<double>(TotalSplatCount) *
+					static_cast<double>(NativeGeerRaymapSize.X) *
+					static_cast<double>(NativeGeerRaymapSize.Y);
+				const double Budget = static_cast<double>(
+					FMath::Max(CVarNativeGeerFullOutputBudget.GetValueOnRenderThread(), 0.0f));
+				if (Budget > 0.0 && FullOutputCost > Budget)
+				{
+					const uint64 RefusalKey = NativeGeerView.registration_serial;
+					const bool bLogOnce = !GNanoGSLoggedNativeGeerBudgetRefusals.Contains(RefusalKey);
+					if (bLogOnce)
+					{
+						GNanoGSLoggedNativeGeerBudgetRefusals.Add(RefusalKey);
+					}
+					if (bNativeInverseReady)
+					{
+						EffectiveNativeGeerCandidateMode = 1;
+						if (bLogOnce)
+						{
+							UE_LOG(LogTemp, Error,
+								TEXT("[NanoGS][NativeGEER][GateC] REFUSED candidate mode 0 on camera=%s: ")
+								TEXT("%u splats x %dx%d = %.3g splat-pixels exceeds ")
+								TEXT("gs.NativeGeerFullOutputBudget %.3g. Mode 0 is a small-analytic-scene ")
+								TEXT("oracle only — on a real checkpoint it is non-deterministic ")
+								TEXT("(sd 5.4 LSB at 1.7M splats) and at full resolution it stops ")
+								TEXT("producing frames and needs an editor restart. FALLING BACK to the ")
+								TEXT("bounded path; this frame is NOT a mode-0 reference. Raise the budget ")
+								TEXT("to override."),
+								*NativeGeerView.camera_name, TotalSplatCount,
+								NativeGeerRaymapSize.X, NativeGeerRaymapSize.Y,
+								FullOutputCost, Budget);
+						}
+					}
+					else if (bLogOnce)
+					{
+						// Cannot fall back: the bounded path needs the inverse resource, which is
+						// absent. Mode 0 is what kept this camera alive, so leave it — but a
+						// configuration this large is the one that wedges, and silence would be worse.
+						UE_LOG(LogTemp, Error,
+							TEXT("[NanoGS][NativeGEER][GateC] camera=%s wants candidate mode 0 at ")
+							TEXT("%.3g splat-pixels (budget %.3g) and CANNOT fall back — the bounded ")
+							TEXT("path needs the 256x128 inverse resource and it is not ready. ")
+							TEXT("Proceeding, but this configuration is the one measured to wedge the ")
+							TEXT("render thread; if the editor stops rendering, this is why."),
+							*NativeGeerView.camera_name, FullOutputCost, Budget);
+					}
+				}
+			}
+
+			// Keyed on the camera AND the mode it actually rendered with, not the camera alone.
+			// Keyed on the serial only, this line is written once and then goes stale — and since
+			// the budget guard above can make the effective mode differ from the CVar, a stale
+			// line is the one place that would misreport what a measurement was taken with.
+			// Observed 2026-08-14: kb_eighth logged candidate_mode=1 for a frame that genuinely
+			// rendered with mode 0. [GateC] and [GateE] are keyed on serial+state for this reason.
+			// `candidate_mode_effective` is deliberately a different field name from [GateC]'s
+			// `mode`, which reports what was REQUESTED; when they disagree, the guard fired.
+			const uint64 ActiveLogKey = (NativeGeerView.registration_serial << 1u) |
+				(static_cast<uint64>(EffectiveNativeGeerCandidateMode) & 1u);
+			if (!GNanoGSLoggedNativeGeerActive.Contains(ActiveLogKey))
+			{
+				GNanoGSLoggedNativeGeerActive.Add(ActiveLogKey);
 				UE_LOG(LogTemp, Log,
-					TEXT("[NanoGS][NativeGEER][GateB1] ACTIVE camera=%s splats=%u raymap=%dx%d candidate_mode=%d depth=false lighting=false velocity=zero"),
+					TEXT("[NanoGS][NativeGEER][GateB1] ACTIVE camera=%s splats=%u raymap=%dx%d candidate_mode_effective=%d depth=false lighting=false velocity=zero"),
 					*NativeGeerView.camera_name, TotalSplatCount,
 					NativeGeerRaymapSize.X, NativeGeerRaymapSize.Y,
-					NativeGeerCandidateMode);
+					EffectiveNativeGeerCandidateMode);
 			}
 		}
 
@@ -1265,8 +1371,10 @@ void FNanoGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderParameters&
 		const bool bCurrentGeerPBF = CVarGeerPBF.GetValueOnRenderThread() != 0;
 		const bool bCurrentGeerSort = CVarGeerSort.GetValueOnRenderThread() != 0;
 		const bool bCurrentGeerAAOpacity = CVarGeerAAOpacity.GetValueOnRenderThread() != 0;
+		// The BUDGET-RESOLVED mode, not the raw CVar: re-reading the CVar here would undo the
+		// refusal above and send the full-output path to the GPU anyway.
 		const int32 CurrentNativeGeerCandidateMode = bNativeGeerView
-			? FMath::Clamp(CVarNativeGeerCandidateMode.GetValueOnRenderThread(), 0, 1)
+			? FMath::Clamp(EffectiveNativeGeerCandidateMode, 0, 1)
 			: 0;
 		// Near cull, captured for the same reason as the knobs above but with more force: this one
 		// decides WHICH splats CalcViewData writes at all, so a stale skip does not merely shade
