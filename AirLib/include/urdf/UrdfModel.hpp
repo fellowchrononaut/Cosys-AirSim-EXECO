@@ -100,6 +100,13 @@ struct Joint {
     JointLimit limit;
     JointDynamics dynamics;
 
+    /// Set when <mimic> was present and deliberately not applied (see ParseOptions). The joint
+    /// then behaves as a free joint of its stated type. Recorded rather than dropped so a caller
+    /// can enumerate exactly what was skipped — the failure mode being avoided is UrdfSim's, where
+    /// <mimic> was parsed and silently never applied, with nothing to indicate it.
+    bool mimic_ignored = false;
+    std::string mimic_source_joint;
+
     int parent_index = -1;  // into Robot::links
     int child_index = -1;
 };

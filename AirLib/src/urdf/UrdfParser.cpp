@@ -176,7 +176,7 @@ void parseLink(const XMLElement* e, Robot& robot)
     robot.links.push_back(std::move(link));
 }
 
-void parseJoint(const XMLElement* e, Robot& robot)
+void parseJoint(const XMLElement* e, Robot& robot, const ParseOptions& options)
 {
     Joint j;
     j.name = readAttrString(e, "name", "joint", true);
@@ -226,10 +226,17 @@ void parseJoint(const XMLElement* e, Robot& robot)
         j.dynamics.friction = readAttrDouble(d, "friction", ctx.c_str(), false);
     }
 
-    // Refuse what UrdfSim accepted and then ignored.
-    if (e->FirstChildElement("mimic"))
-        fail(ctx + ": <mimic> is not supported. It is parsed but never applied by UrdfSim; "
-                   "accepting it here would silently produce a robot that does not match the URDF.");
+    // Refuse what UrdfSim accepted and then ignored — unless the caller has explicitly opted in.
+    if (const XMLElement* mim = e->FirstChildElement("mimic")) {
+        if (!options.ignore_mimic)
+            fail(ctx + ": <mimic> is not supported. It is parsed but never applied by UrdfSim; "
+                       "accepting it here would silently produce a robot that does not match the "
+                       "URDF. Set ParseOptions::ignore_mimic if the coupling is cosmetic and you "
+                       "want it loaded as a free joint.");
+        j.mimic_ignored = true;
+        const char* src = mim->Attribute("joint");
+        j.mimic_source_joint = src ? src : "";
+    }
     if (e->FirstChildElement("safety_controller"))
         fail(ctx + ": <safety_controller> is not supported (parsed-but-ignored in UrdfSim).");
 
@@ -288,7 +295,8 @@ int Robot::chainDepth() const
     return depth(root_link);
 }
 
-Robot parseString(const std::string& xml, const std::string& source_name)
+Robot parseString(const std::string& xml, const std::string& source_name,
+                  const ParseOptions& options)
 {
     XMLDocument doc;
     if (doc.Parse(xml.c_str(), xml.size()) != tinyxml2::XML_SUCCESS)
@@ -304,13 +312,13 @@ Robot parseString(const std::string& xml, const std::string& source_name)
     for (const XMLElement* e = root->FirstChildElement("link"); e; e = e->NextSiblingElement("link"))
         parseLink(e, robot);
     for (const XMLElement* e = root->FirstChildElement("joint"); e; e = e->NextSiblingElement("joint"))
-        parseJoint(e, robot);
+        parseJoint(e, robot, options);
 
     resolveTree(robot, source_name);
     return robot;
 }
 
-Robot parseFile(const std::string& path)
+Robot parseFile(const std::string& path, const ParseOptions& options)
 {
     XMLDocument doc;
     if (doc.LoadFile(path.c_str()) != tinyxml2::XML_SUCCESS)
@@ -319,7 +327,7 @@ Robot parseFile(const std::string& path)
     tinyxml2::XMLPrinter printer;
     doc.Print(&printer);
     return parseString(std::string(printer.CStr(), printer.CStrSize() ? printer.CStrSize() - 1 : 0),
-                       path);
+                       path, options);
 }
 
 } // namespace urdf

@@ -14,6 +14,10 @@ namespace {
 /// limit; the caller must clamp commands instead. Reported rather than silently truncated.
 constexpr double kRevoluteLimitCap = 0.99 * 3.14159265358979323846;
 
+/// Stand-in for "no effort ceiling stated in the URDF". Large enough never to bind in practice,
+/// finite so it cannot poison the solver the way an infinity would.
+constexpr float kUnlimitedEffort = 1.0e6f;
+
 double dot(const b3Vec3& a, const b3Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
 } // namespace
@@ -258,7 +262,14 @@ void Box3DRobot::instantiate()
             // `effort` N.m — a robot that silently refuses to move under gravity. The motor is
             // therefore left off; setControlMode() turns it on and setTarget() drives it, and the
             // effort figure is retained as the cap applied at that point.
-            def.maxMotorTorque = static_cast<float>(j.limit.effort);
+            //
+            // ⚠ An absent or zero effort means UNLIMITED, not zero. URDF requires <limit> only for
+            // revolute and prismatic joints, so a `continuous` joint — every wheel on every rover —
+            // legitimately carries no effort figure. Taking that as maxMotorTorque = 0 gives a
+            // motor that can apply no torque, and velocity control silently does nothing. That is
+            // exactly how the demo rover failed to drive.
+            def.maxMotorTorque = (j.limit.effort > 0.0) ? static_cast<float>(j.limit.effort)
+                                                        : kUnlimitedEffort;
             def.enableMotor = false;
             rec.joint = b3CreateRevoluteJoint(world_, &def);
             break;
@@ -275,8 +286,9 @@ void Box3DRobot::instantiate()
                 def.lowerTranslation = static_cast<float>(j.limit.lower);
                 def.upperTranslation = static_cast<float>(j.limit.upper);
             }
-            // Same as revolute: effort is a ceiling, not a command. See above.
-            def.maxMotorForce = static_cast<float>(j.limit.effort);
+            // Same as revolute: effort is a ceiling, not a command, and absent means unlimited.
+            def.maxMotorForce = (j.limit.effort > 0.0) ? static_cast<float>(j.limit.effort)
+                                                       : kUnlimitedEffort;
             def.enableMotor = false;
             rec.joint = b3CreatePrismaticJoint(world_, &def);
             break;
