@@ -303,7 +303,18 @@ ModelManifest.xml
 /cmake/DroneShell/DroneShell
 /cmake/DroneServer/DroneServer
 cmake/AirLibUnitTests/Makefile
-external/
+# ⚠ `external/*`, not `external/`. Excluding the directory itself stops git descending into it,
+# so the negations below can never re-match — the classic gitignore trap. Matching the *contents*
+# leaves the directory traversable.
+external/*
+# ... except the two vendored dependencies that are committed on purpose. box3d is v0.1.0 with
+# breaking API churn and ExecoSim archives datasets against this code, so the pin must be exact
+# bytes rather than a setup.sh download that depends on GitHub still serving a SHA. See
+# external/box3d/VENDORED.md and SIMVAL/PhysicsEngineDiscussion/PHYSICS_ENGINE_ANALYSIS.md R1.
+!external/box3d/
+!external/box3d/**
+!external/tinyxml2/
+!external/tinyxml2/**
 deps/
 cmake_build/
 

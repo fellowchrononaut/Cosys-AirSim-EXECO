@@ -121,9 +121,18 @@ cp $build_dir/output/lib/libAirLib.a AirLib/lib
 cp $build_dir/output/lib/libMavLinkCom.a AirLib/deps/MavLinkCom/lib
 cp $build_dir/output/lib/librpc.a AirLib/deps/rpclib/lib/librpc.a
 
+# box3d is OPTIONAL: absent => the UE plugin gets WITH_BOX3D_BINDING=0 and compiles it out.
+if [ -f "$build_dir/output/lib/libbox3d.a" ]; then
+    mkdir -p AirLib/deps/box3d/lib
+    cp $build_dir/output/lib/libbox3d.a AirLib/deps/box3d/lib/libbox3d.a
+fi
+
 # Update AirLib/lib, AirLib/deps, Plugins folders with new binaries
 rsync -a --delete $build_dir/output/lib/ AirLib/lib/x64/$folder_name
 rsync -a --delete external/rpclib/$RPC_VERSION_FOLDER/include AirLib/deps/rpclib
+if [ -d "external/box3d/include" ]; then
+    rsync -a --delete external/box3d/include AirLib/deps/box3d
+fi
 rsync -a --delete MavLinkCom/include AirLib/deps/MavLinkCom
 rsync -a --delete AirLib Unreal/Plugins/AirSim/Source
 rm -rf Unreal/Plugins/AirSim/Source/AirLib/src

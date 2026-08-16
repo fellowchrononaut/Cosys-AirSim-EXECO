@@ -38,6 +38,21 @@ macro(CommonSetup)
     #name of .a file with lib prefix
     set(RPC_LIB rpc)
 
+    #setup include and lib for box3d (URDF robot dynamics backend), which is OPTIONAL.
+    #Absent => BOX3D_FOUND is FALSE, nothing links it, and WITH_BOX3D_BINDING=0 compiles it out.
+    if(EXISTS "${AIRSIM_ROOT}/external/box3d/CMakeLists.txt")
+        set(BOX3D_FOUND TRUE)
+        set(BOX3D_LIB_INCLUDES "${AIRSIM_ROOT}/external/box3d/include")
+        set(BOX3D_LIB box3d)
+    else()
+        set(BOX3D_FOUND FALSE)
+        set(BOX3D_LIB_INCLUDES "")
+        set(BOX3D_LIB "")
+    endif()
+
+    #tinyxml2 is vendored as two source files, compiled straight into AirLib (no separate lib).
+    set(TINYXML2_INCLUDES "${AIRSIM_ROOT}/external/tinyxml2")
+
     #what is our build type debug or release?
     string( TOLOWER "${CMAKE_BUILD_TYPE}" BUILD_TYPE)
 

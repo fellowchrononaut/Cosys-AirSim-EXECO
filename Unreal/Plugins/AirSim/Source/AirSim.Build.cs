@@ -57,6 +57,7 @@ public class AirSim : ModuleRules
                 PublicDefinitions.Add("AIRLIB_HEADER_ONLY=1");
                 AddLibDependency("AirLib", Path.Combine(AirLibPath, "lib"), "AirLib", Target, false);
                 LoadAirSimDependency(Target, "rpclib", "rpc");
+                LoadOptionalAirSimDependency(Target, "box3d", "box3d");
                 break;
 
             case CompileMode.CppCompileNoRpc:
@@ -66,6 +67,7 @@ public class AirSim : ModuleRules
 
             case CompileMode.CppCompileWithRpc:
                 LoadAirSimDependency(Target, "rpclib", "rpc");
+                LoadOptionalAirSimDependency(Target, "box3d", "box3d");
                 break;
 
             default:
@@ -139,6 +141,33 @@ public class AirSim : ModuleRules
     private bool LoadAirSimDependency(ReadOnlyTargetRules Target, string LibName, string LibFileName)
     {
         string LibrariesPath = Path.Combine(AirLibPath, "deps", LibName, "lib");
+        return AddLibDependency(LibName, LibrariesPath, LibFileName, Target, true);
+    }
+
+    // As LoadAirSimDependency, but for a dependency that may legitimately be absent.
+    //
+    // AddLibDependency decides isLibrarySupported from the *platform*, not from whether the file
+    // exists, so calling it for a missing library would still add the .a to the link line and
+    // still emit WITH_<LIB>_BINDING=1 - producing a link error rather than a clean opt-out. This
+    // checks first, and emits WITH_<LIB>_BINDING=0 when the library was never built.
+    //
+    // That define is what keeps the guarantee in
+    // SIMVAL/PhysicsEngineDiscussion/PHYSICS_ENGINE_ANALYSIS.md section 7: a build without the
+    // dependency is byte-identical to one from before the dependency existed.
+    private bool LoadOptionalAirSimDependency(ReadOnlyTargetRules Target, string LibName, string LibFileName)
+    {
+        string LibrariesPath = Path.Combine(AirLibPath, "deps", LibName, "lib");
+        string ExpectedLib = (Target.Platform == UnrealTargetPlatform.Win64)
+            ? Path.Combine(LibrariesPath, "x64", "Release", LibFileName + ".lib")
+            : Path.Combine(LibrariesPath, "lib" + LibFileName + ".a");
+
+        if (!File.Exists(ExpectedLib))
+        {
+            PublicDefinitions.Add(string.Format("WITH_" + LibName.ToUpper() + "_BINDING=0"));
+            System.Console.WriteLine("AirSim: optional dependency '" + LibName + "' not found at "
+                + ExpectedLib + " - compiling without it.");
+            return false;
+        }
         return AddLibDependency(LibName, LibrariesPath, LibFileName, Target, true);
     }
 
