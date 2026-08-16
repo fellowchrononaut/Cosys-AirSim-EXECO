@@ -5,6 +5,7 @@
 #include "Vehicles/SkidSteer/SkidVehiclePawn.h"
 #include "Vehicles/Car/CarPawn.h"
 #include "Vehicles/ComputerVision/ComputerVisionPawn.h"
+#include "Vehicles/UrdfBot/UrdfBotPawn.h"
 #include "FlyingPawn.h"
 #include "common/Common.hpp"
 #include "SimMode/SimModeWorldBase.h"
@@ -41,5 +42,6 @@ private:
     typedef ASkidVehiclePawn TSkidPawn;
     typedef ACarPawn TCarPawn;
     typedef AComputerVisionPawn TCVPawn;
+    typedef AUrdfBotPawn TUrdfPawn;
 
 };

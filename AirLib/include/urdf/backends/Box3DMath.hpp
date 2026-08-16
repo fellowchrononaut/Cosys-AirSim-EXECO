@@ -21,13 +21,23 @@ inline b3Vec3 toB3(const urdf::Vec3& v)
     return b3Vec3{ static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z) };
 }
 
+/// Build a world position from doubles, in whichever precision this build of box3d uses.
+///
+/// ⚠ Needed because `b3Pos` is **float in default builds and double under
+/// BOX3D_DOUBLE_PRECISION**, so neither a plain braced init nor a `static_cast<float>` is correct
+/// in both: one narrows in large-world mode, the other narrows in default mode. Both are errors
+/// under clang (`-Wc++11-narrowing`) and merely warnings under gcc — and AirLib builds with clang
+/// while this workstream's headless harness builds with gcc, so getting it wrong compiles cleanly
+/// in the harness and fails only in the real build.
+inline b3Pos toB3Pos(double x, double y, double z)
+{
+    using S = decltype(b3Pos::x);
+    return b3Pos{ static_cast<S>(x), static_cast<S>(y), static_cast<S>(z) };
+}
+
 inline b3Pos toB3Pos(const urdf::Vec3& v)
 {
-#if defined(BOX3D_DOUBLE_PRECISION)
-    return b3Pos{ v.x, v.y, v.z };
-#else
-    return b3Pos{ static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z) };
-#endif
+    return toB3Pos(v.x, v.y, v.z);
 }
 
 /// URDF fixed-axis roll-pitch-yaw -> quaternion, composed R = Rz(yaw) * Ry(pitch) * Rx(roll).
@@ -92,6 +102,35 @@ inline b3Quat normalize(b3Quat q)
     const float inv = (n > 0.0f) ? 1.0f / n : 1.0f;
     q.v.x *= inv; q.v.y *= inv; q.v.z *= inv; q.s *= inv;
     return q;
+}
+
+/// A pose in **world** coordinates.
+///
+/// ⚠ `b3Transform` cannot be used for this. Its `p` is a `b3Vec3`, which is **float in both
+/// precision modes**, whereas `b3Pos` — what `b3Body_GetPosition` returns — becomes **double**
+/// under BOX3D_DOUBLE_PRECISION precisely so that coordinates stay accurate far from the origin.
+/// AirLib pins that mode on (`cmake/box3d_wrapper`). So composing world poses through
+/// `b3Transform` silently truncates them to float and throws away the entire point of large-world
+/// mode — no error, no crash, just a robot that loses precision the further it drives.
+///
+/// `b3Transform` remains correct for *local* frames, where the offsets are small by construction.
+struct WorldPose {
+    b3Pos p{ 0, 0, 0 };
+    b3Quat q = b3Quat_identity;
+};
+
+/// Compose a world pose with a local transform: `world ∘ local`.
+///
+/// The local offset is rotated in float on purpose — it is a link-sized quantity, and the premise
+/// of large-world mode is exactly that positions are large while offsets are not. Only the
+/// accumulation is done in double, which is where the precision actually has to live.
+inline WorldPose mulW(const WorldPose& a, const b3Transform& b)
+{
+    const b3Vec3 r = rotate(a.q, b.p);
+    WorldPose out;
+    out.p = toB3Pos(a.p.x + r.x, a.p.y + r.y, a.p.z + r.z);
+    out.q = normalize(mulQ(a.q, b.q));
+    return out;
 }
 
 /// Shortest-arc rotation taking unit vector `from` to unit vector `to`.

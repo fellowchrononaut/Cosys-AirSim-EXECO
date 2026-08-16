@@ -12,6 +12,7 @@
 #include "Vehicles/Car/CarPawnSimApi.h"
 #include "Vehicles/SkidSteer/SkidVehiclePawnSimApi.h"
 #include "Vehicles/ComputerVision/ComputerVisionPawnSimApi.h"
+#include "Vehicles/UrdfBot/UrdfBotSimApi.h"
 #include "vehicles/multirotor/api/MultirotorApiBase.hpp"
 #include "MultirotorPawnSimApi.h"
 #include "physics/PhysicsBody.hpp"
@@ -157,6 +158,16 @@ void ASimModeWorldMultiAgent::getExistingVehiclePawns(TArray<AActor*>& pawns) co
         }
     }
 
+    TArray<AActor*> UrdfPawns;
+    UAirBlueprintLib::FindAllActor<TUrdfPawn>(this, UrdfPawns);
+    for (AActor* upawn : UrdfPawns) {
+        pawns.Add(upawn);
+        if (getSettings().simmode_name == "MultiAgent") {
+            APawn* vehicle_pawn = static_cast<APawn*>(upawn);
+            addPawnToMap(vehicle_pawn, AirSimSettings::kVehicleTypeUrdfBot);
+        }
+    }
+
     TArray<AActor*> CVPawns;
     UAirBlueprintLib::FindAllActor<TCVPawn>(this, CVPawns);
     for (AActor* cvpawn : CVPawns) {
@@ -176,6 +187,7 @@ bool ASimModeWorldMultiAgent::isVehicleTypeSupported(const std::string& vehicle_
             (vehicle_type == AirSimSettings::kVehicleTypePioneer) ||
             (vehicle_type == AirSimSettings::kVehicleTypeCPHusky) ||
             (vehicle_type == AirSimSettings::kVehicleTypeComputerVision) ||
+            (vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) ||
             (vehicle_type == AirSimSettings::kVehicleTypePX4) ||
             (vehicle_type == AirSimSettings::kVehicleTypeArduRover) ||
             (vehicle_type == AirSimSettings::kVehicleTypeArduCopterSolo) ||
@@ -201,6 +213,9 @@ std::string ASimModeWorldMultiAgent::getVehiclePawnPathName(const AirSimSettings
         }
         else if (vehicle_setting.vehicle_type == AirSimSettings::kVehicleTypeComputerVision) {
             pawn_path = "DefaultComputerVision";
+        }
+        else if (vehicle_setting.vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) {
+            pawn_path = "DefaultUrdfBot";
         }
         else if (vehicle_setting.vehicle_type == AirSimSettings::kVehicleTypeArduRover) {
             pawn_path = "BoxCar";
@@ -236,6 +251,9 @@ PawnEvents* ASimModeWorldMultiAgent::getVehiclePawnEvents(APawn* pawn) const
     else if (vehicle_type == AirSimSettings::kVehicleTypeComputerVision) {
         return static_cast<TCVPawn*>(pawn)->getPawnEvents();
     }
+    else if (vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) {
+        return static_cast<TUrdfPawn*>(pawn)->getPawnEvents();
+    }
     else {
         throw std::invalid_argument(common_utils::Utils::stringf(
             "vehicle_type %s is not recognized in getVehiclePawnEvents()", vehicle_type.c_str()));
@@ -264,6 +282,9 @@ const common_utils::UniqueValueMap<std::string, APIPCamera*> ASimModeWorldMultiA
     else if (vehicle_type == AirSimSettings::kVehicleTypeComputerVision) {
         return (static_cast<const TCVPawn*>(pawn))->getCameras();
     }
+    else if (vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) {
+        return (static_cast<const TUrdfPawn*>(pawn))->getCameras();
+    }
     else {
         throw std::invalid_argument(common_utils::Utils::stringf(
             "vehicle_type %s is not recognized in getVehiclePawnCameras()", vehicle_type.c_str()));
@@ -291,6 +312,9 @@ void ASimModeWorldMultiAgent::initializeVehiclePawn(APawn* pawn)
     }
     else if (vehicle_type == AirSimSettings::kVehicleTypeComputerVision) {
         static_cast<TCVPawn*>(pawn)->initializeForBeginPlay();
+    }
+    else if (vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) {
+        static_cast<TUrdfPawn*>(pawn)->initializeForBeginPlay();
     }
     else {
         throw std::invalid_argument(common_utils::Utils::stringf(
@@ -329,6 +353,19 @@ std::unique_ptr<PawnSimApi> ASimModeWorldMultiAgent::createVehicleSimApi(
         vehicle_sim_api->initialize();
         return vehicle_sim_api;
     }
+    else if (vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) {
+        // ⚠ getPhysicsBody() stays nullptr on this sim api (the UpdatableObject default), so
+        // World::insert never routes it into the single shared PhysicsEngineBase. That is what
+        // lets a FastPhysics drone and a Box3D rover run side by side in one world (§6.0b). Its
+        // update() still runs on the physics thread, because UpdatableContainer::update() calls
+        // every member regardless of whether it has a physics body.
+        const auto* vehicle_setting =
+            AirSimSettings::singleton().getVehicleSetting(pawn_sim_api_params.vehicle_name);
+        auto vehicle_sim_api = std::unique_ptr<PawnSimApi>(
+            new UrdfBotSimApi(pawn_sim_api_params, vehicle_setting));
+        vehicle_sim_api->initialize();
+        return vehicle_sim_api;
+    }
     else {
         auto vehicle_sim_api = std::unique_ptr<PawnSimApi>(new MultirotorPawnSimApi(pawn_sim_api_params));
         vehicle_sim_api->initialize();
@@ -357,6 +394,10 @@ msr::airlib::VehicleApiBase* ASimModeWorldMultiAgent::getVehicleApi(const PawnSi
     else if (vehicle_type == AirSimSettings::kVehicleTypeComputerVision) {
         const auto cv_sim_api = static_cast<const ComputerVisionPawnSimApi*>(sim_api);
         return cv_sim_api->getVehicleApi();
+    }
+    else if (vehicle_type == AirSimSettings::kVehicleTypeUrdfBot) {
+        const auto urdf_sim_api = static_cast<const UrdfBotSimApi*>(sim_api);
+        return urdf_sim_api->getVehicleApi();
     }
     else {
         const auto multirotor_sim_api = static_cast<const MultirotorPawnSimApi*>(sim_api);

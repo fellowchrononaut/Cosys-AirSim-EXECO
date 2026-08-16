@@ -14,24 +14,25 @@ public:
 
 /// Parse a URDF file. Throws ParseError with a message naming the offending element.
 ///
-/// Supported: <robot>, <link> (multiple <collision>, one <inertial>), <joint> of every URDF type,
-/// <origin>, <axis>, <limit>, <dynamics>, and box/cylinder/sphere/mesh geometry.
+/// Supported: <robot>, <link> (multiple <collision> and <visual>, one <inertial>), <joint> of
+/// every URDF type, <origin>, <axis>, <limit>, <dynamics>, <mimic>, and box/cylinder/sphere/mesh
+/// geometry.
 ///
 /// Deliberately NOT supported, and rejected loudly rather than silently ignored:
 ///   - xacro (run it through `xacro` first)
 ///   - <safety_controller> — parsed by UrdfSim but never acted on; accepting it here would
 ///     repeat that class of silent no-op
-///   - <mimic> — same reasoning, but see ParseOptions::ignore_mimic for a deliberate opt-out
 ///   - <transmission>, <gazebo> extensions
-/// Opt-ins for URDF features this loader cannot yet honour.
 ///
-/// The default is to REFUSE such a file rather than load a robot that quietly differs from it.
-/// A caller who knows the feature is cosmetic can enable it here; every affected joint is then
-/// flagged (Joint::mimic_ignored) so the omission stays enumerable rather than invisible.
+/// ⚠ <mimic> is *parsed* here but not *resolved* here. Whether the coupling can be honoured, and
+/// how, depends on whether the joint carries load — a backend question, answered in UrdfMimic.hpp
+/// and enforced when the robot is built. The parser's contract is to record the constraint in full
+/// (source, multiplier, offset) so no later stage has to guess. What is forbidden is UrdfSim's
+/// behaviour: storing it and never applying it.
 struct ParseOptions {
-    /// Load <mimic> joints as ordinary free joints of their stated type. Box3D has no gear or
-    /// coupled-joint constraint, so the coupling genuinely cannot be represented today.
-    bool ignore_mimic = false;
+    /// Reserved. No parse-time opt-outs exist at present: everything this parser accepts, it
+    /// records faithfully, and every judgement call about what can be *simulated* belongs to the
+    /// backend. Kept as a struct so adding one later is not an API break.
 };
 
 Robot parseFile(const std::string& path, const ParseOptions& options = {});

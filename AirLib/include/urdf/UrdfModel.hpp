@@ -47,6 +47,16 @@ struct Collision {
     Geometry geometry;
 };
 
+/// URDF <visual>. Carried because Gate 2 renders each link as an Unreal actor: the visual geometry
+/// is what gets drawn, and — since an Unreal static mesh brings its own collision — it is also what
+/// LiDAR, echo and distance sensors trace. That makes <visual> the *other* half of R2: Box3D drives
+/// on <collision> hulls while the sensors see this. The two are compared by UrdfCollisionAudit.
+struct Visual {
+    std::string name;
+    Origin origin;
+    Geometry geometry;
+};
+
 /// URDF <inertial>. `inertia` is about the centre of mass, expressed in the frame given by
 /// `origin` — so a non-zero origin.rpy means it must be rotated into the link frame before use.
 /// Row-major 3x3; URDF supplies the six independent terms.
@@ -71,6 +81,7 @@ struct Link {
     bool has_inertial = false;
     Inertial inertial;
     std::vector<Collision> collisions;   // URDF permits several; UrdfSim supported only one
+    std::vector<Visual> visuals;         // likewise; drawn and (in Unreal) traced by sensors
 
     // Filled in by the parser once the tree is resolved.
     int parent_joint = -1;               // index into Robot::joints, -1 for the root
@@ -100,12 +111,16 @@ struct Joint {
     JointLimit limit;
     JointDynamics dynamics;
 
-    /// Set when <mimic> was present and deliberately not applied (see ParseOptions). The joint
-    /// then behaves as a free joint of its stated type. Recorded rather than dropped so a caller
-    /// can enumerate exactly what was skipped — the failure mode being avoided is UrdfSim's, where
-    /// <mimic> was parsed and silently never applied, with nothing to indicate it.
-    bool mimic_ignored = false;
+    /// URDF <mimic>: q_this = multiplier * q_source + offset. Present iff `mimic_source_joint` is
+    /// non-empty. Recorded in full rather than dropped — the failure mode being avoided is
+    /// UrdfSim's, where <mimic> was parsed and silently never applied, with nothing to indicate it.
+    ///
+    /// How the constraint is honoured is a *backend* decision, not a parser one, and it depends on
+    /// whether the joint carries load (analysis doc §6.5). See MimicRole and UrdfMimic.hpp.
     std::string mimic_source_joint;
+    double mimic_multiplier = 1.0;   // URDF default
+    double mimic_offset = 0.0;       // URDF default
+    bool hasMimic() const { return !mimic_source_joint.empty(); }
 
     int parent_index = -1;  // into Robot::links
     int child_index = -1;
@@ -134,6 +149,20 @@ struct Robot {
     /// maximal-coordinate solver will struggle — not the joint count. Four wheels on a base is
     /// depth 1; a 6-DoF serial arm is depth 6.
     int chainDepth() const;
+
+    /// Link indices of `link` and everything below it, in a deterministic (depth-first) order.
+    std::vector<int> subtreeLinks(int link) const;
+
+    /// Sum of <inertial><mass> over the subtree rooted at `link`. Links without <inertial>
+    /// contribute nothing, which matches how the backend treats them.
+    double subtreeMass(int link) const;
+
+    /// True if any link in the subtree rooted at `link` declares a <collision>. This is the test
+    /// that decides whether a <mimic> joint can possibly carry load: a subtree that touches nothing
+    /// cannot transmit contact force.
+    bool subtreeHasCollision(int link) const;
+
+    double totalMass() const;
 };
 
 } // namespace urdf

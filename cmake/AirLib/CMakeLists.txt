@@ -43,6 +43,26 @@ list(APPEND ${PROJECT_NAME}_sources ${${PROJECT_NAME}_urdf_sources})
 # includes it, so it needs no entry under AirLib/deps.
 list(APPEND ${PROJECT_NAME}_sources ${AIRSIM_ROOT}/external/tinyxml2/tinyxml2.cpp)
 
+# ⚠ -U_GNU_SOURCE is load-bearing, and removing it breaks the UNREAL link, not this build.
+#
+# build.sh compiles AirLib against the HOST glibc (2.39 here). Since glibc 2.38, <stdio.h> redirects
+# sscanf to __isoc23_sscanf whenever __GLIBC_USE (ISOC2X) is on — which _GNU_SOURCE, defined by
+# default in C++ mode, turns on. Unreal then links the resulting archive with its own bundled
+# toolchain sysroot (v25_clang-18.1.0-rockylinux8, glibc 2.28), which has no such symbol:
+#
+#     ld.lld: error: undefined symbol: __isoc23_sscanf
+#
+# Undefining _GNU_SOURCE for this one file falls back to __isoc99_sscanf, present since glibc 2.7
+# and therefore in Unreal's sysroot. Verified by inspecting the emitted symbol, not by assumption.
+# tinyxml2 uses no GNU extensions, so this costs it nothing.
+#
+# ⚠ This is a targeted fix for the first symptom, NOT a general one. ANY AirLib translation unit
+# compiled on a glibc >= 2.38 host that calls sscanf/strtol-family functions will fail the same way,
+# and tinyxml2 merely happens to be the first one that ever did. The structural fix is to build
+# AirLib against Unreal's bundled sysroot; that is a larger change and has not been made.
+set_source_files_properties(${AIRSIM_ROOT}/external/tinyxml2/tinyxml2.cpp
+  PROPERTIES COMPILE_OPTIONS "-U_GNU_SOURCE")
+
 # The Box3D-backed URDF robot compiles only when the optional dependency is present.
 if(BOX3D_FOUND)
   file(GLOB_RECURSE ${PROJECT_NAME}_box3d_sources

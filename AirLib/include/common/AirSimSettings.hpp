@@ -39,6 +39,7 @@ namespace airlib
         static constexpr char const* kVehicleTypePioneer = "pioneer";
         static constexpr char const* kVehicleTypeArduRover = "ardurover";
         static constexpr char const* kVehicleTypeComputerVision = "computervision";
+        static constexpr char const* kVehicleTypeUrdfBot = "urdfbot";
 
         static constexpr char const* kVehicleInertialFrame = "VehicleInertialFrame";
         static constexpr char const* kSensorLocalFrame = "SensorLocalFrame";
@@ -458,6 +459,82 @@ namespace airlib
             VehicleLightSettingMap lights;
 
             RCSettings rc;
+
+            // --- "urdfbot" only (analysis doc §6.2) ---------------------------------------
+            // ⚠ Every field below is inert unless vehicle_type == kVehicleTypeUrdfBot. A settings
+            // file that names no urdfbot and no "PhysicsEngine" reaches none of this, so existing
+            // files keep their meaning bit-identically — layer 2 of the §7 non-invasiveness
+            // guarantee.
+
+            /// Path to the URDF. Required for an urdfbot; xacro must already be expanded.
+            std::string urdf_file;
+
+            /// Directories to resolve `package://` mesh references against, tried in order before
+            /// the URDF's own directory.
+            std::vector<std::string> urdf_mesh_search_paths;
+
+            /// Which dynamics backend moves this robot. Empty = the type's implicit default, which
+            /// keeps this key optional. Only "urdfbot" may name one; §6.0b is explicit that this
+            /// selects the *bot's* backend, not a global engine — World still holds exactly one
+            /// PhysicsEngineBase and never sees this.
+            std::string physics_engine;
+
+            /// Anchor the root link to the world. URDF has no notion of a fixed base, so it is
+            /// explicit here: true for an arm on a bench, false for anything that drives.
+            bool urdf_fixed_base = false;
+
+            /// Accept the servo-follower approximation for load-bearing <mimic> joints. Off by
+            /// default: cosmetic mimics are resolved exactly without it, and a load-bearing one is
+            /// refused rather than silently approximated.
+            bool urdf_allow_mimic_follower = false;
+
+            /// Log the R2 collision-consistency audit at load. On by default — the disagreement
+            /// between what Box3D drives on and what the sensors trace is not visible in any other
+            /// way, and on a real URDF it is usually large.
+            bool urdf_report_collision_audit = true;
+
+            /// Height of a flat static floor in the robot's own frame, or NaN for none.
+            ///
+            /// ⚠ Scaffolding until static world geometry is mirrored into the backend. The backend
+            /// world otherwise contains the robot and nothing else, so an unpinned robot falls
+            /// forever. Set it to minus the spawn height so the simulated floor lines up with the
+            /// visible one: spawning at NED Z = -2 (2 m up) wants UrdfGroundPlaneZ = -2.
+            double urdf_ground_plane_z = Utils::nan<double>();
+
+            /// Put the scaffolding floor wherever a downward probe from the spawn point hits.
+            ///
+            /// Preferred over UrdfGroundPlaneZ: that one is a height in the *robot's* frame, which
+            /// means knowing where PlayerStart sits relative to the map's floor. Those are
+            /// different numbers, and guessing wrong buries the simulated floor under the visible
+            /// one — the robot then lands out of sight and looks like it fell through the world.
+            bool urdf_ground_plane_auto = false;
+
+            /// Keyboard/gamepad driving for a URDF robot.
+            ///
+            /// ⚠ Which joints are wheels and which are steering is **not** derivable from a URDF —
+            /// it says nothing about a joint's role. Every other vehicle type in AirSim can hard-code
+            /// this because its geometry is fixed; a urdfbot cannot, and guessing from joint names
+            /// would be exactly the silent-wrong-answer failure this workstream exists to avoid. So
+            /// the mapping is declared here, by the operator, or there is no keyboard control.
+            ///
+            /// The per-joint multiplier is what makes this general rather than a special case:
+            /// steering multipliers of front +1 / middle 0 / rear -1 give Ackermann, all +1 gives
+            /// crab, and drive multipliers of +1/-1 per side give a differential/skid robot.
+            struct UrdfDriveSetting
+            {
+                bool enabled = false;
+
+                /// Joint name -> multiplier applied to the throttle axis. Velocity control, rad/s.
+                std::map<std::string, double> drive_joints;
+                /// Joint name -> multiplier applied to the steering axis. Position control, rad.
+                std::map<std::string, double> steer_joints;
+
+                double max_wheel_speed = 6.0;   // rad/s at full throttle
+                double max_steer_angle = 0.6;   // rad at full steering deflection
+                double steer_hertz = 40.0;      // position-control gains for the steering joints
+                double steer_damping_ratio = 1.0;
+            };
+            UrdfDriveSetting urdf_drive;
 
             VehicleSetting()
             {
@@ -1115,6 +1192,68 @@ namespace airlib
             vehicle_setting->is_fpv_vehicle = settings_json.getBool("IsFpvVehicle",
                                                                     vehicle_setting->is_fpv_vehicle);
 
+            // urdfbot-only keys. Read unconditionally but defaulted to inert values, so a vehicle
+            // of any other type is unaffected by their presence in the struct.
+            if (vehicle_type == kVehicleTypeUrdfBot) {
+                vehicle_setting->urdf_file = settings_json.getString("UrdfFile", "");
+                vehicle_setting->physics_engine = settings_json.getString("PhysicsEngine", "");
+                vehicle_setting->urdf_fixed_base = settings_json.getBool("UrdfFixedBase", false);
+                vehicle_setting->urdf_allow_mimic_follower =
+                    settings_json.getBool("UrdfAllowMimicFollower", false);
+                vehicle_setting->urdf_report_collision_audit =
+                    settings_json.getBool("UrdfReportCollisionAudit", true);
+
+                if (vehicle_setting->urdf_file.empty())
+                    throw std::invalid_argument(
+                        "Vehicle '" + vehicle_name + "' is of type \"urdfbot\" but has no "
+                        "\"UrdfFile\". There is no default URDF and guessing one would silently "
+                        "simulate the wrong robot.");
+
+                settings_json.getStringArray("UrdfMeshSearchPaths",
+                                             vehicle_setting->urdf_mesh_search_paths);
+
+                vehicle_setting->urdf_ground_plane_z =
+                    settings_json.getDouble("UrdfGroundPlaneZ", Utils::nan<double>());
+                vehicle_setting->urdf_ground_plane_auto =
+                    settings_json.getBool("UrdfGroundPlaneAuto", false);
+
+                Settings drive_json;
+                if (settings_json.getChild("UrdfDrive", drive_json)) {
+                    auto& d = vehicle_setting->urdf_drive;
+                    d.enabled = drive_json.getBool("Enabled", true);
+                    d.max_wheel_speed = drive_json.getDouble("MaxWheelSpeed", d.max_wheel_speed);
+                    d.max_steer_angle = drive_json.getDouble("MaxSteerAngle", d.max_steer_angle);
+                    d.steer_hertz = drive_json.getDouble("SteerHertz", d.steer_hertz);
+                    d.steer_damping_ratio =
+                        drive_json.getDouble("SteerDampingRatio", d.steer_damping_ratio);
+
+                    auto readJointMap = [](const Settings& parent, const char* key,
+                                           std::map<std::string, double>& out) {
+                        Settings child;
+                        if (!parent.getChild(key, child)) return;
+                        std::vector<std::string> names;
+                        child.getChildNames(names);
+                        for (const std::string& n : names) out[n] = child.getDouble(n, 0.0);
+                    };
+                    readJointMap(drive_json, "DriveJoints", d.drive_joints);
+                    readJointMap(drive_json, "SteerJoints", d.steer_joints);
+
+                    if (d.enabled && d.drive_joints.empty() && d.steer_joints.empty())
+                        throw std::invalid_argument(
+                            "Vehicle '" + vehicle_name + "': \"UrdfDrive\" is enabled but names no "
+                            "DriveJoints and no SteerJoints. A URDF does not say which joints are "
+                            "wheels, so there is nothing to drive and the keys would do nothing.");
+                }
+            }
+            else if (!settings_json.getString("PhysicsEngine", "").empty()) {
+                // Naming a backend on a vehicle that cannot have one is a silent no-op otherwise,
+                // and the operator would reasonably believe the setting took effect.
+                throw std::invalid_argument(
+                    "Vehicle '" + vehicle_name + "' of type \"" + vehicle_type +
+                    "\" sets \"PhysicsEngine\", which only \"urdfbot\" supports. Its dynamics are "
+                    "chosen by vehicle type; the key would have no effect.");
+            }
+
             loadRCSetting(simmode_name, settings_json, vehicle_setting->rc);
 
             vehicle_setting->position = createVectorSetting(settings_json, vehicle_setting->position);
@@ -1394,6 +1533,11 @@ namespace airlib
                 PawnPath("Class'/AirSim/VehicleAdv/BoxCar/BoxCarPawn.BoxCarPawn_C'"));
             pawn_paths.emplace("DefaultComputerVision",
                                PawnPath("Class'/AirSim/Blueprints/BP_ComputerVisionPawn.BP_ComputerVisionPawn_C'"));
+            // The native class, not a blueprint. A URDF robot's geometry comes from its URDF at
+            // runtime, so there is nothing for a blueprint to hold — and requiring one would mean
+            // shipping an asset before any URDF could be loaded at all.
+            pawn_paths.emplace("DefaultUrdfBot",
+                               PawnPath("/Script/AirSim.UrdfBotPawn"));
         }
 
         static void loadPawnPaths(const Settings& settings_json, std::map<std::string, PawnPath>& pawn_paths)

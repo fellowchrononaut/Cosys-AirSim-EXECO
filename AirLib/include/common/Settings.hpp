@@ -153,6 +153,25 @@ namespace airlib
             return false;
         }
 
+        /// Read a JSON array of strings, e.g. "UrdfMeshSearchPaths": ["/a", "/b"].
+        /// Returns false and leaves `out` untouched if the key is absent; throws if it is present
+        /// but is not an array of strings, because a mistyped path list that silently reads as
+        /// empty would look exactly like meshes that could not be found.
+        bool getStringArray(const std::string& name, std::vector<std::string>& out) const
+        {
+            if (doc_.count(name) != 1) return false;
+            const auto& node = doc_[name];
+            if (node.type() != nlohmann::detail::value_t::array)
+                throw std::invalid_argument("Settings key '" + name + "' must be an array of strings");
+            for (const auto& e : node) {
+                if (e.type() != nlohmann::detail::value_t::string)
+                    throw std::invalid_argument("Settings key '" + name +
+                                                "' must contain only strings");
+                out.push_back(e.get<std::string>());
+            }
+            return true;
+        }
+
         std::string getString(const std::string& name, std::string defaultValue) const
         {
             if (doc_.count(name) == 1) {

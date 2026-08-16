@@ -173,6 +173,20 @@ void parseLink(const XMLElement* e, Robot& robot)
         link.collisions.push_back(col);
     }
 
+    // <visual> is read for Gate 2: each link becomes an Unreal actor, and this is the geometry that
+    // gets drawn — and therefore, since an Unreal mesh carries its own collision, the geometry the
+    // LiDAR/echo/distance sensors trace. Keeping it here is what lets UrdfCollisionAudit compare
+    // "what Box3D drives on" against "what the sensors see" (R2) from the URDF alone.
+    for (const XMLElement* v = e->FirstChildElement("visual"); v;
+         v = v->NextSiblingElement("visual")) {
+        Visual vis;
+        const char* n = v->Attribute("name");
+        vis.name = n ? n : "";
+        vis.origin = readOrigin(v, ctx.c_str());
+        vis.geometry = parseGeometry(v->FirstChildElement("geometry"), ctx + " <visual>");
+        link.visuals.push_back(vis);
+    }
+
     robot.links.push_back(std::move(link));
 }
 
@@ -226,21 +240,48 @@ void parseJoint(const XMLElement* e, Robot& robot, const ParseOptions& options)
         j.dynamics.friction = readAttrDouble(d, "friction", ctx.c_str(), false);
     }
 
-    // Refuse what UrdfSim accepted and then ignored — unless the caller has explicitly opted in.
+    // <mimic> is read in full. Whether the coupling can actually be honoured is a backend question
+    // — see UrdfMimic.hpp — so the parser's job is to record it faithfully rather than to judge it.
+    // What must not happen is UrdfSim's behaviour: parsed, stored, and never applied.
     if (const XMLElement* mim = e->FirstChildElement("mimic")) {
-        if (!options.ignore_mimic)
-            fail(ctx + ": <mimic> is not supported. It is parsed but never applied by UrdfSim; "
-                       "accepting it here would silently produce a robot that does not match the "
-                       "URDF. Set ParseOptions::ignore_mimic if the coupling is cosmetic and you "
-                       "want it loaded as a free joint.");
-        j.mimic_ignored = true;
-        const char* src = mim->Attribute("joint");
-        j.mimic_source_joint = src ? src : "";
+        j.mimic_source_joint = readAttrString(mim, "joint", ctx.c_str(), true);
+        if (j.mimic_source_joint == j.name)
+            fail(ctx + ": <mimic> names itself as its own source joint");
+        j.mimic_multiplier = readAttrDouble(mim, "multiplier", ctx.c_str(), false, 1.0);
+        j.mimic_offset     = readAttrDouble(mim, "offset", ctx.c_str(), false, 0.0);
     }
     if (e->FirstChildElement("safety_controller"))
         fail(ctx + ": <safety_controller> is not supported (parsed-but-ignored in UrdfSim).");
 
     robot.joints.push_back(std::move(j));
+}
+
+/// Check every <mimic> reference resolves, and that following `mimic` links terminates.
+///
+/// A mimic chain that loops (a mimics b, b mimics a) has no solution and would hang or produce
+/// junk in any evaluator, so it is rejected here rather than left for a backend to trip over.
+/// Chains themselves are legal — a mimicking a b that mimics c is well defined — so this checks
+/// for cycles, not for depth.
+void resolveMimic(Robot& robot)
+{
+    for (Joint& j : robot.joints) {
+        if (!j.hasMimic()) continue;
+        if (robot.findJoint(j.mimic_source_joint) < 0)
+            fail("joint '" + j.name + "': <mimic> names source joint '" + j.mimic_source_joint +
+                 "', which does not exist");
+    }
+
+    // Walk each mimic chain to a fixed point; anything longer than the joint count is a cycle.
+    const size_t n = robot.joints.size();
+    for (const Joint& start : robot.joints) {
+        if (!start.hasMimic()) continue;
+        int cur = robot.findJoint(start.mimic_source_joint);
+        for (size_t hops = 0; cur >= 0 && robot.joints[cur].hasMimic(); ++hops) {
+            if (hops > n)
+                fail("joint '" + start.name + "': <mimic> chain contains a cycle");
+            cur = robot.findJoint(robot.joints[cur].mimic_source_joint);
+        }
+    }
 }
 
 /// Resolve names to indices, verify the tree is a tree, and find the root.
@@ -279,6 +320,8 @@ void resolveTree(Robot& robot, const std::string& source)
     }
     if (robot.root_link < 0)
         fail(source + ": no root link — the joint graph contains a cycle");
+
+    resolveMimic(robot);
 }
 
 } // namespace
@@ -293,6 +336,41 @@ int Robot::chainDepth() const
         return best;
     };
     return depth(root_link);
+}
+
+std::vector<int> Robot::subtreeLinks(int link) const
+{
+    std::vector<int> out;
+    if (link < 0 || link >= static_cast<int>(links.size())) return out;
+    std::function<void(int)> walk = [&](int li) {
+        out.push_back(li);
+        for (int ji : links[li].child_joints) walk(joints[ji].child_index);
+    };
+    walk(link);
+    return out;
+}
+
+double Robot::subtreeMass(int link) const
+{
+    double m = 0;
+    for (int li : subtreeLinks(link))
+        if (links[li].has_inertial) m += links[li].inertial.mass;
+    return m;
+}
+
+bool Robot::subtreeHasCollision(int link) const
+{
+    for (int li : subtreeLinks(link))
+        if (!links[li].collisions.empty()) return true;
+    return false;
+}
+
+double Robot::totalMass() const
+{
+    double m = 0;
+    for (const Link& l : links)
+        if (l.has_inertial) m += l.inertial.mass;
+    return m;
 }
 
 Robot parseString(const std::string& xml, const std::string& source_name,

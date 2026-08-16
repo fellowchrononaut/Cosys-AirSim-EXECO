@@ -37,6 +37,7 @@ void Box3DRobot::destroyWorld()
     world_ = b3_nullWorldId;
     links_.clear();
     joints_.clear();
+    mimic_.clear();
     accumulator_ = 0;
     steps_taken_ = 0;
 }
@@ -58,6 +59,12 @@ void Box3DRobot::build(const urdf::Robot& model, const BuildOptions& opts)
     if (opts_.substeps < 4)
         throw std::runtime_error("Box3D rejects substeps < 4 for stiff chains; got " +
                                  std::to_string(opts_.substeps));
+
+    // Classify <mimic> before anything is created: a cosmetic coupling means *not* creating a
+    // joint, so the decision has to precede instantiation rather than be patched in afterwards.
+    mimic_ = urdf::classifyMimicJoints(model_, opts_.mimic);
+    urdf::requireMimicSupported(model_, mimic_, opts_.mimic);
+
     createWorld();
     instantiate();
     built_ = true;
@@ -158,10 +165,51 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
     }
 }
 
+void Box3DRobot::classifyMimic()
+{
+    // Everything at or below a cosmetic <mimic> joint is resolved by forward kinematics: no Box3D
+    // joint is created for it and no body is integrated. Doing it this way rather than creating a
+    // free body and overwriting its pose is the point — an overwritten body wastes solver work and
+    // leaves Box3D's state disagreeing with what is drawn (analysis doc §6.5).
+    //
+    // The whole subtree, not just the mimicking link: a decoration hanging off a decoration is
+    // still a decoration, and leaving its children jointed to a body that never moves would strand
+    // them at the origin.
+    for (const urdf::MimicClassification& c : mimic_) {
+        if (c.role != urdf::MimicRole::Cosmetic) continue;
+        const urdf::Joint& j = model_.joints[c.joint];
+        for (int li : model_.subtreeLinks(j.child_index)) {
+            LinkRec& rec = links_[li];
+            rec.kinematic = true;
+            const int pj = model_.links[li].parent_joint;
+            rec.kinematic_joint = pj;
+            rec.kinematic_parent = pj >= 0 ? model_.joints[pj].parent_index : -1;
+        }
+    }
+}
+
 void Box3DRobot::instantiate()
 {
+    // Built from opts_, so reset() — which rebuilds the world — recreates it automatically. A
+    // ground plane that vanished on reset would be a memorable bug.
+    if (opts_.add_ground_plane) {
+        b3BodyDef bd = b3DefaultBodyDef();
+        bd.type = b3_staticBody;
+        bd.position = toB3Pos(0.0, 0.0, opts_.ground_plane_z - 0.5);
+        bd.name = "ground_plane";
+        b3BodyId ground = b3CreateBody(world_, &bd);
+
+        b3ShapeDef sd = b3DefaultShapeDef();
+        sd.baseMaterial.friction = static_cast<float>(opts_.ground_friction);
+        // A thick, wide slab rather than a true half-space: Box3D has no infinite plane, and depth
+        // keeps a fast-moving wheel from tunnelling through it.
+        const b3BoxHull box = b3MakeBoxHull(50.0f, 50.0f, 0.5f);
+        b3CreateHullShape(ground, &sd, &box.base);
+    }
+
     const size_t n_links = model_.links.size();
     links_.resize(n_links);
+    classifyMimic();
 
     // Walk the tree from the root accumulating world transforms. A URDF joint <origin> is the
     // transform from the parent link frame to the joint frame, and the child link frame coincides
@@ -185,7 +233,9 @@ void Box3DRobot::instantiate()
         const bool is_static_root = opts_.fixed_base && static_cast<int>(i) == model_.root_link;
 
         b3BodyDef bd = b3DefaultBodyDef();
-        bd.type = is_static_root ? b3_staticBody : b3_dynamicBody;
+        bd.type = is_static_root  ? b3_staticBody
+                  : rec.kinematic ? b3_kinematicBody
+                                  : b3_dynamicBody;
         bd.position = b3Pos{ world_xf[i].p.x, world_xf[i].p.y, world_xf[i].p.z };
         bd.rotation = world_xf[i].q;
         bd.name = rec.name.c_str();
@@ -195,12 +245,13 @@ void Box3DRobot::instantiate()
 
         rec.body = b3CreateBody(world_, &bd);
         addCollisionShapes(link, rec, rec.body);
-        // Mass properties are meaningless on a static body and Box3D ignores them there.
-        if (!is_static_root) applyInertial(link, rec.body);
+        // Mass properties are meaningless on static and kinematic bodies; Box3D ignores them there.
+        if (!is_static_root && !rec.kinematic) applyInertial(link, rec.body);
     }
 
     joints_.reserve(model_.joints.size());
-    for (const urdf::Joint& j : model_.joints) {
+    for (size_t ji = 0; ji < model_.joints.size(); ++ji) {
+        const urdf::Joint& j = model_.joints[ji];
         // ⚠ Refuse rather than silently ignore. <dynamics damping="..."/> is viscous joint damping
         // in N.m.s/rad and <dynamics friction="..."/> is static friction in N.m. Box3D has no
         // direct equivalent for either: friction can be emulated with a zero-speed motor capped at
@@ -222,6 +273,21 @@ void Box3DRobot::instantiate()
         rec.axis_child = normalized(j.axis);
         rec.effort_limit = j.limit.effort;
         rec.velocity_limit = j.limit.velocity;
+
+        if (j.hasMimic()) {
+            rec.mimic_source = model_.findJoint(j.mimic_source_joint);
+            rec.mimic_multiplier = j.mimic_multiplier;
+            rec.mimic_offset = j.mimic_offset;
+            for (const urdf::MimicClassification& c : mimic_)
+                if (c.joint == static_cast<int>(ji)) rec.mimic_role = c.role;
+        }
+
+        // A cosmetic mimic, and everything below it, gets no Box3D joint at all — that is the
+        // whole point of the classification. The link's pose is composed in linkState() instead.
+        if (links_[j.child_index].kinematic) {
+            joints_.push_back(std::move(rec));
+            continue;
+        }
 
         // See b3_math.h::axisToZ for the derivation of these two frames, and for why the target
         // axis differs by joint type: revolute rotates about local +Z, prismatic slides along
@@ -327,7 +393,18 @@ void Box3DRobot::instantiate()
         }
 
         (void)base;
+        const bool load_bearing_mimic = rec.mimic_role == urdf::MimicRole::LoadBearing;
         joints_.push_back(std::move(rec));
+
+        // A load-bearing mimic keeps its joint — it has to, because it carries force — and is
+        // driven by a servo-follower: position control retargeted from the source joint every
+        // step. Approximate by construction, which is why reaching this line at all required an
+        // explicit opt-in back in build().
+        if (load_bearing_mimic) {
+            const size_t idx = joints_.size() - 1;
+            setControlMode(idx, ControlMode::Position);
+            setPositionGains(idx, opts_.mimic.follower_hertz, opts_.mimic.follower_damping_ratio);
+        }
     }
 }
 
@@ -338,8 +415,88 @@ int Box3DRobot::findJoint(const std::string& name) const
     return -1;
 }
 
+double Box3DRobot::mimicPosition(size_t joint) const
+{
+    const JointRec& r = joints_[joint];
+    if (r.mimic_source < 0) return jointState(joint).position;
+    // Recursion terminates because the parser rejects mimic cycles (resolveMimic).
+    const double q_src = mimicPosition(static_cast<size_t>(r.mimic_source));
+    return r.mimic_multiplier * q_src + r.mimic_offset;
+}
+
+double Box3DRobot::mimicVelocity(size_t joint) const
+{
+    const JointRec& r = joints_[joint];
+    if (r.mimic_source < 0) return jointState(joint).velocity;
+    // d/dt (m*q + c) = m*q̇ — the offset differentiates away.
+    return r.mimic_multiplier * mimicVelocity(static_cast<size_t>(r.mimic_source));
+}
+
+WorldPose Box3DRobot::kinematicTransform(size_t link) const
+{
+    const LinkRec& rec = links_[link];
+    if (!rec.kinematic || rec.kinematic_parent < 0 || rec.kinematic_joint < 0) {
+        // ⚠ WorldPose, not b3Transform: b3Transform::p is float in both precision modes, while
+        // b3Body_GetPosition returns a double b3Pos under BOX3D_DOUBLE_PRECISION (which AirLib
+        // pins on). Going through b3Transform here would truncate world coordinates to float.
+        WorldPose xf;
+        xf.p = b3Body_GetPosition(rec.body);
+        xf.q = b3Body_GetRotation(rec.body);
+        return xf;
+    }
+
+    // URDF composition: child frame = parent frame ∘ <origin> ∘ joint displacement about <axis>.
+    // The parent may itself be kinematic, so this recurses up to the first solver-owned link.
+    const WorldPose parent = kinematicTransform(static_cast<size_t>(rec.kinematic_parent));
+    const JointRec& jr = joints_[rec.kinematic_joint];
+    const urdf::Joint& j = model_.joints[rec.kinematic_joint];
+
+    // A joint inside a cosmetic subtree that is not itself a mimic has no solver state to read, so
+    // it sits at its commanded target — which is 0 unless something set one.
+    const double q = jr.mimic_source >= 0 ? mimicPosition(static_cast<size_t>(rec.kinematic_joint))
+                                          : jr.target;
+
+    b3Transform motion = b3Transform_identity;
+    switch (jr.type) {
+    case urdf::JointType::Revolute:
+    case urdf::JointType::Continuous: {
+        const double half = 0.5 * q;
+        const double s = std::sin(half);
+        const b3Vec3 a = jr.axis_child;
+        motion.q = b3Quat{ b3Vec3{ static_cast<float>(a.x * s), static_cast<float>(a.y * s),
+                                   static_cast<float>(a.z * s) },
+                           static_cast<float>(std::cos(half)) };
+        break;
+    }
+    case urdf::JointType::Prismatic: {
+        const b3Vec3 a = jr.axis_child;
+        motion.p = b3Vec3{ static_cast<float>(a.x * q), static_cast<float>(a.y * q),
+                           static_cast<float>(a.z * q) };
+        break;
+    }
+    default:
+        break;  // fixed / floating / planar contribute no scalar displacement
+    }
+
+    // The joint origin and the joint's own displacement are both local, link-sized transforms, so
+    // they compose in float; only the world accumulation is done in double.
+    return mulW(parent, mulT(transformFromOrigin(j.origin), motion));
+}
+
+void Box3DRobot::updateMimicFollowers()
+{
+    for (size_t i = 0; i < joints_.size(); ++i) {
+        JointRec& r = joints_[i];
+        if (r.mimic_role != urdf::MimicRole::LoadBearing) continue;
+        if (!b3Joint_IsValid(r.joint)) continue;
+        setTarget(i, mimicPosition(i));
+    }
+}
+
 void Box3DRobot::stepOnce()
 {
+    // Before the solve, so the follower's target is consistent with the state it was read from.
+    updateMimicFollowers();
     b3World_Step(world_, static_cast<float>(opts_.fixed_timestep), opts_.substeps);
     ++steps_taken_;
 }
@@ -358,6 +515,22 @@ int Box3DRobot::step(double dt)
 
 LinkState Box3DRobot::linkState(size_t i) const
 {
+    // ⚠ A kinematically-resolved link (at or below a cosmetic <mimic>) has no Box3D joint, so its
+    // body still sits at its build-time pose. Reading it would hand back a decoration frozen at
+    // the origin while the robot drove away — a plausible wrong answer of exactly the kind this
+    // workstream keeps finding. Resolve it here, in the backend, so every consumer agrees.
+    if (links_[i].kinematic) {
+        const WorldPose xf = kinematicTransform(i);
+        LinkState ks;
+        ks.position[0] = xf.p.x; ks.position[1] = xf.p.y; ks.position[2] = xf.p.z;
+        ks.orientation[0] = xf.q.v.x; ks.orientation[1] = xf.q.v.y;
+        ks.orientation[2] = xf.q.v.z; ks.orientation[3] = xf.q.s;
+        // Velocity of a kinematic decoration is not reported: deriving it would mean
+        // differentiating a pose the solver never integrated. Zero is the honest answer, and no
+        // sensor reads these links.
+        return ks;
+    }
+
     LinkState s;
     const b3BodyId b = links_[i].body;
     const b3Pos p = b3Body_GetPosition(b);
@@ -375,6 +548,15 @@ JointState Box3DRobot::jointState(size_t i) const
 {
     const JointRec& r = joints_[i];
     JointState s;
+
+    // A cosmetic mimic has no Box3D joint. Its coordinate is exactly the mimic relation, which is
+    // a better answer than the zeros the invalid-joint path below would return.
+    if (r.mimic_role == urdf::MimicRole::Cosmetic) {
+        s.position = mimicPosition(i);
+        s.velocity = mimicVelocity(i);
+        return s;  // effort is genuinely zero: nothing drives it
+    }
+
     if (!b3Joint_IsValid(r.joint)) return s;
 
     switch (r.type) {
@@ -411,32 +593,74 @@ double Box3DRobot::totalMass() const
     return m;
 }
 
+double Box3DRobot::kinematicMass() const
+{
+    double m = 0;
+    for (size_t i = 0; i < links_.size(); ++i)
+        if (links_[i].kinematic && model_.links[i].has_inertial) m += model_.links[i].inertial.mass;
+    return m;
+}
+
+void Box3DRobot::applyWrench(size_t link, const double force_world[3],
+                             const double torque_world[3], const double point_world[3],
+                             bool at_center)
+{
+    const LinkRec& rec = links_[link];
+    // A kinematic decoration has no dynamics to push on, and Box3D would ignore it anyway. Saying
+    // so here keeps the no-op deliberate rather than accidental.
+    if (rec.kinematic) return;
+
+    const b3Vec3 f{ static_cast<float>(force_world[0]), static_cast<float>(force_world[1]),
+                    static_cast<float>(force_world[2]) };
+    const b3Vec3 t{ static_cast<float>(torque_world[0]), static_cast<float>(torque_world[1]),
+                    static_cast<float>(torque_world[2]) };
+
+    if (at_center) {
+        b3Body_ApplyForceToCenter(rec.body, f, true);
+    }
+    else {
+        // toB3Pos, not a braced init: this is a world position, whose precision differs between
+        // build modes. See Box3DMath.hpp.
+        const b3Pos p = toB3Pos(point_world[0], point_world[1], point_world[2]);
+        b3Body_ApplyForce(rec.body, f, p, true);
+    }
+    b3Body_ApplyTorque(rec.body, t, true);
+}
+
 void Box3DRobot::setControlMode(size_t joint, ControlMode mode)
 {
     JointRec& r = joints_[joint];
     r.mode = mode;
     if (!b3Joint_IsValid(r.joint)) return;
-    if (r.type != urdf::JointType::Revolute && r.type != urdf::JointType::Continuous) return;
 
+    const bool revolute = r.type == urdf::JointType::Revolute ||
+                          r.type == urdf::JointType::Continuous;
+    const bool prismatic = r.type == urdf::JointType::Prismatic;
+    if (!revolute && !prismatic) return;
+
+    // ⚠ Position control is spring ON, motor **OFF**. The spring drives the joint to its target;
+    // leaving the motor enabled at its default motorSpeed = 0 turns it into a brake holding zero
+    // velocity with `effort` N.m, which the spring cannot overcome. The first version of this code
+    // did exactly that and the arm did not move at all — the reported "tracking error" came out as
+    // precisely the commanded target, which is what gave it away.
+    bool spring = false, motor = false;
     switch (mode) {
-    case ControlMode::Position:
-        // ⚠ Spring ON, motor **OFF**. The spring drives the joint to its target angle; leaving the
-        // motor enabled at its default motorSpeed = 0 turns it into a brake holding zero velocity
-        // with `effort` N.m, which the spring cannot overcome. The first version of this code did
-        // exactly that and the arm did not move at all — the measured "tracking error" came out as
-        // precisely the commanded target, which is what gave it away.
-        b3RevoluteJoint_EnableSpring(r.joint, true);
-        b3RevoluteJoint_EnableMotor(r.joint, false);
-        break;
-    case ControlMode::Velocity:
-        b3RevoluteJoint_EnableSpring(r.joint, false);
-        b3RevoluteJoint_EnableMotor(r.joint, true);
-        break;
+    case ControlMode::Position: spring = true;  motor = false; break;
+    case ControlMode::Velocity: spring = false; motor = true;  break;
     case ControlMode::Effort:
-    case ControlMode::None:
-        b3RevoluteJoint_EnableSpring(r.joint, false);
-        b3RevoluteJoint_EnableMotor(r.joint, false);
-        break;
+    case ControlMode::None:     spring = false; motor = false; break;
+    }
+
+    if (revolute) {
+        b3RevoluteJoint_EnableSpring(r.joint, spring);
+        b3RevoluteJoint_EnableMotor(r.joint, motor);
+    }
+    else {
+        // Prismatic used to fall through this function entirely, so position control on a sliding
+        // joint silently did nothing. That matters now: a parallel gripper — the canonical
+        // load-bearing <mimic> — is prismatic, and its servo-follower runs on this path.
+        b3PrismaticJoint_EnableSpring(r.joint, spring);
+        b3PrismaticJoint_EnableMotor(r.joint, motor);
     }
 }
 
@@ -444,11 +668,16 @@ void Box3DRobot::setPositionGains(size_t joint, double hertz, double damping_rat
 {
     JointRec& r = joints_[joint];
     if (!b3Joint_IsValid(r.joint)) return;
-    if (r.type != urdf::JointType::Revolute && r.type != urdf::JointType::Continuous) return;
     // Box3D's guidance: spring hertz should stay below half the step frequency (Nyquist). At the
     // 3 ms sim step that ceiling is ~166 Hz.
-    b3RevoluteJoint_SetSpringHertz(r.joint, static_cast<float>(hertz));
-    b3RevoluteJoint_SetSpringDampingRatio(r.joint, static_cast<float>(damping_ratio));
+    if (r.type == urdf::JointType::Revolute || r.type == urdf::JointType::Continuous) {
+        b3RevoluteJoint_SetSpringHertz(r.joint, static_cast<float>(hertz));
+        b3RevoluteJoint_SetSpringDampingRatio(r.joint, static_cast<float>(damping_ratio));
+    }
+    else if (r.type == urdf::JointType::Prismatic) {
+        b3PrismaticJoint_SetSpringHertz(r.joint, static_cast<float>(hertz));
+        b3PrismaticJoint_SetSpringDampingRatio(r.joint, static_cast<float>(damping_ratio));
+    }
 }
 
 void Box3DRobot::setTarget(size_t joint, double value)
