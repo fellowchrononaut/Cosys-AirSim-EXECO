@@ -1610,7 +1610,29 @@ void AirsimROSWrapperMultiAgent::append_static_vehicle_tf(VehicleROS* vehicle_ro
     tf_msg.header.frame_id  = world_frame_id_;
     tf_msg.header.stamp     = nh_->now();
     tf_msg.child_frame_id   = vehicle_ros->vehicle_name_;
-    tf_msg.transform        = get_transform_msg_from_airsim(vehicle_setting.position, vehicle_setting.rotation);
+
+    // ⚠ TRANSLATION ONLY. The spawn ROTATION must NOT go in here, and leaving it in rotated every
+    // vehicle's sensor data by its own spawn yaw.
+    //
+    // simGetVehiclePose reports in a HYBRID frame: position relative to the vehicle's spawn,
+    // orientation ABSOLUTE. That is upstream AirSim behaviour, not a fork quirk — NedTransform's
+    // per-pawn pivot is a POSITION offset only (`local_ned_offset_ = pivot->GetActorLocation()`),
+    // and toNed(FQuat) is an axis flip that never sees the pivot. Measured 2026-08-17 on five
+    // vehicles: every one reported position (0.00, 0.00) at spawn while reporting its true spawn
+    // yaw (60 -> 60.0, 300 -> 300.0, 180 -> 181.8).
+    //
+    // The odom transform published under this one therefore ALREADY carries the absolute
+    // orientation. Putting the spawn rotation here too composed spawn_yaw with absolute_yaw, so at
+    // spawn each body frame sat at 2x its yaw — and every sensor frame hangs off that body frame.
+    // Invisible when all vehicles spawn at yaw 0 (execo_test.json), which is why it survived: the
+    // clouds only visibly separate once vehicles face different directions.
+    //
+    // With translation only the chain is consistent: this frame is world-axis-aligned at the spawn
+    // point, the odom delta is expressed in world axes (both operands of the subtraction above are
+    // world Unreal coordinates), and the odom orientation supplies the true heading.
+    msr::airlib::AirSimSettings::Rotation no_rotation;
+    no_rotation.yaw = 0.0f; no_rotation.pitch = 0.0f; no_rotation.roll = 0.0f;
+    tf_msg.transform        = get_transform_msg_from_airsim(vehicle_setting.position, no_rotation);
     convert_tf_msg_to_ros(tf_msg);
     vehicle_ros->static_tf_msg_vec_.emplace_back(tf_msg);
 }
