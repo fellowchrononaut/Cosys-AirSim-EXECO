@@ -47,7 +47,11 @@ std::vector<MimicClassification> classifyMimicJoints(const Robot& robot, const M
         c.joint = static_cast<int>(ji);
         c.source_joint = robot.findJoint(j.mimic_source_joint);
         c.subtree_mass = robot.subtreeMass(j.child_index);
-        c.subtree_collides = robot.subtreeHasCollision(j.child_index);
+        // declared_only: a shape synthesised from <visual> says nothing about whether the URDF's
+        // author intended this coupling to carry load. Counting it would mean that switching on
+        // UrdfCollisionFromVisual silently demotes a cosmetic eye into a servo-follower
+        // approximation — a physics change caused by a rendering-motivated setting.
+        c.subtree_collides = robot.subtreeHasCollision(j.child_index, /*declared_only=*/true);
 
         // A <mimic> on a joint with no scalar coordinate has nothing to mimic *with*. Neither path
         // can be built for it, so it is load-bearing by elimination and will be refused with a

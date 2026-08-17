@@ -21,6 +21,13 @@ struct Vec3 {
     double x = 0, y = 0, z = 0;
 };
 
+/// Unit quaternion, x/y/z/w. Lives here rather than in UrdfRobotBackend.hpp (where it started)
+/// because it is a frame primitive that both the backend interface and the static-world description
+/// need, and having them include each other to reach it would be a cycle.
+struct Quat {
+    double x = 0, y = 0, z = 0, w = 1;
+};
+
 /// Pose as URDF writes it: translation plus fixed-axis roll/pitch/yaw.
 struct Origin {
     Vec3 xyz;
@@ -45,16 +52,40 @@ struct Collision {
     std::string name;
     Origin origin;
     Geometry geometry;
+
+    /// This shape was **inferred** from the link's <visual>, not declared by the URDF author.
+    /// See UrdfCollisionSynthesis.hpp.
+    ///
+    /// ⚠ The distinction is load-bearing, not bookkeeping. Anything reasoning about what the
+    /// *author intended* must ignore synthesised shapes — the <mimic> classifier decides whether a
+    /// coupling is load-bearing by asking whether the subtree "declares <collision>", and if
+    /// synthesis silently satisfied that test, enabling UrdfCollisionFromVisual would turn a
+    /// cosmetic eye into a servo-follower approximation. Anything reasoning about what the robot
+    /// *physically is* (the R2 audit, the backend) must count them.
+    bool synthesized = false;
 };
 
 /// URDF <visual>. Carried because Gate 2 renders each link as an Unreal actor: the visual geometry
 /// is what gets drawn, and — since an Unreal static mesh brings its own collision — it is also what
 /// LiDAR, echo and distance sensors trace. That makes <visual> the *other* half of R2: Box3D drives
 /// on <collision> hulls while the sensors see this. The two are compared by UrdfCollisionAudit.
+/// URDF <material>. Only the colour is carried: <texture> needs an image loader and an asset
+/// pipeline, and a texture silently ignored would be indistinguishable from a robot that has none.
+struct Material {
+    bool present = false;
+    std::string name;
+    double r = 0.8, g = 0.8, b = 0.8, a = 1.0;  ///< neutral grey when the URDF says nothing
+    std::string texture;                        ///< recorded, not applied — reported if set
+};
+
 struct Visual {
     std::string name;
     Origin origin;
     Geometry geometry;
+
+    /// ⚠ Dropped entirely before 2026-08-17, which is why a mesh robot rendered untinted. ExoMy
+    /// declares 45 of these.
+    Material material;
 };
 
 /// URDF <inertial>. `inertia` is about the centre of mass, expressed in the frame given by
@@ -157,10 +188,13 @@ struct Robot {
     /// contribute nothing, which matches how the backend treats them.
     double subtreeMass(int link) const;
 
-    /// True if any link in the subtree rooted at `link` declares a <collision>. This is the test
-    /// that decides whether a <mimic> joint can possibly carry load: a subtree that touches nothing
-    /// cannot transmit contact force.
-    bool subtreeHasCollision(int link) const;
+    /// Any link at or below `link` with collision geometry. This is the test that decides whether
+    /// a <mimic> joint can possibly carry load: a subtree that touches nothing cannot transmit
+    /// contact force.
+    ///
+    /// `declared_only` excludes shapes synthesised from <visual>: pass true when the question is
+    /// what the URDF author stated, false when the question is what will actually collide.
+    bool subtreeHasCollision(int link, bool declared_only = false) const;
 
     double totalMass() const;
 };

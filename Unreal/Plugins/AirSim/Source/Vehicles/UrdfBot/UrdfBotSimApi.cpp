@@ -1,11 +1,13 @@
 #include "UrdfBotSimApi.h"
 
 #include "UrdfTransform.h"
+#include "UrdfWorldGeometry.h"
 
 #include "Engine/World.h"
 #include "UnrealSensors/UnrealSensorFactory.h"
 
 #include "common/ClockFactory.hpp"
+#include "urdf/UrdfCollisionSynthesis.hpp"
 #include "urdf/UrdfParser.hpp"
 
 #if WITH_BOX3D_BINDING
@@ -176,14 +178,33 @@ void UrdfBotSimApi::loadModelAndBackend()
     const std::string urdf_path = vehicle_setting_->urdf_file;
     model_ = urdf::parseFile(urdf_path);
 
+    // Applied BEFORE the audit and before the build, deliberately: the audit's numbers, the
+    // backend's shapes and the pawn's <collision> render fallback then all describe one robot
+    // rather than three different ones.
+    if (vehicle_setting_->urdf_collision_from_visual) {
+        const urdf::SynthesisResult synth = urdf::synthesizeCollisionFromVisual(model_);
+        if (!synth.empty()) {
+            UAirBlueprintLib::LogMessageString("UrdfBot collision synthesis\n", synth.report(),
+                                               LogDebugLevel::Informational);
+            UE_LOG(LogUrdfBot, Log, TEXT("collision synthesis for '%s':\n%s"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()),
+                   UTF8_TO_TCHAR(synth.report().c_str()));
+        }
+    }
+
     // R2. Reported at load because it cannot be seen any other way: a URDF whose links are almost
     // all visual-only produces a robot that looks complete, drives on nearly nothing, and is fully
     // visible to LiDAR. On ExoMy that is 17 of 23 links and ~80% of the mass.
     audit_ = urdf::auditCollisionConsistency(model_, dirOf(urdf_path),
                                              vehicle_setting_->urdf_mesh_search_paths);
-    if (vehicle_setting_->urdf_report_collision_audit)
+    if (vehicle_setting_->urdf_report_collision_audit) {
         UAirBlueprintLib::LogMessageString("UrdfBot R2 audit\n", audit_.report(),
                                            LogDebugLevel::Informational);
+        // ...and to Blocks.log. LogMessageString draws on screen only and keys by prefix, so a
+        // multi-line report scrolls away and is unrecoverable afterwards.
+        UE_LOG(LogUrdfBot, Log, TEXT("R2 audit for '%s':\n%s"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), UTF8_TO_TCHAR(audit_.report().c_str()));
+    }
 
     const std::string engine = Utils::toLower(vehicle_setting_->physics_engine);
     if (!engine.empty() && engine != "box3d")
@@ -200,15 +221,104 @@ void UrdfBotSimApi::loadModelAndBackend()
     // internal step to it keeps whole steps consuming whole clock ticks.
     opts.fixed_timestep = 0.003;
     opts.fixed_base = vehicle_setting_->urdf_fixed_base;
+    opts.mesh_base_dir = dirOf(urdf_path);
+    opts.mesh_search_paths = vehicle_setting_->urdf_mesh_search_paths;
     opts.mimic.allow_servo_follower = vehicle_setting_->urdf_allow_mimic_follower;
-    // Where to put the scaffolding floor.
+
+    const float world_to_meters = getNedTransform().fromNed(1.0f);
+
+    // Place the robot in the shared world frame. Read before anything moves the pawn, because
+    // updateRendering then drives the pawn from the root link — reading it later would compound
+    // the robot's own motion into its start pose.
+    const FTransform spawn = getPawn()->GetActorTransform();
+    opts.root_position = UrdfTransform::toUrdfVec(spawn.GetTranslation(), world_to_meters);
+    opts.root_orientation = UrdfTransform::toUrdfQuat(spawn.GetRotation());
+
+    // --- static world geometry ----------------------------------------------------------------
+    // Mirrored once per level and shared by every robot: the shared_ptr's identity is what makes
+    // the cook shared (Box3DStaticGeometry), so this must go through MirrorLevelShared rather than
+    // each robot mirroring for itself.
+    if (vehicle_setting_->urdf_mirror_world_geometry) {
+        UrdfWorldGeometry::FMirrorOptions mirror_opts;
+        mirror_opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
+        mirror_opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
+        for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
+            mirror_opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+
+        UrdfWorldGeometry::FMirrorStats stats;
+        bool from_cache = false;
+        const UrdfWorldGeometry::FMirrorResult& mirror = UrdfWorldGeometry::MirrorLevelShared(
+            getPawn()->GetWorld(), world_to_meters, mirror_opts, stats, from_cache);
+        static_world_ = mirror.World;
+
+        if (!from_cache) {
+            UAirBlueprintLib::LogMessageString("UrdfBot static world geometry\n",
+                                               std::string(TCHAR_TO_UTF8(*stats.Report())),
+                                               LogDebugLevel::Informational);
+            UE_LOG(LogUrdfBot, Log, TEXT("static world geometry mirror:\n%s"), *stats.Report());
+            if (stats.ComponentsMirrored == 0) {
+                UE_LOG(LogUrdfBot, Error,
+                       TEXT("NOTHING mirrored from the level - the robot has no world to collide "
+                            "with. See the per-component rejection reasons above."));
+            }
+        }
+        else {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot: ",
+                getVehicleName() + " reuses the level mirror already made for this world - "
+                "one cook serves every robot",
+                LogDebugLevel::Informational);
+        }
+
+        box3d->setStaticWorld(static_world_);
+
+        // Kinematic bodies: registered per robot, because each robot owns its own b3World and gets
+        // its own handles. The mirror itself is shared, so the self-exclusion has to happen here —
+        // a robot that mirrored its own pawn would weld itself to an obstacle shaped like itself.
+        if (static_world_) {
+            for (size_t i = 0; i < static_world_->kinematic.size(); ++i) {
+                UPrimitiveComponent* src =
+                    (static_cast<int32>(i) < mirror.KinematicSources.Num())
+                        ? mirror.KinematicSources[static_cast<int32>(i)].Get()
+                        : nullptr;
+                if (src == nullptr) continue;
+                if (src->GetOwner() == getPawn()) continue;  // never mirror yourself
+
+                KinematicMirror km;
+                km.component = mirror.KinematicSources[static_cast<int32>(i)];
+                km.handle = box3d->addKinematicBody(static_world_->kinematic[i]);
+                kinematic_mirrors_.push_back(km);
+            }
+            UE_LOG(LogUrdfBot, Log, TEXT("kinematic mirror: tracking %d bodies for '%s'"),
+                   static_cast<int32>(kinematic_mirrors_.size()),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()));
+        }
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("static world: %d bodies, %d shapes, %d triangles (from_cache=%d)"),
+               static_cast<int32>(static_world_ ? static_world_->bodies.size() : 0),
+               static_cast<int32>(static_world_ ? static_world_->shapeCount() : 0),
+               static_cast<int32>(static_world_ ? static_world_->triangleCount() : 0),
+               from_cache ? 1 : 0);
+    }
+
+    const bool have_static_world = static_world_ && !static_world_->bodies.empty();
+    // --- scaffolding floor: FALLBACK ONLY, now that the level is mirrored ----------------------
     //
-    // ⚠ Auto is strongly preferred, and the explicit height exists mainly for reproducibility.
-    // Asking an operator for a height in the *robot's* frame means asking them to know where
-    // PlayerStart sits relative to the map's floor — those are different numbers, and getting it
-    // wrong puts the simulated floor underneath the visible one, where the robot lands out of
-    // sight and looks like it fell through the world.
-    if (vehicle_setting_->urdf_ground_plane_auto) {
+    // ⚠ Suppressed whenever real geometry exists. A flat plane and a mirrored level are not
+    // additive: the plane is infinite-ish (a 100 m slab) and would sit *through* the map, so a
+    // rover driving down a ramp would stop dead in mid-air on an invisible floor. Two floors is a
+    // worse failure than none, because none is obvious.
+    if (have_static_world) {
+        if (vehicle_setting_->urdf_ground_plane_auto ||
+            !std::isnan(vehicle_setting_->urdf_ground_plane_z)) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot: ",
+                getVehicleName() + " asked for a scaffolding ground plane, but the level mirrored "
+                "successfully - the plane is suppressed. It would sit through the map.",
+                LogDebugLevel::Informational);
+        }
+    }
+    else if (vehicle_setting_->urdf_ground_plane_auto) {
         const FVector start = getPawn()->GetActorLocation();
         FCollisionQueryParams params(FName(TEXT("UrdfGroundProbe")), /*bTraceComplex=*/true);
         params.AddIgnoredActor(getPawn());  // the robot's own link components carry collision
@@ -216,14 +326,15 @@ void UrdfBotSimApi::loadModelAndBackend()
         FHitResult hit;
         const FVector end = start - FVector(0.0f, 0.0f, 1.0e6f);
         if (getPawn()->GetWorld()->LineTraceSingleByChannel(hit, start, end, ECC_Visibility, params)) {
-            const float world_to_meters = getNedTransform().fromNed(1.0f);
             opts.add_ground_plane = true;
-            // Unreal Z and URDF Z both point up, so this is a plain scaled difference.
-            opts.ground_plane_z = (hit.ImpactPoint.Z - start.Z) / world_to_meters;
+            // Unreal Z and URDF Z both point up, so this is a plain scaled height — absolute now,
+            // not relative to the spawn point, because the solver frame is the world frame.
+            opts.ground_plane_z = hit.ImpactPoint.Z / world_to_meters;
             UAirBlueprintLib::LogMessageString(
                 "UrdfBot: ground probe hit ",
-                Utils::stringf("%s at %.3f m below the spawn point - scaffolding floor placed there",
-                               TCHAR_TO_UTF8(*GetNameSafe(hit.GetActor())), -opts.ground_plane_z),
+                Utils::stringf("%s - scaffolding floor placed at z = %.3f m. The level did "
+                               "NOT mirror, so this flat plane is all the robot can touch.",
+                               TCHAR_TO_UTF8(*GetNameSafe(hit.GetActor())), opts.ground_plane_z),
                 LogDebugLevel::Informational);
         }
         else {
@@ -254,13 +365,66 @@ void UrdfBotSimApi::loadModelAndBackend()
             LogDebugLevel::Failure);
     }
 
-    auto* pawn = static_cast<AUrdfBotPawn*>(getPawn());
-    pawn->buildFromModel(model_, dirOf(urdf_path), vehicle_setting_->urdf_mesh_search_paths);
+    // Two things the backend can only discover while building, both of which change what is
+    // actually simulated and neither of which is visible in the render.
+    {
+        const b3urdf::Box3DRobot& robot =
+            static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->robot();
 
-    // The robot's URDF world origin, fixed once. Captured before anything moves the pawn, because
-    // updateRendering then drives the pawn itself from the root link — so reading it later would
-    // compound the robot's own motion into its origin and make it accelerate away.
-    robot_origin_ = pawn->GetActorTransform();
+        for (const auto& r : robot.hullBudgetReductions()) {
+            // Box3D's hull builder has a hard 255-half-edge ceiling that no vertex budget can
+            // predict, so the budget is walked down until one is accepted. A coarser hull is a
+            // different shape from the one the operator asked for.
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot: coarser hull ",
+                Utils::stringf("on link '%s' - %d vertices requested, %d used (Box3D's 255 "
+                               "half-edge ceiling)", r.link.c_str(), r.requested, r.used),
+                LogDebugLevel::Informational);
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("link '%s': hull budget reduced %d -> %d (255 half-edge ceiling)"),
+                   UTF8_TO_TCHAR(r.link.c_str()), r.requested, r.used);
+        }
+
+        if (!robot.masslessMarkers().empty()) {
+            std::string names;
+            for (const std::string& n : robot.masslessMarkers())
+                names += (names.empty() ? "" : ", ") + n;
+            // Normal for frame markers, but they contribute no mass and are not simulated, so the
+            // operator should be told which links those are rather than inferring it.
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot: massless frame links ",
+                names + " have neither <inertial> nor <collision> - resolved kinematically, not "
+                "simulated",
+                LogDebugLevel::Informational);
+            UE_LOG(LogUrdfBot, Log, TEXT("massless frame links resolved kinematically: %s"),
+                   UTF8_TO_TCHAR(names.c_str()));
+        }
+    }
+
+    auto* pawn = static_cast<AUrdfBotPawn*>(getPawn());
+    pawn->setVisualCollision(vehicle_setting_->urdf_visual_collision);
+    pawn->setMeshShading(vehicle_setting_->urdf_mesh_cast_shadow,
+                         vehicle_setting_->urdf_mesh_smooth_normals,
+                         vehicle_setting_->urdf_mesh_flip_winding,
+                         vehicle_setting_->urdf_mesh_base_material,
+                         vehicle_setting_->urdf_mesh_inset_shadow,
+                         vehicle_setting_->urdf_mesh_two_sided_shadow,
+                         vehicle_setting_->urdf_mesh_contact_shadow,
+                         vehicle_setting_->urdf_mesh_decimate_grid,
+                         vehicle_setting_->urdf_mesh_asset_dir,
+                         vehicle_setting_->urdf_mesh_asset_scale);
+    UE_LOG(LogUrdfBot, Log,
+           TEXT("mesh shading [%s]: cast_shadow=%d contact_shadow=%d inset_shadow=%d "
+                "two_sided_shadow=%d smooth_normals=%d flip_winding=%d base_material=%d"),
+           UTF8_TO_TCHAR(getVehicleName().c_str()),
+           vehicle_setting_->urdf_mesh_cast_shadow ? 1 : 0,
+           vehicle_setting_->urdf_mesh_contact_shadow ? 1 : 0,
+           vehicle_setting_->urdf_mesh_inset_shadow ? 1 : 0,
+           vehicle_setting_->urdf_mesh_two_sided_shadow ? 1 : 0,
+           vehicle_setting_->urdf_mesh_smooth_normals ? 1 : 0,
+           vehicle_setting_->urdf_mesh_flip_winding ? 1 : 0,
+           vehicle_setting_->urdf_mesh_base_material ? 1 : 0);
+    pawn->buildFromModel(model_, dirOf(urdf_path), vehicle_setting_->urdf_mesh_search_paths);
 
     snapshot_.resize(backend_->linkCount());
     render_poses_.resize(backend_->linkCount());
@@ -297,17 +461,17 @@ void UrdfBotSimApi::loadModelAndBackend()
             LogDebugLevel::Failure);
     }
 
-    // ⚠ An unpinned robot in a world with no ground falls forever, and looks exactly like a broken
-    // physics backend. Until static world geometry is mirrored in, "not fixed base" plus "no ground
-    // plane" is almost always a settings mistake rather than an intent — so say so at load instead
-    // of letting the operator watch a rover accelerate into the void and guess why.
-    if (!opts.fixed_base && !opts.add_ground_plane) {
+    // ⚠ An unpinned robot in a world with no ground falls forever, and looks exactly like a
+    // broken physics backend rather than a configuration mistake. Say so at load instead of letting
+    // the operator watch a rover accelerate into the void and guess why.
+    if (!opts.fixed_base && !have_static_world && !opts.add_ground_plane) {
         UAirBlueprintLib::LogMessageString(
             "UrdfBot WARNING: ",
-            getVehicleName() + " has UrdfFixedBase=false and no UrdfGroundPlaneZ. Static world "
-            "geometry is not implemented, so this robot's physics world contains the robot and "
-            "NOTHING ELSE - it will free-fall indefinitely. Set UrdfGroundPlaneZ (to minus the "
-            "spawn height) to give it a floor, or UrdfFixedBase=true to pin it.",
+            getVehicleName() + " has UrdfFixedBase=false, the level mirror produced no geometry, "
+            "and there is no scaffolding plane - this robot's physics world contains the robot and "
+            "NOTHING ELSE, so it will free-fall indefinitely. Check the static-world report above: "
+            "if nothing mirrored, the level's colliders may not block the Pawn channel. Otherwise "
+            "set UrdfGroundPlaneAuto, or UrdfFixedBase=true to pin it.",
             LogDebugLevel::Failure);
     }
 
@@ -356,10 +520,26 @@ void UrdfBotSimApi::setupDriveJoints()
     UAirBlueprintLib::LogMessageString(
         "UrdfBot: keyboard drive ready - ",
         Utils::stringf("%d drive joint(s), %d steer joint(s). W/S or Up/Down = throttle, "
-                       "A/D or Left/Right = steer, Space = stop.",
+                       "A/D or Left/Right or Numpad4/6 = steer, Space = stop.",
                        static_cast<int>(drive_joints_.size()),
                        static_cast<int>(steer_joints_.size())),
         LogDebugLevel::Informational);
+
+    // To Blocks.log, because the on-screen channel cannot be read back after the fact and these
+    // three numbers separate the plausible causes of "steering does nothing":
+    //   0 steer joints        -> the names in settings did not resolve
+    //   max_steer_angle 0     -> the command is computed as zero however good the input is
+    //   both fine             -> the axis is not arriving, which is an Unreal input problem
+    UE_LOG(LogUrdfBot, Log,
+           TEXT("drive setup: %d drive joints, %d steer joints, max_wheel_speed=%.3f, "
+                "max_steer_angle=%.3f, steer_hertz=%.1f, steer_damping=%.2f"),
+           static_cast<int>(drive_joints_.size()), static_cast<int>(steer_joints_.size()),
+           d.max_wheel_speed, d.max_steer_angle, d.steer_hertz, d.steer_damping_ratio);
+    for (const DriveMapping& m : steer_joints_) {
+        UE_LOG(LogUrdfBot, Log, TEXT("  steer joint[%d] '%s' multiplier=%.2f"),
+               static_cast<int>(m.joint), UTF8_TO_TCHAR(backend_->jointName(m.joint).c_str()),
+               m.multiplier);
+    }
 }
 
 void UrdfBotSimApi::applyDriveInput()
@@ -380,6 +560,36 @@ void UrdfBotSimApi::applyDriveInput()
     for (const DriveMapping& m : steer_joints_)
         backend_->setJointTarget(m.joint, urdf::ControlMode::Position,
                                  steering * d.max_steer_angle * m.multiplier);
+
+    // ⚠ Diagnostic, on axis CHANGE only so the log stays readable. "Steering does nothing" has
+    // several causes that look identical from the driver's seat, and this line distinguishes them
+    // in one press: it prints the axis as received, the target computed from it, and the angle the
+    // joint actually reached. Physics has been ruled out headlessly (measure_steering.cpp shows all
+    // three ExoMy modes working), so if `steer` stays 0.000 here the axis is not arriving.
+    if (std::fabs(throttle - last_logged_throttle_) > 1e-3f ||
+        std::fabs(steering - last_logged_steering_) > 1e-3f) {
+        last_logged_throttle_ = throttle;
+        last_logged_steering_ = steering;
+
+        double target = 0, actual = 0;
+        const char* name = "<none>";
+        if (!steer_joints_.empty()) {
+            const DriveMapping& m = steer_joints_.front();
+            target = steering * d.max_steer_angle * m.multiplier;
+            actual = backend_->getJointState(m.joint).position;
+            name = backend_->jointName(m.joint).c_str();
+        }
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("drive input: throttle=%.3f steer=%.3f -> %s target=%.3f actual=%.3f"),
+               throttle, steering, UTF8_TO_TCHAR(name), target, actual);
+
+        // On screen too, one line, replaced in place - so it can be watched live while driving.
+        UAirBlueprintLib::LogMessageString(
+            "UrdfBot drive input ",
+            Utils::stringf("throttle=%.2f  steer=%.2f  ->  %s target=%.3f actual=%.3f",
+                           throttle, steering, name, target, actual),
+            LogDebugLevel::Informational);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -426,6 +636,26 @@ void UrdfBotSimApi::updateRenderedState(float dt)
         render_poses_ = snapshot_;
     }
 
+    // ⚠ Kinematic poses are pushed HERE, and this is the only correct place for them.
+    //
+    // updateRenderedState runs on the GAME thread while physics_world_->lock() is held, so the
+    // physics thread is stopped: reading Unreal actor transforms is legal (game thread) and writing
+    // to the backend is safe (physics paused). Doing it in update() would read UObject transforms
+    // off the physics thread; doing it in updateRendering() would write to the backend outside the
+    // lock. This is the same producer/consumer boundary the whole design already rests on.
+    //
+    // ⚠ Poses therefore refresh at FRAME rate while physics steps at 333 Hz, so a fast-moving
+    // mirrored object is up to one frame stale. That is a real limit and not a bug to chase: the
+    // source of truth is Unreal's game thread and it cannot be sampled faster than it runs.
+    for (const KinematicMirror& km : kinematic_mirrors_) {
+        UPrimitiveComponent* c = km.component.Get();
+        if (c == nullptr) continue;  // actor destroyed mid-run: stop pushing, do not crash
+        const FTransform tm = c->GetComponentTransform();
+        const float w2m = getNedTransform().fromNed(1.0f);
+        backend_->setKinematicPose(km.handle, UrdfTransform::toUrdfVec(tm.GetTranslation(), w2m),
+                                   UrdfTransform::toUrdfQuat(tm.GetRotation()));
+    }
+
     // Feed AirSim's sensors from the pawn's motion, which is the production pattern for every
     // vehicle whose dynamics AirSim does not own (PawnSimApi.cpp:701 — "update kinematics from
     // pawn's movement instead of physics engine"). It is how every Chaos car already works.
@@ -445,11 +675,17 @@ void UrdfBotSimApi::updateRendering(float dt)
         // rescaled map cannot silently halve the robot.
         const float world_to_meters = getNedTransform().fromNed(1.0f);
 
-        // Box3D poses live in the robot's own URDF world, whose origin is wherever AirSim spawned
-        // the pawn. Composing against the spawn transform is what lets several robots coexist and
-        // keeps PlayerStart meaning what it means for every other vehicle type.
+        // Box3D poses are in the **world** frame — origin at the Unreal world origin, not at this
+        // robot's spawn point — so this is now a pure frame change with nothing composed onto it.
+        //
+        // ⚠ It used to compose against the pawn's spawn transform, and that had to go before
+        // static geometry could work: a level mirrored once is at fixed world coordinates, so a
+        // robot whose solver frame hangs off its own spawn point would need its own copy of the
+        // level, translated. Placement moved to BackendOptions::root_position instead — the robot
+        // is put *into* the shared frame rather than the frame being moved to the robot. See
+        // analysis doc §6.0c; it is also what makes the single shared world of stage 3 reachable.
         auto toWorld = [&](const urdf::LinkPose& p) {
-            return UrdfTransform::toFTransform(p, world_to_meters) * robot_origin_;
+            return UrdfTransform::toFTransform(p, world_to_meters);
         };
 
         // ⚠ Move the pawn actor to the root link first. PawnSimApi::updateKinematics derives the

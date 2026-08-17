@@ -184,6 +184,33 @@ void parseLink(const XMLElement* e, Robot& robot)
         vis.name = n ? n : "";
         vis.origin = readOrigin(v, ctx.c_str());
         vis.geometry = parseGeometry(v->FirstChildElement("geometry"), ctx + " <visual>");
+
+        // <material> — colour only. A URDF that says a link is red and renders untinted grey is a
+        // small lie, but it is the same class as every other one this parser refuses to tell.
+        if (const XMLElement* m = v->FirstChildElement("material")) {
+            vis.material.present = true;
+            const char* mn = m->Attribute("name");
+            vis.material.name = mn ? mn : "";
+            if (const XMLElement* c = m->FirstChildElement("color")) {
+                if (const char* rgba = c->Attribute("rgba")) {
+                    const auto v4 = splitNumbers(rgba, (ctx + " <material><color rgba>").c_str());
+                    if (v4.size() != 4)
+                        fail(ctx + " <material><color>: expected 4 numbers in 'rgba', got " +
+                             std::to_string(v4.size()));
+                    vis.material.r = v4[0];
+                    vis.material.g = v4[1];
+                    vis.material.b = v4[2];
+                    vis.material.a = v4[3];
+                }
+            }
+            // ⚠ Recorded, never applied. Applying a texture needs an image loader and an asset
+            // path convention; recording it means a caller can say so rather than silently
+            // rendering a flat colour where the URDF asked for an image.
+            if (const XMLElement* t = m->FirstChildElement("texture")) {
+                if (const char* f = t->Attribute("filename")) vis.material.texture = f;
+            }
+        }
+
         link.visuals.push_back(vis);
     }
 
@@ -358,10 +385,12 @@ double Robot::subtreeMass(int link) const
     return m;
 }
 
-bool Robot::subtreeHasCollision(int link) const
+bool Robot::subtreeHasCollision(int link, bool declared_only) const
 {
-    for (int li : subtreeLinks(link))
-        if (!links[li].collisions.empty()) return true;
+    for (int li : subtreeLinks(link)) {
+        for (const Collision& c : links[li].collisions)
+            if (!declared_only || !c.synthesized) return true;
+    }
     return false;
 }
 

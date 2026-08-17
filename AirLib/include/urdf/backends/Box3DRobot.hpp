@@ -7,10 +7,13 @@
 
 #include "urdf/UrdfMimic.hpp"
 #include "urdf/UrdfModel.hpp"
+#include "urdf/UrdfStaticWorld.hpp"
 #include "urdf/backends/Box3DMath.hpp"  // WorldPose
+#include "urdf/backends/Box3DStaticGeometry.hpp"
 
 #include <box3d/box3d.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -47,16 +50,30 @@ struct BuildOptions {
     /// Convex-hull vertex budget per collision shape.
     int max_hull_vertices = 64;
 
+    /// Where to look for `<mesh>` files named by `<collision>`. `mesh_base_dir` is the directory
+    /// holding the URDF, which is what a plain relative filename resolves against; the search paths
+    /// are the ROS-package roots that `package://` needs.
+    std::string mesh_base_dir;
+    std::vector<std::string> mesh_search_paths;
+
     /// Sides used when tessellating a URDF <cylinder> into a hull.
     int cylinder_sides = 16;
 
+    /// World pose of the **root link** at build time, in the solver frame.
+    ///
+    /// Identity was implicit before static geometry existed: the robot was built at the origin and
+    /// the plugin composed the result onto its spawn transform afterwards. That is incompatible
+    /// with a level shared between robots — a triangle at a fixed place in the map would need a
+    /// different position in each robot's frame — so the robot is now placed *in* a world frame
+    /// whose origin is the Unreal world origin. See analysis doc §6.0c.
+    urdf::Vec3 root_position;
+    urdf::Quat root_orientation;
+
     /// A flat static floor in the robot's own world, at this height in the URDF frame.
     ///
-    /// ⚠ SCAFFOLDING, not the static-geometry feature. Real static geometry means mirroring the
-    /// Unreal collision world in (analysis doc §6.1: take Box3DUnreal's cooking/baking approach),
-    /// and until that exists a Box3D world contains the robot and nothing else — so a driving robot
-    /// simply falls forever. A plane makes a flat-ground robot testable; it is not a substitute,
-    /// and anything with terrain, ramps or obstacles will drive straight through them.
+    /// ⚠ SCAFFOLDING, superseded by `Box3DRobot::setStaticWorld`. Retained for the headless
+    /// harness, which has no Unreal level to mirror, and as the explicit fallback when a level's
+    /// mirror comes back empty. A robot given neither falls forever.
     bool add_ground_plane = false;
     double ground_plane_z = 0.0;
     double ground_friction = 0.9;
@@ -96,6 +113,32 @@ public:
     /// is impossible in the target simulator anyway, and a private world keeps the reset rebuild
     /// (R10) contained to this robot instead of disturbing every vehicle.
     void build(const urdf::Robot& model, const BuildOptions& opts = {});
+
+    /// Register a body whose pose is pushed in from outside each step, returning its handle.
+    ///
+    /// ⚠ Survives `reset()` by construction: the descriptions live outside the b3World and are
+    /// recreated by `instantiate()`. That is deliberate and not incidental — the position-gains
+    /// defect (2026-08-17) was exactly this mistake made once already, and reset silently dropping
+    /// every mirrored obstacle would look identical to a level that never mirrored.
+    int addKinematicBody(const urdf::KinematicBody& body);
+
+    /// Push a registered kinematic body's current pose. Applied on the next step.
+    void setKinematicPose(int handle, const urdf::Vec3& position, const urdf::Quat& orientation);
+
+    size_t kinematicBodyCount() const { return kinematic_.size(); }
+
+    /// Supply the static world to stand on. Call **before** `build()`.
+    ///
+    /// Cooks now (or reuses an existing cook of the same pointer — see Box3DStaticGeometry) and
+    /// keeps the cooked form alive, so the level is not re-cooked when `reset()` rebuilds the
+    /// world. Handing the *same* StaticWorld pointer to every robot in the scene is what makes the
+    /// level cost one cook for the whole scene rather than one per robot.
+    void setStaticWorld(std::shared_ptr<const urdf::StaticWorld> world);
+
+    /// The cook backing this robot's static geometry, or nullptr if it has none. For logging the
+    /// triangle count and cook cost, which is how an operator sees whether the level actually
+    /// mirrored.
+    const Box3DStaticGeometry* staticGeometry() const { return static_geometry_.get(); }
 
     /// Destroy and rebuild the world. Box3D has no rollback determinism — the FAQ is explicit that
     /// a world cannot be restored to a prior state and resumed with identical results, because
@@ -154,6 +197,29 @@ public:
     /// Enumerable on purpose: the operator can audit what the loader decided.
     const std::vector<urdf::MimicClassification>& mimicClassifications() const { return mimic_; }
 
+    /// A link whose <mesh> hull did not fit Box3D's 255-half-edge ceiling at the requested vertex
+    /// budget and was rebuilt coarser.
+    struct HullBudgetReduction {
+        std::string link;
+        int requested = 0;
+        int used = 0;
+    };
+
+    /// Links that had neither <inertial> nor <collision> and are therefore resolved by forward
+    /// kinematics rather than simulated. Usually frame markers (base_footprint, imu_link) and
+    /// entirely normal — but worth naming, because such a link contributes no mass to the robot.
+    const std::vector<std::string>& masslessMarkers() const { return massless_markers_; }
+
+    /// Links whose collision hull is coarser than asked for. Empty is the normal case.
+    ///
+    /// ⚠ Reported rather than swallowed: a hull rebuilt at 16 vertices instead of 64 is a
+    /// materially different shape from the one the operator believes is being simulated, and the
+    /// difference is invisible in the render.
+    const std::vector<HullBudgetReduction>& hullBudgetReductions() const
+    {
+        return hull_budget_reductions_;
+    }
+
     /// True if this link's pose is computed by forward kinematics rather than integrated by Box3D
     /// — i.e. it sits at or below a cosmetic <mimic> joint.
     bool isLinkKinematic(size_t link) const { return links_[link].kinematic; }
@@ -172,7 +238,10 @@ private:
     struct LinkRec {
         std::string name;
         b3BodyId body = b3_nullBodyId;
-        b3Transform initial{};                 // world pose at build time
+        /// World pose at build time. WorldPose, not b3Transform, because b3Transform::p is float in
+        /// both precision modes — tolerable when every robot was built at the origin, not tolerable
+        /// now that a robot sits at its true position in a level that may be kilometres across.
+        WorldPose initial{};
         std::vector<b3HullData*> owned_hulls;  // freed on teardown
 
         /// Pose comes from forward kinematics, not from the solver: this link sits at or below a
@@ -203,6 +272,40 @@ private:
         urdf::MimicRole mimic_role = urdf::MimicRole::None;
     };
 
+    /// Per-joint control configuration, kept **outside** the Box3D world so it survives the
+    /// destroy-and-rebuild that reset() performs.
+    ///
+    /// ⚠ This exists because reset() rebuilds the solver (§6.4), which silently discarded every
+    /// b3Joint's spring gains and enable flags. The steering springs were configured once at load
+    /// and were gone after AirSim's startup reset: the spring was re-enabled every step by the
+    /// control loop, but at default stiffness, so it exerted no restoring force and the wheels
+    /// free-swung. Driving kept working throughout, because velocity control is a motor rather
+    /// than a spring — which is exactly why it went unnoticed.
+    struct JointControl {
+        ControlMode mode = ControlMode::None;
+        double target = 0;
+        double hertz = 0;
+        double damping_ratio = 0;
+        bool gains_set = false;
+    };
+
+    /// Re-apply `control_` to freshly created joints. Called by reset(), never by build().
+    void reapplyControl();
+
+    /// A body driven from outside the solver. The description is kept so the body can be recreated
+    /// after reset()'s world rebuild; `target` is the pose most recently pushed in.
+    struct KinematicRec {
+        urdf::KinematicBody desc;
+        b3BodyId body = b3_nullBodyId;
+        WorldPose target;
+        std::vector<b3HullData*> owned_hulls;
+    };
+
+    /// Create the kinematic bodies in the current world. Called by instantiate(), so reset()
+    /// restores them along with everything else.
+    void instantiateKinematic();
+    void addKinematicShapes(KinematicRec& r);
+
     void destroyWorld();
     void createWorld();
     void instantiate();
@@ -211,6 +314,9 @@ private:
 
     /// Mark the subtree under every cosmetic <mimic> joint as kinematically resolved.
     void classifyMimic();
+    /// Resolve massless, shapeless frame-marker links kinematically instead of creating zero-mass
+    /// dynamic bodies for them. See the implementation for why this is not optional.
+    void classifyMasslessMarkers();
     /// Drive every load-bearing <mimic> joint's servo-follower toward its source. Called once per
     /// fixed step, before b3World_Step.
     void updateMimicFollowers();
@@ -224,7 +330,14 @@ private:
     urdf::Robot model_;
     BuildOptions opts_;
     std::vector<urdf::MimicClassification> mimic_;
+    std::vector<HullBudgetReduction> hull_budget_reductions_;
+    std::vector<std::string> massless_markers_;
+    std::vector<JointControl> control_;
+    std::vector<KinematicRec> kinematic_;
     b3WorldId world_ = b3_nullWorldId;
+    /// Held, not borrowed: the cook must outlive every world whose shapes reference its meshes,
+    /// and it must survive reset()'s world rebuild.
+    std::shared_ptr<const Box3DStaticGeometry> static_geometry_;
     std::vector<LinkRec> links_;
     std::vector<JointRec> joints_;
     double accumulator_ = 0;

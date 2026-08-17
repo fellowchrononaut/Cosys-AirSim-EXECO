@@ -493,20 +493,206 @@ namespace airlib
             /// way, and on a real URDF it is usually large.
             bool urdf_report_collision_audit = true;
 
-            /// Height of a flat static floor in the robot's own frame, or NaN for none.
+            /// Give links that declare no <collision> the geometry of their <visual>.
             ///
-            /// ⚠ Scaffolding until static world geometry is mirrored into the backend. The backend
-            /// world otherwise contains the robot and nothing else, so an unpinned robot falls
-            /// forever. Set it to minus the spawn height so the simulated floor lines up with the
-            /// visible one: spawning at NED Z = -2 (2 m up) wants UrdfGroundPlaneZ = -2.
+            /// ⚠ OFF by default, and it must stay off by default: it changes the physics of the
+            /// robot relative to the URDF as written. Turning it on is the operator saying "this
+            /// model omits collision geometry and I want it inferred", and what it inferred is
+            /// reported link by link at load.
+            ///
+            /// Why it exists: R2 measured upstream ExoMy at 6 of 23 links with <collision> and
+            /// 79.7 % of its mass on links that cannot collide. The chassis is visible to LiDAR and
+            /// absent from the dynamics, so the rover's body passes through walls its wheels bump
+            /// into. Many published URDFs are like this.
+            ///
+            /// ⚠ A <mesh> becomes ONE CONVEX HULL (Box3D mesh shapes are static-only), so concave
+            /// links end up FATTER than they look. Convex decomposition is the real fix.
+            bool urdf_collision_from_visual = false;
+
+            // --- procedural mesh appearance: three switches for bisecting a shading problem ---
+            //
+            // ⚠ These exist because "the rover goes dark as the camera approaches" survived four
+            // rounds of hypotheses argued from code — inverted normals, missing tangents, wrong
+            // material parameter, unbuilt reflection captures — each costing a rebuild. They are
+            // settings rather than constants so the remaining candidates can be bisected from JSON,
+            // one variable per run, without a rebuild between attempts.
+
+            /// Content path holding pre-imported UStaticMesh assets for this robot's <mesh>
+            /// visuals, e.g. "/Game/Robots/ExoMy". Empty disables the lookup.
+            ///
+            /// For each `<mesh filename="base_link.STL">` the loader tries
+            /// `<dir>/base_link.base_link` as a UStaticMesh. Found, and the link is drawn with a
+            /// UStaticMeshComponent; not found, and it falls back to the runtime STL path. Each
+            /// link logs which route it took, so a half-imported robot is visible rather than
+            /// mysterious.
+            ///
+            /// ⚠ Why this exists: a UProceduralMeshComponent self-shadows into blackness under
+            /// UE5's Virtual Shadow Maps at close range. A UStaticMeshComponent in the same scene,
+            /// same light, does not — demonstrated with rover4.urdf. UrdfSim reached the same
+            /// conclusion and made pre-imported assets its primary path, keeping raw-mesh parsing
+            /// as a fallback.
+            ///
+            /// ⚠ The mapping lives HERE rather than inside the URDF — which is where UrdfSim put
+            /// it — so that an upstream robot description is still read unmodified. Editing a
+            /// vendored URDF to carry engine-specific asset paths would couple the robot to one
+            /// simulator.
+            ///
+            /// ⚠ Cost, stated plainly: the meshes must be imported once, offline, and Unreal does
+            /// not import STL natively — expect to convert to FBX/OBJ/glTF first. That friction is
+            /// why the procedural path stays the default.
+            std::string urdf_mesh_asset_dir;
+
+            /// Extra uniform scale for asset meshes, on top of the URDF's <mesh scale>.
+            ///
+            /// An asset imported at its authored metre scale ends up 100x too small, because one
+            /// Unreal unit is a centimetre. Import at 100x and leave this at 1.0; if you did not,
+            /// set 100 here. The resulting component scale is logged so a wrong choice is obvious
+            /// immediately rather than looking like a broken robot.
+            double urdf_mesh_asset_scale = 1.0;
+
+            /// Vertex-cluster decimation grid for <mesh> visuals, in metres. 0 disables.
+            ///
+            /// ⚠ ExoMy's STLs are PRINT-resolution — 220 618 triangles for a 30 cm robot, about
+            /// 7 500 per wheel. That density is why it aliases under Virtual Shadow Maps: VSM
+            /// allocates shadow pages by screen size, so up close the geometry is finer than the
+            /// shadow texels and the robot self-shadows into blackness. It is also why the symptom
+            /// vanishes at distance, and why r.Shadow.Virtual.NormalBias changed nothing while
+            /// lowering the shadow resolution fixed it. Geometric aliasing, not depth bias.
+            ///
+            /// 0.003 (3 mm) is a sensible starting point for a rover of this size. A robot has no
+            /// business carrying print-resolution geometry, so this should help load time, memory
+            /// and shadow cost together rather than trading one against another.
+            double urdf_mesh_decimate_grid = 0.0;
+
+            /// Let the robot's meshes cast screen-space contact shadows.
+            ///
+            /// ⚠ The prime suspect for "the rover goes black as the camera approaches", and the only
+            /// remaining mechanism that is inherently SCREEN-SPACE — which is what a distance-
+            /// dependent artefact requires. A light's ContactShadowLength is measured in screen
+            /// space unless ContactShadowLengthInWS is set, so a nearer object gets a proportionally
+            /// LONGER ray march and self-shadows harder the closer you get. On a small, finely
+            /// detailed robot that reads as the whole surface going dark.
+            ///
+            /// Unlike switching shadow casting off, this keeps the shadow the robot casts on the
+            /// ground; it only stops the screen-space pass shadowing the robot against itself.
+            bool urdf_mesh_contact_shadow = true;
+
+            /// Give the robot its own high-resolution per-object shadow map.
+            ///
+            /// ⚠ This is the actual remedy for the darkening, once it was established that
+            /// disabling shadow casting removed it. A URDF robot is SMALL — ExoMy is about 30 cm —
+            /// while a cascaded shadow map spans hundreds of metres, so one shadow texel is
+            /// comparable to the robot's entire feature size and it shadows itself everywhere. That
+            /// is also why the symptom is distance-dependent: cascades only cover a limited range,
+            /// so the robot is unshadowed far away and self-shadowed on approach.
+            ///
+            /// An inset shadow renders the object into its own tight shadow map instead, which is
+            /// the standard treatment for exactly this. Unlike switching shadow casting off, the
+            /// robot still casts a shadow on the ground — which it must, or it is not fixed, only
+            /// hidden.
+            bool urdf_mesh_inset_shadow = true;
+
+            /// Cast shadows from both faces of the geometry.
+            ///
+            /// Sometimes helps acne on thin, single-layer geometry (a solar panel, a bracket) by
+            /// giving the shadow pass a back face to bias against. Off by default: it doubles
+            /// shadow-caster cost and can make matters worse on closed solids.
+            bool urdf_mesh_two_sided_shadow = false;
+
+            /// Let the robot's visual meshes cast dynamic shadows.
+            ///
+            /// ⚠ The specific thing this tests: cascaded shadow maps have a limited range, so a
+            /// robot is unshadowed at distance and self-shadowed close up. If the normals are wrong
+            /// the shadow bias fails and the mesh shadows itself everywhere — producing darkening
+            /// that appears only once the robot enters CSM range. If false fixes it, the cause is
+            /// self-shadowing and therefore the normals.
+            bool urdf_mesh_cast_shadow = true;
+
+            /// Average normals across coincident vertices instead of using flat per-facet normals.
+            ///
+            /// ⚠ The build that used UKismetProceduralMeshLibrary::CalculateTangentsForMesh was
+            /// reported as correctly shaded; it welds vertices and therefore produced SMOOTH
+            /// normals. The O(n) replacement produces flat ones. This isolates that difference
+            /// without reintroducing that function's cost, which dominated load time.
+            bool urdf_mesh_smooth_normals = false;
+
+            /// Reverse triangle winding and the face normal together.
+            ///
+            /// ⚠ Which winding is correct after the URDF-to-Unreal Y mirror was derived twice, both
+            /// times wrongly, because "outward" was reasoned about with right-handed intuition while
+            /// Unreal is left-handed. This makes it a one-run experiment instead of an argument.
+            bool urdf_mesh_flip_winding = false;
+
+            /// Build the link material from the bare BasicShapeMaterial base instead of from
+            /// BasicShapeMaterial_Inst.
+            ///
+            /// ⚠ Tests whether the base-versus-instance switch changed appearance. A dynamic
+            /// instance inherits its parent's parameter values, and the base and the instance need
+            /// not agree on anything this code does not explicitly set — metallic and specular are
+            /// not set here, only colour and roughness. The build reported as correctly shaded used
+            /// the BASE; every build since has used the instance.
+            bool urdf_mesh_base_material = false;
+
+            /// Cook collision for the robot's procedural visual meshes.
+            ///
+            /// ⚠ True by default and it should usually stay true: this is the collision LiDAR, echo
+            /// and distance sensors trace, so false makes the robot invisible to its own sensors and
+            /// to every other robot's — R2 in its most complete form.
+            ///
+            /// It exists because runtime tri-mesh cooking is normally the dominant cost of spawning
+            /// a mesh-heavy robot, and it is paid on every PIE start. While iterating on something
+            /// that is not perception, that trade is sometimes worth making deliberately.
+            bool urdf_visual_collision = true;
+
+            /// Mirror the Unreal level's collision geometry into the physics backend.
+            ///
+            /// On by default, and it is what a URDF robot actually drives on. The whole level is
+            /// mirrored, not a patch under the robot (analysis doc §6.0c): a radius-limited mirror
+            /// would make the physical world depend on which robot you are.
+            ///
+            /// Affordable at N robots because the mirror is made once per level and every robot
+            /// shares one cook — measured at 17.4 ms per 80 k triangles to cook, 0.006 ms to attach
+            /// to another robot's world.
+            bool urdf_mirror_world_geometry = true;
+
+            /// Also mirror colliders whose mobility is Movable.
+            ///
+            /// ⚠ Off by default and it should usually stay off. A movable actor is mirrored at the
+            /// pose it had when the level was mirrored and then never moves in the solver, so a
+            /// lift that rises in Unreal stays down in Box3D. Skipped movable colliders are counted
+            /// and named in the load-time report either way, so what was left out is visible.
+            bool urdf_mirror_movable = false;
+
+            /// Mirror other vehicles' pawns as kinematic bodies, so this robot feels a drone or a
+            /// husky drive into it (§6.0b). A robot never mirrors itself.
+            ///
+            /// ⚠ One-directional: they push this robot, this robot never pushes them through Box3D.
+            /// The reverse coupling comes free through Unreal collision, and is just as crude.
+            bool urdf_mirror_other_vehicles = false;
+
+            /// If non-empty, mirror only actors carrying one of these tags.
+            ///
+            /// The escape hatch for a map where mirroring everything is genuinely too much. Opt-in
+            /// on purpose: the default stays "the whole level", so a partial physical world is
+            /// always something the operator asked for rather than something that happened.
+            std::vector<std::string> urdf_world_geometry_tags;
+
+            /// Height of a flat static floor, in metres, or NaN for none.
+            ///
+            /// ⚠ SCAFFOLDING, and a FALLBACK ONLY — suppressed whenever the level mirror produces
+            /// geometry, because a flat 100 m slab and a real level are not additive: the slab
+            /// would sit through the map and a rover driving down a ramp would stop dead on an
+            /// invisible floor. Two floors is a worse failure than none, because none is obvious.
+            ///
+            /// ⚠ Now an ABSOLUTE height in the world frame, not a height in the robot's frame.
+            /// The solver frame is the Unreal world frame as of §6.0c.
             double urdf_ground_plane_z = Utils::nan<double>();
 
             /// Put the scaffolding floor wherever a downward probe from the spawn point hits.
             ///
-            /// Preferred over UrdfGroundPlaneZ: that one is a height in the *robot's* frame, which
-            /// means knowing where PlayerStart sits relative to the map's floor. Those are
-            /// different numbers, and guessing wrong buries the simulated floor under the visible
-            /// one — the robot then lands out of sight and looks like it fell through the world.
+            /// Preferred over UrdfGroundPlaneZ, and still the right answer when a level genuinely
+            /// has no mirrorable collision. Measuring beats asking the operator for an offset
+            /// between two things neither of you can see.
             bool urdf_ground_plane_auto = false;
 
             /// Keyboard/gamepad driving for a URDF robot.
@@ -1211,6 +1397,39 @@ namespace airlib
 
                 settings_json.getStringArray("UrdfMeshSearchPaths",
                                              vehicle_setting->urdf_mesh_search_paths);
+
+                vehicle_setting->urdf_collision_from_visual =
+                    settings_json.getBool("UrdfCollisionFromVisual", false);
+                vehicle_setting->urdf_visual_collision =
+                    settings_json.getBool("UrdfVisualCollision", true);
+                vehicle_setting->urdf_mesh_base_material =
+                    settings_json.getBool("UrdfMeshBaseMaterial", false);
+                vehicle_setting->urdf_mesh_asset_dir =
+                    settings_json.getString("UrdfMeshAssetDir", "");
+                vehicle_setting->urdf_mesh_asset_scale =
+                    settings_json.getDouble("UrdfMeshAssetScale", 1.0);
+                vehicle_setting->urdf_mesh_decimate_grid =
+                    settings_json.getDouble("UrdfMeshDecimateGrid", 0.0);
+                vehicle_setting->urdf_mesh_contact_shadow =
+                    settings_json.getBool("UrdfMeshContactShadow", true);
+                vehicle_setting->urdf_mesh_inset_shadow =
+                    settings_json.getBool("UrdfMeshInsetShadow", true);
+                vehicle_setting->urdf_mesh_two_sided_shadow =
+                    settings_json.getBool("UrdfMeshTwoSidedShadow", false);
+                vehicle_setting->urdf_mesh_cast_shadow =
+                    settings_json.getBool("UrdfMeshCastShadow", true);
+                vehicle_setting->urdf_mesh_smooth_normals =
+                    settings_json.getBool("UrdfMeshSmoothNormals", false);
+                vehicle_setting->urdf_mesh_flip_winding =
+                    settings_json.getBool("UrdfMeshFlipWinding", false);
+                vehicle_setting->urdf_mirror_world_geometry =
+                    settings_json.getBool("UrdfMirrorWorldGeometry", true);
+                vehicle_setting->urdf_mirror_movable =
+                    settings_json.getBool("UrdfMirrorMovable", false);
+                vehicle_setting->urdf_mirror_other_vehicles =
+                    settings_json.getBool("UrdfMirrorOtherVehicles", false);
+                settings_json.getStringArray("UrdfWorldGeometryTags",
+                                             vehicle_setting->urdf_world_geometry_tags);
 
                 vehicle_setting->urdf_ground_plane_z =
                     settings_json.getDouble("UrdfGroundPlaneZ", Utils::nan<double>());

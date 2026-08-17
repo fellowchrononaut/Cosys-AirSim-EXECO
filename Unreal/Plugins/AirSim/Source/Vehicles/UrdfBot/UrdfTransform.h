@@ -59,6 +59,24 @@ inline FQuat toFQuat(const urdf::Vec3& rpy)
     return toFQuat(q);
 }
 
+/// Unreal -> URDF. Needed since the solver frame became the **world** frame rather than each
+/// robot's spawn frame (analysis doc §6.0c): a robot's spawn transform and the level's colliders
+/// both start life as Unreal quantities and have to be expressed in URDF terms.
+///
+/// Both of these are their own inverses, because a Y mirror is an involution. That is worth
+/// knowing: `toUrdfVec(toFVector(v, m), m) == v` exactly, which is how the pair is checked.
+inline urdf::Vec3 toUrdfVec(const FVector& v, float world_to_meters)
+{
+    return urdf::Vec3{ static_cast<double>(v.X) / world_to_meters,
+                       static_cast<double>(-v.Y) / world_to_meters,
+                       static_cast<double>(v.Z) / world_to_meters };
+}
+
+inline urdf::Quat toUrdfQuat(const FQuat& q)
+{
+    return urdf::Quat{ -q.X, q.Y, -q.Z, q.W };
+}
+
 inline FTransform toFTransform(const urdf::Origin& o, float world_to_meters)
 {
     return FTransform(toFQuat(o.rpy), toFVector(o.xyz, world_to_meters));

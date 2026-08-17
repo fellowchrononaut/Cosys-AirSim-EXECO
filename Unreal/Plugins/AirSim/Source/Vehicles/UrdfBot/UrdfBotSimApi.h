@@ -88,6 +88,21 @@ private:
     std::vector<DriveMapping> drive_joints_;
     std::vector<DriveMapping> steer_joints_;
 
+    /// One mirrored obstacle: the Unreal component that drives it, and its handle in the backend.
+    ///
+    /// Weak, because a mirrored actor may be destroyed mid-run — a stale entry simply stops being
+    /// pushed. The body stays in the solver at its last pose, which is the honest outcome: the
+    /// mirror cannot know whether the actor was deleted or merely unloaded.
+    struct KinematicMirror {
+        TWeakObjectPtr<UPrimitiveComponent> component;
+        int handle = -1;
+    };
+    std::vector<KinematicMirror> kinematic_mirrors_;
+
+    /// Last drive axes written to the log, so the diagnostic fires on change rather than at 333 Hz.
+    float last_logged_throttle_ = 0.0f;
+    float last_logged_steering_ = 0.0f;
+
     const AirSimSettings::VehicleSetting* vehicle_setting_;
 
     urdf::Robot model_;
@@ -109,7 +124,16 @@ private:
 
     /// Where the robot's URDF origin sits in the Unreal world — the pawn's spawn transform,
     /// captured once. Game thread only.
-    FTransform robot_origin_ = FTransform::Identity;
+    /// The mirrored level, shared with every other urdfbot in this world.
+    ///
+    /// Held for the robot's lifetime because the backend's cooked geometry is keyed on this
+    /// pointer's identity (Box3DStaticGeometry) and must not be re-cooked on reset. Dropping it
+    /// here would let the cook die and the level silently re-cook.
+    ///
+    /// Replaces robot_origin_, which composed link poses onto the pawn's spawn transform. That is
+    /// incompatible with a level mirrored once at fixed world coordinates — see analysis doc
+    /// §6.0c; the robot is now placed into the shared frame via BackendOptions::root_position.
+    std::shared_ptr<const urdf::StaticWorld> static_world_;
 
     bool built_ = false;
     int64_t steps_taken_ = 0;

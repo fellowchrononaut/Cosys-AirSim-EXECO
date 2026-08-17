@@ -19,14 +19,15 @@
 
 #include "urdf/UrdfMimic.hpp"
 #include "urdf/UrdfModel.hpp"
+#include "urdf/UrdfStaticWorld.hpp"
 
+#include <memory>
 #include <string>
 
 namespace urdf {
 
-struct Quat {
-    double x = 0, y = 0, z = 0, w = 1;
-};
+// urdf::Quat now lives in UrdfModel.hpp — see the note at its definition. It is still spelled
+// `urdf::Quat` here and everywhere else, so nothing that used it needs to change.
 
 struct LinkPose {
     Vec3 position;
@@ -82,12 +83,28 @@ struct BackendOptions {
     /// self-collide.
     bool collide_connected = false;
 
-    /// A flat static floor at this height in the robot's frame.
+    /// Where to look for `<mesh>` files named by `<collision>`. `mesh_base_dir` is the directory
+    /// holding the URDF; `mesh_search_paths` are the roots a `package://` reference resolves
+    /// against. A backend that cannot find a named mesh must refuse, not skip the shape.
+    std::string mesh_base_dir;
+    std::vector<std::string> mesh_search_paths;
+
+    /// World pose of the **root link** at build time, in the solver frame.
     ///
-    /// ⚠ SCAFFOLDING. Real static geometry means mirroring the Unreal collision world into the
-    /// backend; until that exists the backend's world holds the robot and nothing else, so a
-    /// driving robot falls forever. A plane makes flat-ground robots testable and is not a
-    /// substitute — terrain, ramps and obstacles are simply not there.
+    /// Was implicitly identity before static geometry existed, with the plugin composing the whole
+    /// robot onto its spawn transform afterwards. That cannot survive a shared world: if each
+    /// robot's frame is anchored at its own spawn point, the same level triangle needs a different
+    /// position per robot, so one cook cannot serve two robots and §6.0c stage 3 is unreachable.
+    /// The robot is now placed **in** a world-frame shared by everything.
+    Vec3 root_position;
+    Quat root_orientation;
+
+    /// A flat static floor at this height in the solver frame.
+    ///
+    /// ⚠ SCAFFOLDING, now superseded by `setStaticWorld`. Kept as an explicit fallback for the
+    /// headless harness (which has no Unreal level to mirror) and for a level whose mirror comes
+    /// back empty. A robot given neither a static world nor a ground plane falls forever, which is
+    /// why `UrdfBotSimApi` warns loudly about exactly that case.
     bool add_ground_plane = false;
     double ground_plane_z = 0.0;
 
@@ -102,6 +119,36 @@ public:
 
     /// Stable identifier for logs and settings ("Box3D", "Chaos").
     virtual const char* backendName() const = 0;
+
+    /// Supply the static world the robot stands on. Call **before** `buildFromUrdf`.
+    ///
+    /// Passed as a shared_ptr rather than by value because its identity is the cache key: hand the
+    /// same pointer to every robot in the scene and the level is cooked once, then attached to each
+    /// robot's world for ~0.006 ms (§6.0c, verified in tests/test_static_geometry.cpp). Hand out
+    /// copies instead and each robot pays the full cook.
+    ///
+    /// The reference is held, so the cooked form survives `reset()` — which destroys and rebuilds
+    /// the world (§6.4) and would otherwise re-cook the level on every reset. Re-attaching cooked
+    /// geometry is what makes reset stay cheap.
+    ///
+    /// A null pointer means "no static world", which is a legitimate configuration (a fixed-base
+    /// arm needs none) and is not the same as an empty one.
+    virtual void setStaticWorld(std::shared_ptr<const StaticWorld> world) = 0;
+
+    /// Register a body whose pose is driven from outside the solver, and return a handle for
+    /// `setKinematicPose`. May be called before or after `buildFromUrdf`.
+    ///
+    /// ⚠ Must survive `reset()`. Reset rebuilds the solver, so a backend that forgets its kinematic
+    /// bodies there would silently lose every mirrored obstacle — the same class of defect as
+    /// losing position gains on reset, which cost three sessions of debugging. The backend owns the
+    /// rebuild, so it owns restoring this.
+    virtual int addKinematicBody(const KinematicBody& body) = 0;
+
+    /// Push the current pose of a registered kinematic body. Applied at the next step.
+    ///
+    /// Cheap and idempotent: call it every frame with whatever the source says now. Poses that do
+    /// not change cost nothing beyond the store.
+    virtual void setKinematicPose(int handle, const Vec3& position, const Quat& orientation) = 0;
 
     /// Instantiate `model`. Throws std::runtime_error, with a message naming the offending link or
     /// joint, for anything the backend cannot represent faithfully. Refusing is deliberate: a

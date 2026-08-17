@@ -15,6 +15,9 @@ class Box3DUrdfBackend : public UrdfRobotBackend {
 public:
     const char* backendName() const override { return "Box3D"; }
 
+    void setStaticWorld(std::shared_ptr<const StaticWorld> world) override;
+    int addKinematicBody(const KinematicBody& body) override;
+    void setKinematicPose(int handle, const Vec3& position, const Quat& orientation) override;
     void buildFromUrdf(const Robot& model, const BackendOptions& opts) override;
     void reset() override;
     int step(double dt) override;

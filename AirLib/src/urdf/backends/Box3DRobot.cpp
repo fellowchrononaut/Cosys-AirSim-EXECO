@@ -1,5 +1,7 @@
 #include "urdf/backends/Box3DRobot.hpp"
 
+#include "urdf/UrdfMesh.hpp"
+
 #include "urdf/backends/Box3DMath.hpp"
 
 #include <cmath>
@@ -33,13 +35,147 @@ void Box3DRobot::destroyWorld()
         for (b3HullData* h : l.owned_hulls) b3DestroyHull(h);
         l.owned_hulls.clear();
     }
+    // ⚠ Only the b3 handles are invalidated. The kinematic DESCRIPTIONS and last-pushed poses are
+    // kept, because instantiate() recreates the bodies from them after reset()'s rebuild. Clearing
+    // this vector here would make a reset silently delete every mirrored obstacle, which looks
+    // exactly like a level that never mirrored.
+    for (KinematicRec& r : kinematic_) {
+        for (b3HullData* h : r.owned_hulls) b3DestroyHull(h);
+        r.owned_hulls.clear();
+        r.body = b3_nullBodyId;
+    }
+
     if (b3World_IsValid(world_)) b3DestroyWorld(world_);
     world_ = b3_nullWorldId;
     links_.clear();
     joints_.clear();
     mimic_.clear();
+    hull_budget_reductions_.clear();
+    massless_markers_.clear();
     accumulator_ = 0;
     steps_taken_ = 0;
+}
+
+int Box3DRobot::addKinematicBody(const urdf::KinematicBody& body)
+{
+    const int handle = static_cast<int>(kinematic_.size());
+
+    KinematicRec rec;
+    rec.desc = body;
+    rec.target.p = toB3Pos(body.position);
+    rec.target.q = normalize(b3Quat{ b3Vec3{ static_cast<float>(body.orientation.x),
+                                             static_cast<float>(body.orientation.y),
+                                             static_cast<float>(body.orientation.z) },
+                                     static_cast<float>(body.orientation.w) });
+    kinematic_.push_back(std::move(rec));
+
+    // If a world already exists this is a late registration, so create it now. If not, instantiate()
+    // will create it — either way the description is what survives, not the b3BodyId.
+    if (b3World_IsValid(world_)) {
+        KinematicRec& r = kinematic_.back();
+        b3BodyDef bd = b3DefaultBodyDef();
+        bd.type = b3_kinematicBody;
+        bd.position = r.target.p;
+        bd.rotation = r.target.q;
+        bd.name = r.desc.name.c_str();
+        r.body = b3CreateBody(world_, &bd);
+        addKinematicShapes(r);
+    }
+
+    return handle;
+}
+
+void Box3DRobot::setKinematicPose(int handle, const urdf::Vec3& position,
+                                  const urdf::Quat& orientation)
+{
+    if (handle < 0 || static_cast<size_t>(handle) >= kinematic_.size()) return;
+
+    KinematicRec& r = kinematic_[static_cast<size_t>(handle)];
+    r.target.p = toB3Pos(position);
+    r.target.q = normalize(b3Quat{ b3Vec3{ static_cast<float>(orientation.x),
+                                           static_cast<float>(orientation.y),
+                                           static_cast<float>(orientation.z) },
+                                   static_cast<float>(orientation.w) });
+    // Applied in stepOnce, not here: b3Body_SetTargetTransform converts a pose into the VELOCITY
+    // needed to reach it in one timestep, so it is meaningful only against the step that follows.
+    // Calling it here would set a velocity sized for a step that may not come next, and the body
+    // would overshoot or crawl depending on how often the source updates.
+}
+
+void Box3DRobot::instantiateKinematic()
+{
+    for (KinematicRec& r : kinematic_) {
+        b3BodyDef bd = b3DefaultBodyDef();
+        bd.type = b3_kinematicBody;
+        // Recreated at the LAST pushed pose, not the registration pose: a reset in the middle of a
+        // run should put mirrored obstacles where they currently are, not where they were at load.
+        bd.position = r.target.p;
+        bd.rotation = r.target.q;
+        bd.name = r.desc.name.c_str();
+        r.body = b3CreateBody(world_, &bd);
+        addKinematicShapes(r);
+    }
+}
+
+void Box3DRobot::addKinematicShapes(KinematicRec& r)
+{
+    b3ShapeDef sd = b3DefaultShapeDef();
+    sd.baseMaterial.friction = static_cast<float>(r.desc.friction);
+    sd.baseMaterial.restitution = static_cast<float>(r.desc.restitution);
+    // A kinematic body is infinitely massive by definition; letting shapes write mass data would
+    // turn it into something the solver tries to move.
+    sd.updateBodyMass = false;
+
+    for (const urdf::StaticShape& shape : r.desc.shapes) {
+        switch (shape.kind) {
+        case urdf::StaticShapeKind::Mesh:
+            // ⚠ Refused, not silently skipped. Box3D mesh shapes are static-only
+            // (loose_ends.md #7), so a mesh here would produce a body that exists and collides with
+            // nothing — an obstacle you can see, that the mirror reports, and that the robot drives
+            // straight through. The plugin hulls tri-meshes before they reach this point.
+            throw std::runtime_error("kinematic body '" + r.desc.name +
+                                     "': mesh shapes are static-only in Box3D and cannot be used "
+                                     "on a moving body. Supply a convex hull instead.");
+        case urdf::StaticShapeKind::Hull: {
+            if (shape.points.size() < 4) break;
+            std::vector<b3Vec3> pts;
+            pts.reserve(shape.points.size());
+            for (const urdf::Vec3& v : shape.points) pts.push_back(toB3(v));
+            b3HullData* hull = nullptr;
+            for (int budget = opts_.max_hull_vertices; budget >= 8 && !hull; budget /= 2)
+                hull = b3CreateHull(pts.data(), static_cast<int>(pts.size()), budget);
+            if (!hull) break;
+            b3CreateHullShape(r.body, &sd, hull);
+            b3DestroyHull(hull);
+            break;
+        }
+        case urdf::StaticShapeKind::Sphere: {
+            b3Sphere sp;
+            sp.center = toB3(shape.center_a);
+            sp.radius = static_cast<float>(shape.radius);
+            b3CreateSphereShape(r.body, &sd, &sp);
+            break;
+        }
+        case urdf::StaticShapeKind::Capsule: {
+            b3Capsule c;
+            c.center1 = toB3(shape.center_a);
+            c.center2 = toB3(shape.center_b);
+            c.radius = static_cast<float>(shape.radius);
+            b3CreateCapsuleShape(r.body, &sd, &c);
+            break;
+        }
+        }
+    }
+}
+
+void Box3DRobot::setStaticWorld(std::shared_ptr<const urdf::StaticWorld> world)
+{
+    // Cooks here, at set time, rather than lazily inside instantiate(). That is deliberate: set is
+    // called from the game thread during vehicle setup, while instantiate() runs on the physics
+    // thread — including on every reset. Cooking a level-sized mesh on the physics thread would
+    // put tens of milliseconds into the executor loop, which is the budget issue I-R and R14 are
+    // about. Attaching, which is what instantiate() does, costs microseconds.
+    static_geometry_ = Box3DStaticGeometry::acquire(std::move(world));
 }
 
 void Box3DRobot::createWorld()
@@ -67,15 +203,52 @@ void Box3DRobot::build(const urdf::Robot& model, const BuildOptions& opts)
 
     createWorld();
     instantiate();
+    // Sized here, after joints exist. build() always starts from defaults; reset() is what carries
+    // configuration across, and it does so explicitly rather than by this vector quietly surviving.
+    control_.assign(joints_.size(), JointControl{});
     built_ = true;
 }
 
 void Box3DRobot::reset()
 {
     if (!built_) throw std::runtime_error("reset() before build()");
+
+    // ⚠ Control CONFIGURATION survives the rebuild; control STATE does not.
+    //
+    // The rebuild is not optional — Box3D has no rollback determinism, so a reproducible reset must
+    // destroy and recreate rather than rewrite poses (§6.4). But that also destroys every joint's
+    // spring gains and enable flags, and a caller that configured them once before the reset has no
+    // way to know they are gone. Making every caller re-configure after every reset is an interface
+    // that will be got wrong — and was: the steering springs were lost to AirSim's startup reset and
+    // the wheels free-swung for three sessions while driving kept working.
+    //
+    // So: mode and gains are restored, because they describe how the joint is controlled. Targets
+    // are NOT — they are commands, and a robot must not drive off again just because it was reset.
+    std::vector<JointControl> saved = control_;
+
     urdf::Robot m = model_;
     BuildOptions o = opts_;
     build(m, o);
+
+    if (saved.size() == joints_.size()) {
+        for (size_t i = 0; i < saved.size(); ++i) {
+            saved[i].target = 0;
+            control_[i] = saved[i];
+        }
+        reapplyControl();
+    }
+}
+
+void Box3DRobot::reapplyControl()
+{
+    for (size_t i = 0; i < joints_.size(); ++i) {
+        const JointControl c = control_[i];
+        if (c.gains_set) setPositionGains(i, c.hertz, c.damping_ratio);
+        if (c.mode != ControlMode::None) {
+            setControlMode(i, c.mode);
+            setTarget(i, c.target);
+        }
+    }
 }
 
 void Box3DRobot::applyInertial(const urdf::Link& link, b3BodyId body)
@@ -153,14 +326,73 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
             b3CreateTransformedHullShape(body, &sd, cyl, mulT(xf, y_to_z), b3Vec3_one);
             break;
         }
-        case urdf::GeometryType::Mesh:
-            // Deferred past Gate 1 on purpose. Box3D can build a single convex hull from points
-            // (b3CreateHull), and mesh shapes are static-only (docs/loose_ends.md #7) so a moving
-            // link could never use the triangles directly anyway. Loading STL/OBJ and, later,
-            // convex *decomposition* are Gate 2 work.
-            throw std::runtime_error("link '" + link.name + "': <mesh> collision is not supported "
-                                     "yet (Gate 1 covers box/cylinder/sphere). Mesh links need a "
-                                     "convex hull or decomposition — see analysis doc section 4.5.");
+        case urdf::GeometryType::Mesh: {
+            // ⚠ ONE CONVEX HULL per <mesh>, not the triangles.
+            //
+            // Not a shortcut that could be improved by trying harder: Box3D's mesh shapes are
+            // **static-only** (docs/loose_ends.md #7) and cannot take part in dynamic-vs-dynamic
+            // contact, so a moving link can never use its triangles directly whatever we do. The
+            // real alternative is convex *decomposition* (CoACD/VHACD) into several hulls, which is
+            // a separate dependency and a separate decision.
+            //
+            // ⚠ So a concave link is simulated as its convex hull and is therefore **fatter than it
+            // looks**: a C-shaped bracket collides as a solid block, and a robot with a hollow
+            // chassis cannot have anything pass through the hollow. That is a real modelling error,
+            // it is invisible in the render, and it is why it is stated here and reported by the
+            // audit rather than left for someone to discover.
+            const std::string resolved =
+                urdf::resolveMeshPath(col.geometry.mesh_filename, opts_.mesh_base_dir,
+                                      opts_.mesh_search_paths);
+            if (resolved.empty())
+                throw std::runtime_error("link '" + link.name + "': <collision> mesh '" +
+                                         col.geometry.mesh_filename +
+                                         "' could not be found. Set UrdfMeshSearchPaths. Refusing "
+                                         "rather than simulating a link with no shape.");
+
+            const urdf::MeshData mesh = urdf::loadStl(resolved);
+            if (mesh.vertices.size() < 4)
+                throw std::runtime_error("link '" + link.name + "': mesh '" + resolved +
+                                         "' has too few vertices to hull (" +
+                                         std::to_string(mesh.vertices.size()) + ").");
+
+            std::vector<b3Vec3> pts;
+            pts.reserve(mesh.vertices.size());
+            for (const urdf::Vec3& v : mesh.vertices)
+                pts.push_back(b3Vec3{ static_cast<float>(v.x * col.geometry.mesh_scale.x),
+                                      static_cast<float>(v.y * col.geometry.mesh_scale.y),
+                                      static_cast<float>(v.z * col.geometry.mesh_scale.z) });
+
+            // ⚠ Box3D's hull builder has a hard ceiling of **255 half-edges**, which is not the
+            // same constraint as the vertex budget and is not checkable in advance: a 64-vertex
+            // budget produced 264 half-edges on ExoMy's base_link and was refused outright. So the
+            // budget is walked down until one is accepted rather than failing on the first try.
+            //
+            // Halving is the right ladder because the failure is a *topology* limit: a hull that
+            // overflows at 64 vertices is not going to fit by shaving two off.
+            b3HullData* hull = nullptr;
+            int budget = opts_.max_hull_vertices;
+            for (; budget >= 8; budget /= 2) {
+                hull = b3CreateHull(pts.data(), static_cast<int>(pts.size()), budget);
+                if (hull != nullptr) break;
+            }
+            if (hull == nullptr)
+                throw std::runtime_error("link '" + link.name + "': b3CreateHull rejected mesh '" +
+                                         resolved + "' at every vertex budget from " +
+                                         std::to_string(opts_.max_hull_vertices) +
+                                         " down to 8 (degenerate or coplanar point cloud).");
+
+            // Recorded, not swallowed. A coarser hull is a *different shape* from the one the
+            // operator thinks is being simulated, and the difference grows as the budget falls.
+            if (budget < opts_.max_hull_vertices)
+                hull_budget_reductions_.push_back({ link.name, opts_.max_hull_vertices, budget });
+
+            // b3CreateHullShape and b3CreateTransformedHullShape both CLONE the hull, so ours is
+            // freed immediately. (b3CreateMeshShape does not clone — the two differ, and the
+            // static-geometry cache depends on that difference.)
+            b3CreateTransformedHullShape(body, &sd, hull, xf, b3Vec3_one);
+            b3DestroyHull(hull);
+            break;
+        }
         }
     }
 }
@@ -186,10 +418,67 @@ void Box3DRobot::classifyMimic()
             rec.kinematic_parent = pj >= 0 ? model_.joints[pj].parent_index : -1;
         }
     }
+
+    classifyMasslessMarkers();
+}
+
+void Box3DRobot::classifyMasslessMarkers()
+{
+    // A link with **no <inertial> and no collision geometry** has no way to acquire mass: the
+    // <inertial> fallback is b3Body_ApplyMassFromShapes, and there are no shapes. It becomes a
+    // dynamic body of mass zero.
+    //
+    // ⚠ That does not error. It **silently freezes the whole robot** — a zero-mass dynamic body
+    // welded into the chain by a fixed joint stops the island moving, and the rover simply never
+    // falls. No exception, no warning, and a physics backend that looks broken. This is the exact
+    // plausible-wrong-answer class this workstream exists to catch, and it is not exotic: frame
+    // markers (base_footprint, imu_link, camera_link) are in a large fraction of published URDFs.
+    //
+    // The right treatment is the one already built for cosmetic <mimic>: resolve the pose by
+    // forward kinematics and create no dynamics for it. That is also what such a link physically
+    // *is* — a named frame rigidly attached to its parent.
+    for (size_t li = 0; li < links_.size(); ++li) {
+        const urdf::Link& link = model_.links[li];
+        if (links_[li].kinematic) continue;                 // already resolved kinematically
+        if (link.has_inertial || !link.collisions.empty()) continue;
+
+        const int pj = link.parent_joint;
+        if (pj < 0) {
+            // The root. Nothing to hang it off, and a massless free root is genuinely ill-posed.
+            throw std::runtime_error(
+                "root link '" + link.name + "' has neither <inertial> nor <collision>, so it has "
+                "no mass and no shape. A massless free root cannot be simulated. Give it an "
+                "<inertial>, or enable collision synthesis from <visual>.");
+        }
+
+        // ⚠ Only a FIXED joint may be resolved this way. On a revolute or prismatic joint a
+        // massless link's motion is genuinely undefined — there is no inertia for the joint to act
+        // against — so refusing is the honest answer rather than pinning it to its parent and
+        // pretending the joint works.
+        if (model_.joints[pj].type != urdf::JointType::Fixed) {
+            throw std::runtime_error(
+                "link '" + link.name + "' has neither <inertial> nor <collision> but hangs off "
+                "non-fixed joint '" + model_.joints[pj].name + "'. A massless link on a movable "
+                "joint has undefined dynamics. Give it an <inertial>, or make the joint fixed.");
+        }
+
+        LinkRec& rec = links_[li];
+        rec.kinematic = true;
+        rec.kinematic_joint = pj;
+        rec.kinematic_parent = model_.joints[pj].parent_index;
+        massless_markers_.push_back(link.name);
+    }
 }
 
 void Box3DRobot::instantiate()
 {
+    // Static world geometry. Re-attached here rather than in build() precisely because reset()
+    // routes through instantiate() — a level that vanished on the first reset would be a very
+    // memorable bug. Re-attaching is cheap (~0.006 ms per cooked mesh) because the cook itself is
+    // held by static_geometry_ and survives the world teardown; see Box3DStaticGeometry.
+    if (static_geometry_) static_geometry_->attachTo(world_);
+    instantiateKinematic();
+
     // Built from opts_, so reset() — which rebuilds the world — recreates it automatically. A
     // ground plane that vanished on reset would be a memorable bug.
     if (opts_.add_ground_plane) {
@@ -214,15 +503,28 @@ void Box3DRobot::instantiate()
     // Walk the tree from the root accumulating world transforms. A URDF joint <origin> is the
     // transform from the parent link frame to the joint frame, and the child link frame coincides
     // with the joint frame at zero joint position.
-    std::vector<b3Transform> world_xf(n_links);
-    std::function<void(int, const b3Transform&)> place = [&](int li, const b3Transform& parent_xf) {
+    // ⚠ WorldPose, not b3Transform. b3Transform::p is float in BOTH precision modes, so composing
+    // world poses through it silently discards BOX3D_DOUBLE_PRECISION (which AirLib pins ON). That
+    // was survivable while every robot was built at the origin and coordinates stayed around a
+    // metre. It is not survivable now: the root is placed at its true position in the level, so a
+    // robot 2 km from the map origin would have its links composed at ~0.1 mm resolution and its
+    // joint frames would visibly disagree with each other.
+    std::vector<WorldPose> world_xf(n_links);
+    std::function<void(int, const WorldPose&)> place = [&](int li, const WorldPose& parent_xf) {
         world_xf[li] = parent_xf;
         for (int ji : model_.links[li].child_joints) {
             const urdf::Joint& j = model_.joints[ji];
-            place(j.child_index, mulT(parent_xf, transformFromOrigin(j.origin)));
+            place(j.child_index, mulW(parent_xf, transformFromOrigin(j.origin)));
         }
     };
-    place(model_.root_link, b3Transform_identity);
+
+    WorldPose root;
+    root.p = toB3Pos(opts_.root_position);
+    root.q = normalize(b3Quat{ b3Vec3{ static_cast<float>(opts_.root_orientation.x),
+                                       static_cast<float>(opts_.root_orientation.y),
+                                       static_cast<float>(opts_.root_orientation.z) },
+                               static_cast<float>(opts_.root_orientation.w) });
+    place(model_.root_link, root);
 
     for (size_t i = 0; i < n_links; ++i) {
         const urdf::Link& link = model_.links[i];
@@ -236,7 +538,7 @@ void Box3DRobot::instantiate()
         bd.type = is_static_root  ? b3_staticBody
                   : rec.kinematic ? b3_kinematicBody
                                   : b3_dynamicBody;
-        bd.position = b3Pos{ world_xf[i].p.x, world_xf[i].p.y, world_xf[i].p.z };
+        bd.position = world_xf[i].p;
         bd.rotation = world_xf[i].q;
         bd.name = rec.name.c_str();
         // A robot link that falls asleep stops reporting joint state, which reads as a frozen
@@ -497,6 +799,19 @@ void Box3DRobot::stepOnce()
 {
     // Before the solve, so the follower's target is consistent with the state it was read from.
     updateMimicFollowers();
+    // Kinematic targets, immediately before the step they are sized for. b3Body_SetTargetTransform
+    // converts a pose into the velocity needed to reach it in exactly `timeStep`, so it must be
+    // issued against the step that follows it and re-issued every step — a velocity is consumed by
+    // the integrator, not held.
+    for (KinematicRec& r : kinematic_) {
+        if (!b3Body_IsValid(r.body)) continue;
+        b3WorldTransform target;
+        target.p = r.target.p;
+        target.q = r.target.q;
+        b3Body_SetTargetTransform(r.body, target, static_cast<float>(opts_.fixed_timestep),
+                                  /*wake=*/true);
+    }
+
     b3World_Step(world_, static_cast<float>(opts_.fixed_timestep), opts_.substeps);
     ++steps_taken_;
 }
@@ -631,6 +946,7 @@ void Box3DRobot::setControlMode(size_t joint, ControlMode mode)
 {
     JointRec& r = joints_[joint];
     r.mode = mode;
+    if (joint < control_.size()) control_[joint].mode = mode;
     if (!b3Joint_IsValid(r.joint)) return;
 
     const bool revolute = r.type == urdf::JointType::Revolute ||
@@ -667,6 +983,11 @@ void Box3DRobot::setControlMode(size_t joint, ControlMode mode)
 void Box3DRobot::setPositionGains(size_t joint, double hertz, double damping_ratio)
 {
     JointRec& r = joints_[joint];
+    if (joint < control_.size()) {
+        control_[joint].hertz = hertz;
+        control_[joint].damping_ratio = damping_ratio;
+        control_[joint].gains_set = true;
+    }
     if (!b3Joint_IsValid(r.joint)) return;
     // Box3D's guidance: spring hertz should stay below half the step frequency (Nyquist). At the
     // 3 ms sim step that ceiling is ~166 Hz.
@@ -684,6 +1005,7 @@ void Box3DRobot::setTarget(size_t joint, double value)
 {
     JointRec& r = joints_[joint];
     r.target = value;
+    if (joint < control_.size()) control_[joint].target = value;
     if (!b3Joint_IsValid(r.joint)) return;
 
     if (r.type == urdf::JointType::Revolute || r.type == urdf::JointType::Continuous) {

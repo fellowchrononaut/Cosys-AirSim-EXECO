@@ -24,6 +24,7 @@
 #include "PawnEvents.h"
 #include "common/AirSimSettings.hpp"
 #include "common/common_utils/UniqueValueMap.hpp"
+#include "urdf/UrdfMesh.hpp"
 #include "urdf/UrdfModel.hpp"
 
 #include <atomic>
@@ -51,6 +52,27 @@ public:
 
     /// Create one component per URDF link. Called by the sim api once the model is parsed, because
     /// the pawn is spawned before settings are read and cannot parse the file itself.
+    void setVisualCollision(bool enabled) { visual_collision_ = enabled; }
+
+    /// Shading switches, settable from settings.json so a shading problem can be bisected without a
+    /// rebuild between attempts. See AirSimSettings for what each one tests.
+    void setMeshShading(bool cast_shadow, bool smooth_normals, bool flip_winding,
+                        bool base_material, bool inset_shadow, bool two_sided_shadow,
+                        bool contact_shadow, double decimate_grid,
+                        const std::string& asset_dir, double asset_scale)
+    {
+        mesh_asset_dir_ = asset_dir;
+        mesh_asset_scale_ = asset_scale;
+        mesh_decimate_grid_ = decimate_grid;
+        mesh_contact_shadow_ = contact_shadow;
+        mesh_inset_shadow_ = inset_shadow;
+        mesh_two_sided_shadow_ = two_sided_shadow;
+        mesh_base_material_ = base_material;
+        mesh_cast_shadow_ = cast_shadow;
+        mesh_smooth_normals_ = smooth_normals;
+        mesh_flip_winding_ = flip_winding;
+    }
+
     void buildFromModel(const urdf::Robot& model, const std::string& urdf_dir,
                         const std::vector<std::string>& mesh_search_paths);
 
@@ -89,6 +111,69 @@ public:
     const DriveInput& getDriveInput() const { return drive_input_; }
 
 private:
+    /// Build a UProceduralMeshComponent from a URDF <mesh> file, or return false if it cannot be
+    /// loaded. This is what makes a real robot visible: on ExoMy **all 23 visuals are meshes**, so
+    /// without it the robot is drawn as whatever <collision> primitives happen to exist — six wheel
+    /// cylinders — and is equally invisible to its own LiDAR.
+    /// Draw a <mesh> visual from a pre-imported UStaticMesh asset, if one exists for it.
+    /// Returns false when no asset is found, leaving the caller to use the runtime STL path.
+    bool attachStaticMeshAsset(USceneComponent* link_component, const urdf::Geometry& g,
+                               const urdf::Origin& origin, const FName& name, bool collidable);
+
+    bool attachMeshGeometry(USceneComponent* link_component, const urdf::Geometry& g,
+                            const urdf::Origin& origin, const urdf::Material& material,
+                            const FName& name, bool collidable);
+
+    /// Base material for procedural link meshes. A UProceduralMeshComponent has none of its own —
+    /// unlike the engine BasicShapes the primitive path uses — so without this a mesh robot renders
+    /// black.
+    UPROPERTY()
+    UMaterialInterface* mesh_material_ = nullptr;
+
+    /// Loaded STL files, keyed by resolved absolute path.
+    ///
+    /// ⚠ Not an optimisation: ExoMy names six identical wheel STLs and several repeated brackets,
+    /// so an uncached build re-parses the same files many times during a single spawn.
+    std::map<std::string, urdf::MeshData> mesh_cache_;
+
+    /// Where the spawn's time actually went. Reported once per build, because "loading is slow" is
+    /// not actionable and "collision cooking took 4.1 s of 4.4 s" is.
+    /// Cook collision for procedural visual meshes.
+    ///
+    /// ⚠ True by default and it should usually stay true: this collision is what LiDAR, echo and
+    /// distance sensors trace, so false makes the robot invisible to its own sensors and to every
+    /// other robot's. It exists because runtime tri-mesh cooking dominates spawn time on a
+    /// mesh-heavy robot, and while iterating on something else that trade is sometimes worth it.
+    bool visual_collision_ = true;
+    bool mesh_cast_shadow_ = true;
+    bool mesh_smooth_normals_ = false;
+    bool mesh_flip_winding_ = false;
+    bool mesh_base_material_ = false;
+    bool mesh_inset_shadow_ = true;
+    bool mesh_contact_shadow_ = true;
+
+    /// Vertex-cluster grid in metres; 0 disables. See attachMeshGeometry for why this exists.
+    double mesh_decimate_grid_ = 0.0;
+    std::string mesh_asset_dir_;
+    double mesh_asset_scale_ = 1.0;
+    int32 mesh_from_asset_ = 0;
+    int32 mesh_from_stl_ = 0;
+    int64 mesh_triangles_before_ = 0;
+    int64 mesh_triangles_after_ = 0;
+    bool mesh_two_sided_shadow_ = false;
+
+    bool logged_material_once_ = false;
+    bool logged_param_once_ = false;
+
+    double mesh_load_seconds_ = 0.0;
+    double mesh_section_seconds_ = 0.0;
+    int64 mesh_triangle_total_ = 0;
+
+    /// Where <mesh filename=...> is resolved from. Captured in buildFromModel, which previously
+    /// discarded both because nothing could load a mesh.
+    std::string urdf_dir_;
+    std::vector<std::string> mesh_search_paths_;
+
     /// Resolve a URDF <visual> mesh to a UStaticMesh, or return null.
     ///
     /// ⚠ Returns null for every <mesh>, which is more often than one might expect. URDF meshes are

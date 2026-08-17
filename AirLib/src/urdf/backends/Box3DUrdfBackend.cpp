@@ -2,11 +2,30 @@
 
 namespace urdf {
 
+void Box3DUrdfBackend::setStaticWorld(std::shared_ptr<const StaticWorld> world)
+{
+    robot_.setStaticWorld(std::move(world));
+}
+
+int Box3DUrdfBackend::addKinematicBody(const KinematicBody& body)
+{
+    return robot_.addKinematicBody(body);
+}
+
+void Box3DUrdfBackend::setKinematicPose(int handle, const Vec3& position, const Quat& orientation)
+{
+    robot_.setKinematicPose(handle, position, orientation);
+}
+
 void Box3DUrdfBackend::buildFromUrdf(const Robot& model, const BackendOptions& opts)
 {
     model_ = model;
 
     b3urdf::BuildOptions b = tuning_;
+    b.mesh_base_dir = opts.mesh_base_dir;
+    b.mesh_search_paths = opts.mesh_search_paths;
+    b.root_position = opts.root_position;
+    b.root_orientation = opts.root_orientation;
     b.fixed_timestep = opts.fixed_timestep;
     b.gravity_z = opts.gravity_z;
     b.fixed_base = opts.fixed_base;
