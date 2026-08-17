@@ -87,6 +87,30 @@ class UrdfBotClient:
         """
         self.client.call('setDriveCommand', float(throttle), float(steering), vehicle_name)
 
+    def getUrdfXml(self, vehicle_name=''):
+        """The robot's URDF as the simulator loaded it.
+
+        ⚠ Prefer this over opening UrdfFile yourself. A client in a container generally cannot
+        see that path — verified for the ROS 2 container, where only one host directory is
+        mounted. It is also the exact text this simulator parsed, so a description and the joint
+        names it is matched against cannot drift apart.
+        """
+        return self.client.call('getUrdfXml', vehicle_name)
+
+    def getJointStates(self, vehicle_name=''):
+        """Every movable joint's state in one call, sampled together.
+
+        Returns a list of dicts: name, position, velocity, effort.
+
+        ⚠ Prefer this over calling getJointState per joint. N separate calls sample N different
+        instants, so the result is a smear rather than a snapshot — which matters when it feeds a
+        sensor_msgs/JointState and from there robot_state_publisher's TF.
+
+        ⚠ FIXED joints are absent (no state to report), and so are COSMETIC <mimic> joints, which
+        have no solver joint at all. Their coupling is visible via getJoints()'s mimic_role.
+        """
+        return self.client.call('getJointStates', vehicle_name)
+
     def setJointEffort(self, joint, newton_metres, vehicle_name=''):
         """⚠ Box3D has no direct torque input on a revolute joint. Effort is expressed as an
         unreachable speed capped by the requested torque, which is the standard idiom — but it is

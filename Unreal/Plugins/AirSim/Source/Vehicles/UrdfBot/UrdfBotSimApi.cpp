@@ -19,6 +19,8 @@
 #endif
 
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <cmath>
 #include <map>
 #include <set>
@@ -101,6 +103,41 @@ namespace
             return backend_->getJointState(static_cast<size_t>(requireJoint(joint)));
         }
 
+        std::vector<JointStateInfo> getJointStates() const override
+        {
+            std::vector<JointStateInfo> out;
+            out.reserve(model_->joints.size());
+            for (size_t i = 0; i < model_->joints.size(); ++i) {
+                const urdf::Joint& j = model_->joints[i];
+
+                // ⚠ FIXED joints are skipped. They have no state, and ROS convention is that
+                // joint_states carries only actuatable joints — robot_state_publisher composes
+                // fixed transforms from the URDF itself. Publishing them would be harmless noise
+                // for RViz but would misrepresent the robot to anything counting DoF.
+                if (j.type == urdf::JointType::Fixed) continue;
+
+                // ⚠ Cosmetic <mimic> joints have NO joint in the solver at all — they were
+                // resolved in the rendering layer — so findJoint misses them. Omitted rather than
+                // reported as zero, because zero would be a plausible-looking lie about a joint
+                // that is in fact tracking its source. A client that needs them can see the
+                // coupling through getJoints()'s mimic_role and mimic_source fields.
+                const int bj = backend_->findJoint(j.name);
+                if (bj < 0) continue;
+
+                const urdf::JointState st = backend_->getJointState(static_cast<size_t>(bj));
+                JointStateInfo info;
+                info.name = j.name;
+                info.position = st.position;
+                info.velocity = st.velocity;
+                info.effort = st.effort;
+                out.push_back(std::move(info));
+            }
+            return out;
+        }
+
+        std::string getUrdfXml() const override { return urdf_xml_; }
+        void setUrdfXml(std::string xml) { urdf_xml_ = std::move(xml); }
+
         LinkPoseInfo getLinkPose(const std::string& link) const override
         {
             const int i = backend_->findLink(link);
@@ -168,6 +205,7 @@ namespace
             backend_->setJointTarget(static_cast<size_t>(requireJoint(joint)), mode, v);
         }
 
+        std::string urdf_xml_;
         const urdf::Robot* model_;
         urdf::UrdfRobotBackend* backend_;
         const std::vector<urdf::MimicClassification>* mimic_;
@@ -198,6 +236,18 @@ void UrdfBotSimApi::loadModelAndBackend()
 #else
     const std::string urdf_path = vehicle_setting_->urdf_file;
     model_ = urdf::parseFile(urdf_path);
+
+    // Kept so getUrdfXml() can serve it to clients that cannot see this path — see
+    // UrdfBotApiBase::getUrdfXml. Read separately from the parser rather than re-serialised, so
+    // what a client receives is byte-for-byte what was parsed.
+    {
+        std::ifstream urdf_in(urdf_path);
+        if (urdf_in) {
+            std::stringstream ss;
+            ss << urdf_in.rdbuf();
+            urdf_xml_raw_ = ss.str();
+        }
+    }
 
     // Applied BEFORE the audit and before the build, deliberately: the audit's numbers, the
     // backend's shapes and the pawn's <collision> render fallback then all describe one robot
@@ -473,8 +523,20 @@ void UrdfBotSimApi::loadModelAndBackend()
     const std::vector<urdf::MimicClassification>* mimic =
         &static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->robot().mimicClassifications();
 
-    vehicle_api_ = std::make_unique<UrdfBotApi>(&model_, backend_.get(), mimic, &getNedTransform(),
+    {
+        auto api = std::make_unique<UrdfBotApi>(&model_, backend_.get(), mimic, &getNedTransform(),
                                                 getGroundTruthEnvironment()->getHomeGeoPoint());
+        // Hand over the raw URDF so clients that cannot see the file path can still obtain the
+        // description — see UrdfBotApiBase::getUrdfXml.
+        api->setUrdfXml(urdf_xml_raw_);
+        if (urdf_xml_raw_.empty()) {
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("could not re-read '%s' for getUrdfXml; ROS clients will get an EMPTY "
+                        "robot_description and no link TF"),
+                   UTF8_TO_TCHAR(urdf_path.c_str()));
+        }
+        vehicle_api_ = std::move(api);
+    }
 
     // Per-link sensor mounting. A mount actor is created only for links a sensor actually names,
     // so a 23-link rover with two sensors gets two mounts rather than 23.

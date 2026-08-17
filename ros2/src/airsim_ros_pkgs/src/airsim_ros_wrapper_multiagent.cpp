@@ -1,4 +1,6 @@
 #include <airsim_ros_wrapper_multiagent.h>
+#include <fstream>
+#include <sstream>
 #include "common/AirSimSettings.hpp"
 #include <tf2_sensor_msgs/tf2_sensor_msgs.h>
 
@@ -119,6 +121,7 @@ void AirsimROSWrapperMultiAgent::initialize_airsim()
         car_client_->confirmConnection();
         cv_client_->confirmConnection();
         urdfbot_client_->confirmConnection();
+        publish_urdf_descriptions();
 
         airsim_client_images_drone_.confirmConnection();
         airsim_client_images_car_.confirmConnection();
@@ -174,6 +177,56 @@ void AirsimROSWrapperMultiAgent::initialize_airsim()
 // ============================================================================
 // initialize_ros
 // ============================================================================
+
+/// Publish each URDF robot's description, once, on its latched topic.
+///
+/// ⚠ Called from initialize_airsim(), NOT from create_ros_pubs_from_settings_json(). The publishers
+/// are created there, but urdfbot_client_ does not exist until initialize_airsim() runs at the end
+/// of initialize_ros() — fetching the description at creation time dereferenced a null client and
+/// killed the node outright.
+///
+/// ⚠ Fetched over RPC rather than read from UrdfFile. The simulator resolves that path on the HOST;
+/// this node normally runs in a container that cannot see it — verified on sad_vio_dense, which
+/// mounts one host directory and cannot open the ExoMy model at all. Reading the path here would
+/// publish an empty description, whose only symptom is "the robot does not appear in RViz". The RPC
+/// also returns the exact text the simulator parsed, so description and joint names cannot drift.
+void AirsimROSWrapperMultiAgent::publish_urdf_descriptions()
+{
+    for (auto& vehicle_name_ptr_pair : vehicle_name_ptr_map_) {
+        auto& vehicle_ros = vehicle_name_ptr_pair.second;
+        if (vehicle_ros->vehicle_mode_ != VehicleMode::URDFBOT) continue;
+
+        auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_ros.get());
+        if (!urdf_ros->robot_description_pub_) continue;
+
+        const std::string& vname = vehicle_ros->vehicle_name_;
+        std_msgs::msg::String desc;
+        try {
+            desc.data = urdfbot_client_->getUrdfXml(vname);
+        }
+        catch (const std::exception& e) {
+            RCLCPP_WARN(nh_->get_logger(), "Vehicle '%s': getUrdfXml failed (%s)", vname.c_str(), e.what());
+        }
+
+        if (desc.data.empty()) {
+            // Fallback for a node running on the host, where UrdfFile does resolve.
+            std::ifstream in(urdf_ros->urdf_file_);
+            if (in) { std::stringstream ss; ss << in.rdbuf(); desc.data = ss.str(); }
+        }
+
+        if (!desc.data.empty()) {
+            urdf_ros->robot_description_pub_->publish(desc);
+            RCLCPP_INFO(nh_->get_logger(), "Vehicle '%s': published robot_description (%zu bytes)",
+                        vname.c_str(), desc.data.size());
+        }
+        else {
+            RCLCPP_ERROR(nh_->get_logger(),
+                         "Vehicle '%s': robot_description is EMPTY - neither getUrdfXml nor UrdfFile "
+                         "yielded anything. robot_state_publisher cannot build link TF and the robot "
+                         "will not appear in RViz.", vname.c_str());
+        }
+    }
+}
 
 void AirsimROSWrapperMultiAgent::initialize_ros()
 {
@@ -416,8 +469,22 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
             }
 
         } else if (vmode == VehicleMode::URDFBOT) {
-            // No type-specific state topic: a URDF robot has no fixed state struct to publish.
-            // Joint state arrives in phase 2 on ~/<vehicle>/joint_states.
+            auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_ros.get());
+            urdf_ros->joint_state_pub_ =
+                nh_->create_publisher<sensor_msgs::msg::JointState>(topic_prefix + "/joint_states", 10);
+
+            // ⚠ LATCHED (transient_local + reliable). robot_state_publisher and RViz almost never
+            // start before this node does, and a volatile description would simply be missed —
+            // leaving a robot that publishes joint angles nobody can turn into transforms.
+            urdf_ros->robot_description_pub_ = nh_->create_publisher<std_msgs::msg::String>(
+                topic_prefix + "/robot_description", qos_latched);
+            urdf_ros->urdf_file_ = vehicle_setting->urdf_file;
+
+            // ⚠ The DESCRIPTION IS NOT FETCHED HERE. initialize_ros() creates these publishers
+            // and only calls initialize_airsim() at its very end, so urdfbot_client_ is still
+            // nullptr at this point — dereferencing it segfaulted the whole node immediately after
+            // the "Vehicle 'Rover' -> URDF" line, with no other symptom. Published from
+            // publish_urdf_descriptions(), after the clients exist.
         } else { // CV
             auto cv = static_cast<ComputerVisionROS*>(vehicle_ros.get());
             cv->computer_vision_state_pub_ = nh_->create_publisher<airsim_interfaces::msg::ComputerVisionState>(topic_prefix + "/computervision_state", 10);
@@ -807,6 +874,24 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
             vehicle_ros->gps_sensor_msg_.header.stamp = vehicle_time;
             vehicle_ros->curr_odom_ = get_odom_msg_from_kinematic_state(kin);
 
+            // ⚠ ONE batched call, not one call per joint. Polling joints individually samples them
+            // at different instants, and a JointState assembled from that describes a pose the
+            // robot never held — which robot_state_publisher would then turn into TF.
+            auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_ros.get());
+            const auto js = urdfbot_client_->getJointStates(vname);
+            auto& jm = urdf_ros->joint_state_msg_;
+            jm.header.stamp = vehicle_time;
+            jm.header.frame_id = vname;
+            jm.name.clear(); jm.position.clear(); jm.velocity.clear(); jm.effort.clear();
+            jm.name.reserve(js.size()); jm.position.reserve(js.size());
+            jm.velocity.reserve(js.size()); jm.effort.reserve(js.size());
+            for (const auto& j : js) {
+                jm.name.push_back(j.name);
+                jm.position.push_back(j.position);
+                jm.velocity.push_back(j.velocity);
+                jm.effort.push_back(j.effort);
+            }
+
         } else { // CV
             auto cv = static_cast<ComputerVisionROS*>(vehicle_ros.get());
             cv->curr_computer_vision_state_ = cv_client_->getComputerVisionState(vname);
@@ -858,6 +943,10 @@ void AirsimROSWrapperMultiAgent::publish_vehicle_state()
         } else if (vmode == VehicleMode::CV) {
             static_cast<ComputerVisionROS*>(vehicle_ros.get())->computer_vision_state_pub_->publish(
                 static_cast<ComputerVisionROS*>(vehicle_ros.get())->computer_vision_state_msg_);
+        } else if (vmode == VehicleMode::URDFBOT) {
+            auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_ros.get());
+            if (urdf_ros->joint_state_pub_ && !urdf_ros->joint_state_msg_.name.empty())
+                urdf_ros->joint_state_pub_->publish(urdf_ros->joint_state_msg_);
         }
 
         vehicle_ros->odom_local_pub_->publish(vehicle_ros->curr_odom_);

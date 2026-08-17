@@ -91,6 +91,23 @@ namespace airlib
             ->call("setJointPositionGains", joint, hertz, damping_ratio, vehicle_name);
     }
 
+    std::string UrdfBotRpcLibClient::getUrdfXml(const std::string& vehicle_name)
+    {
+        return static_cast<rpc::client*>(getClient())->call("getUrdfXml", vehicle_name).as<std::string>();
+    }
+
+    std::vector<UrdfBotApiBase::JointStateInfo>
+    UrdfBotRpcLibClient::getJointStates(const std::string& vehicle_name)
+    {
+        const auto wire = static_cast<rpc::client*>(getClient())
+                              ->call("getJointStates", vehicle_name)
+                              .as<std::vector<UrdfBotRpcLibAdaptors::JointStateInfo>>();
+        std::vector<UrdfBotApiBase::JointStateInfo> out;
+        out.reserve(wire.size());
+        for (const auto& w : wire) out.push_back(w.to());
+        return out;
+    }
+
     urdf::JointState UrdfBotRpcLibClient::getJointState(const std::string& joint,
                                                         const std::string& vehicle_name)
     {

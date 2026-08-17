@@ -44,6 +44,15 @@ namespace airlib
             std::string mimic_source;
         };
 
+        /// One joint's state, carrying its own name so a batch is self-describing.
+        struct JointStateInfo
+        {
+            std::string name;
+            double position = 0;  ///< rad or m
+            double velocity = 0;  ///< rad/s or m/s
+            double effort = 0;    ///< N.m or N
+        };
+
         struct LinkPoseInfo
         {
             std::string name;
@@ -66,7 +75,32 @@ namespace airlib
                                            double damping_ratio) = 0;
 
         virtual urdf::JointState getJointState(const std::string& joint) const = 0;
+
+        /// Every movable joint's state in ONE call, sampled together.
+        ///
+        /// ⚠ Not a convenience wrapper over getJointState. Polling N joints individually samples
+        /// them at N different instants, so the result is a SMEAR rather than a snapshot — and a
+        /// sensor_msgs/JointState built from a smear feeds robot_state_publisher a pose the robot
+        /// never actually held. At ROS rates the error is small and entirely invisible, which is
+        /// the property that makes it worth avoiding rather than tolerating.
+        ///
+        /// ⚠ FIXED joints are excluded. They have no state to report, and ROS convention is that
+        /// joint_states carries only actuatable joints — robot_state_publisher takes fixed
+        /// transforms from the URDF itself.
+        virtual std::vector<JointStateInfo> getJointStates() const = 0;
         virtual LinkPoseInfo getLinkPose(const std::string& link) const = 0;
+
+        /// The robot's URDF, as the simulator actually loaded it.
+        ///
+        /// ⚠ Served over RPC rather than left for the client to read off disk, because the client
+        /// frequently CANNOT read it. The ROS 2 wrapper runs in a container where only one host
+        /// directory is mounted, so the UrdfFile path from settings does not resolve there —
+        /// verified 2026-08-17. A client reading the path itself would publish an empty
+        /// robot_description, and the only symptom would be "the robot does not appear in RViz".
+        ///
+        /// It also removes a correctness trap: this is the exact text this simulator parsed, so a
+        /// description and the joint names it is matched against cannot drift.
+        virtual std::string getUrdfXml() const = 0;
 
         /// Drive the robot with the SAME two axes the keyboard uses, in the same units: throttle
         /// and steering each in [-1, 1], scaled by UrdfDrive's MaxWheelSpeed and MaxSteerAngle and

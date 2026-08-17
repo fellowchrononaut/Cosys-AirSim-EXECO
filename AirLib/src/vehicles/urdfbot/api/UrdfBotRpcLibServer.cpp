@@ -64,6 +64,18 @@ namespace airlib
         (static_cast<rpc::server*>(getServer()))->bind("setJointVelocity", [&](const std::string& joint, double value, const std::string& vehicle_name) -> void {
             getVehicleApi(vehicle_name)->setJointVelocity(joint, value);
         });
+        (static_cast<rpc::server*>(getServer()))->bind("getUrdfXml", [&](const std::string& vehicle_name) -> std::string {
+            return getVehicleApi(vehicle_name)->getUrdfXml();
+        });
+
+        (static_cast<rpc::server*>(getServer()))->bind("getJointStates", [&](const std::string& vehicle_name) -> std::vector<UrdfBotRpcLibAdaptors::JointStateInfo> {
+            const auto states = getVehicleApi(vehicle_name)->getJointStates();
+            std::vector<UrdfBotRpcLibAdaptors::JointStateInfo> out;
+            out.reserve(states.size());
+            for (const auto& s : states) out.emplace_back(s);
+            return out;
+        });
+
         (static_cast<rpc::server*>(getServer()))->bind("setDriveCommand", [&](double throttle, double steering, const std::string& vehicle_name) -> void {
             getVehicleApi(vehicle_name)->setDriveCommand(throttle, steering);
         });

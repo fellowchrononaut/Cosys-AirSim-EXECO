@@ -49,6 +49,14 @@ namespace airlib
         void setJointPositionGains(const std::string& joint, double hertz, double damping_ratio,
                                    const std::string& vehicle_name = "");
 
+        /// Every movable joint's state in one call, sampled together. Prefer this over calling
+        /// getJointState per joint: N separate calls sample N different instants.
+        std::vector<UrdfBotApiBase::JointStateInfo> getJointStates(const std::string& vehicle_name = "");
+
+        /// The robot's URDF as the simulator loaded it. Use this rather than opening UrdfFile:
+        /// a client in a container usually cannot see that path.
+        std::string getUrdfXml(const std::string& vehicle_name = "");
+
         urdf::JointState getJointState(const std::string& joint,
                                        const std::string& vehicle_name = "");
         /// Pose and twist in AirSim NED, like every other pose crossing this API.

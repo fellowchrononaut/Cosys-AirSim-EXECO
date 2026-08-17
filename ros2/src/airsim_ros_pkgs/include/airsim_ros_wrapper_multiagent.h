@@ -61,6 +61,8 @@ STRICT_MODE_OFF
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <airsim_interfaces/msg/altimeter.hpp>
 #include <sensor_msgs/msg/magnetic_field.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -284,7 +286,23 @@ private:
     class UrdfBotROS : public VehicleROS
     {
     public:
-        // Phase 2/3 members (joint-state publisher, joint command subscribers) attach here.
+        /// sensor_msgs/JointState for the robot's actuatable joints.
+        rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
+        sensor_msgs::msg::JointState joint_state_msg_;
+
+        /// The URDF itself, LATCHED (transient_local), so robot_state_publisher and RViz can pick
+        /// it up whenever they start rather than only if they were listening at spawn.
+        ///
+        /// ⚠ Publishing the description and joint_states is what lets the STANDARD
+        /// robot_state_publisher compose every link transform. The alternative — this wrapper
+        /// emitting 23 TFs per rover per cycle — would be more traffic, more code, and a second
+        /// implementation of kinematics that could disagree with the URDF it came from.
+        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_description_pub_;
+
+        /// UrdfFile as the SIMULATOR sees it. Kept only as a fallback for a node running on the
+        /// host; in a container this path generally does not resolve, which is why the description
+        /// is fetched over RPC instead.
+        std::string urdf_file_;
     };
 
     class ComputerVisionROS : public VehicleROS
@@ -388,6 +406,7 @@ private:
     // Settings → ROS pub/sub creation
     // -----------------------------------------------------------------------
     void create_ros_pubs_from_settings_json();
+    void publish_urdf_descriptions();
     VehicleMode get_vehicle_mode_from_type(const std::string& vehicle_type) const;
 
     void convert_tf_msg_to_ros(geometry_msgs::msg::TransformStamped& tf_msg);

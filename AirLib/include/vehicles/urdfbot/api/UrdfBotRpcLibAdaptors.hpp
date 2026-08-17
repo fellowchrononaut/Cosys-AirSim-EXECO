@@ -76,6 +76,38 @@ namespace airlib_rpclib
         /// Measured joint coordinate. `effort` is the motor's applied effort, not the constraint
         /// reaction — the distinction is in UrdfRobotBackend and is preserved here rather than
         /// flattened into a single "force" the caller would have to guess about.
+        /// One joint's state WITH its name, so a batch reply is self-describing and a client
+        /// never has to assume the reply is index-aligned with a separate getJoints() call.
+        struct JointStateInfo
+        {
+            std::string name;
+            double position = 0;
+            double velocity = 0;
+            double effort = 0;
+
+            MSGPACK_DEFINE_MAP(name, position, velocity, effort);
+
+            JointStateInfo() {}
+
+            JointStateInfo(const msr::airlib::UrdfBotApiBase::JointStateInfo& s)
+            {
+                name = s.name;
+                position = s.position;
+                velocity = s.velocity;
+                effort = s.effort;
+            }
+
+            msr::airlib::UrdfBotApiBase::JointStateInfo to() const
+            {
+                msr::airlib::UrdfBotApiBase::JointStateInfo d;
+                d.name = name;
+                d.position = position;
+                d.velocity = velocity;
+                d.effort = effort;
+                return d;
+            }
+        };
+
         struct JointState
         {
             double position = 0;

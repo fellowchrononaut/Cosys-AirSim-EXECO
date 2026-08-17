@@ -122,6 +122,10 @@ private:
 
     urdf::Robot model_;
     std::unique_ptr<urdf::UrdfRobotBackend> backend_;
+    /// The URDF exactly as read from disk, served to clients through getUrdfXml(). Held because
+    /// a ROS client in a container generally cannot open UrdfFile itself.
+    std::string urdf_xml_raw_;
+
     std::unique_ptr<msr::airlib::UrdfBotApiBase> vehicle_api_;
     urdf::CollisionAudit audit_;
 
