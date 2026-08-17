@@ -57,22 +57,27 @@ AirsimROSWrapperMultiAgent::AirsimROSWrapperMultiAgent(
     , multirotor_client_(nullptr)
     , car_client_(nullptr)
     , cv_client_(nullptr)
+    , urdfbot_client_(nullptr)
     // Dedicated image connections — one per server
     , airsim_client_images_drone_(host_ip, DRONE_PORT)
     , airsim_client_images_car_(host_ip, CAR_PORT)
     , airsim_client_images_cv_(host_ip, CV_PORT)
+    , airsim_client_images_urdfbot_(host_ip, URDFBOT_PORT)
     // Dedicated lidar connections
     , airsim_client_lidar_drone_(host_ip, DRONE_PORT)
     , airsim_client_lidar_car_(host_ip, CAR_PORT)
     , airsim_client_lidar_cv_(host_ip, CV_PORT)
+    , airsim_client_lidar_urdfbot_(host_ip, URDFBOT_PORT)
     // Dedicated GPU-lidar connections
     , airsim_client_gpulidar_drone_(host_ip, DRONE_PORT)
     , airsim_client_gpulidar_car_(host_ip, CAR_PORT)
     , airsim_client_gpulidar_cv_(host_ip, CV_PORT)
+    , airsim_client_gpulidar_urdfbot_(host_ip, URDFBOT_PORT)
     // Dedicated echo connections
     , airsim_client_echo_drone_(host_ip, DRONE_PORT)
     , airsim_client_echo_car_(host_ip, CAR_PORT)
     , airsim_client_echo_cv_(host_ip, CV_PORT)
+    , airsim_client_echo_urdfbot_(host_ip, URDFBOT_PORT)
     , nh_(nh)
     , nh_img_(nh_img)
     , nh_lidar_(nh_lidar)
@@ -88,6 +93,7 @@ AirsimROSWrapperMultiAgent::AirsimROSWrapperMultiAgent(
     RCLCPP_INFO(nh_->get_logger(), "  Drone   server → %s:%u", host_ip_.c_str(), DRONE_PORT);
     RCLCPP_INFO(nh_->get_logger(), "  Car     server → %s:%u", host_ip_.c_str(), CAR_PORT);
     RCLCPP_INFO(nh_->get_logger(), "  CV      server → %s:%u", host_ip_.c_str(), CV_PORT);
+    RCLCPP_INFO(nh_->get_logger(), "  URDF    server → %s:%u", host_ip_.c_str(), URDFBOT_PORT);
 
     tf_broadcaster_  = std::make_shared<tf2_ros::TransformBroadcaster>(nh_);
     static_tf_pub_   = std::make_shared<tf2_ros::StaticTransformBroadcaster>(nh_);
@@ -107,26 +113,32 @@ void AirsimROSWrapperMultiAgent::initialize_airsim()
         multirotor_client_ = std::make_unique<msr::airlib::MultirotorRpcLibClient>(host_ip_, DRONE_PORT);
         car_client_        = std::make_unique<msr::airlib::CarRpcLibClient>(host_ip_, CAR_PORT);
         cv_client_         = std::make_unique<msr::airlib::ComputerVisionRpcLibClient>(host_ip_, CV_PORT);
+        urdfbot_client_    = std::make_unique<msr::airlib::UrdfBotRpcLibClient>(host_ip_, URDFBOT_PORT);
 
         multirotor_client_->confirmConnection();
         car_client_->confirmConnection();
         cv_client_->confirmConnection();
+        urdfbot_client_->confirmConnection();
 
         airsim_client_images_drone_.confirmConnection();
         airsim_client_images_car_.confirmConnection();
         airsim_client_images_cv_.confirmConnection();
+        airsim_client_images_urdfbot_.confirmConnection();
 
         airsim_client_lidar_drone_.confirmConnection();
         airsim_client_lidar_car_.confirmConnection();
         airsim_client_lidar_cv_.confirmConnection();
+        airsim_client_lidar_urdfbot_.confirmConnection();
 
         airsim_client_gpulidar_drone_.confirmConnection();
         airsim_client_gpulidar_car_.confirmConnection();
         airsim_client_gpulidar_cv_.confirmConnection();
+        airsim_client_gpulidar_urdfbot_.confirmConnection();
 
         airsim_client_echo_drone_.confirmConnection();
         airsim_client_echo_car_.confirmConnection();
         airsim_client_echo_cv_.confirmConnection();
+        airsim_client_echo_urdfbot_.confirmConnection();
 
         if (enable_api_control_) {
             for (const auto& vehicle_name_ptr_pair : vehicle_name_ptr_map_) {
@@ -191,6 +203,7 @@ msr::airlib::RpcLibClientBase& AirsimROSWrapperMultiAgent::get_state_client(Vehi
         case VehicleMode::DRONE: return *multirotor_client_;
         case VehicleMode::CAR:   return *car_client_;
         case VehicleMode::CV:    return *cv_client_;
+        case VehicleMode::URDFBOT: return *urdfbot_client_;
     }
     return *multirotor_client_;
 }
@@ -201,6 +214,7 @@ msr::airlib::RpcLibClientBase& AirsimROSWrapperMultiAgent::get_images_client(Veh
         case VehicleMode::DRONE: return airsim_client_images_drone_;
         case VehicleMode::CAR:   return airsim_client_images_car_;
         case VehicleMode::CV:    return airsim_client_images_cv_;
+        case VehicleMode::URDFBOT: return airsim_client_images_urdfbot_;
     }
     return airsim_client_images_drone_;
 }
@@ -211,6 +225,7 @@ msr::airlib::RpcLibClientBase& AirsimROSWrapperMultiAgent::get_lidar_client(Vehi
         case VehicleMode::DRONE: return airsim_client_lidar_drone_;
         case VehicleMode::CAR:   return airsim_client_lidar_car_;
         case VehicleMode::CV:    return airsim_client_lidar_cv_;
+        case VehicleMode::URDFBOT: return airsim_client_lidar_urdfbot_;
     }
     return airsim_client_lidar_drone_;
 }
@@ -221,6 +236,7 @@ msr::airlib::RpcLibClientBase& AirsimROSWrapperMultiAgent::get_gpulidar_client(V
         case VehicleMode::DRONE: return airsim_client_gpulidar_drone_;
         case VehicleMode::CAR:   return airsim_client_gpulidar_car_;
         case VehicleMode::CV:    return airsim_client_gpulidar_cv_;
+        case VehicleMode::URDFBOT: return airsim_client_gpulidar_urdfbot_;
     }
     return airsim_client_gpulidar_drone_;
 }
@@ -231,6 +247,7 @@ msr::airlib::RpcLibClientBase& AirsimROSWrapperMultiAgent::get_echo_client(Vehic
         case VehicleMode::DRONE: return airsim_client_echo_drone_;
         case VehicleMode::CAR:   return airsim_client_echo_car_;
         case VehicleMode::CV:    return airsim_client_echo_cv_;
+        case VehicleMode::URDFBOT: return airsim_client_echo_urdfbot_;
     }
     return airsim_client_echo_drone_;
 }
@@ -264,6 +281,12 @@ AirsimROSWrapperMultiAgent::VehicleMode AirsimROSWrapperMultiAgent::get_vehicle_
     // Computer vision → CV server (41453)
     if (vehicle_type == S::kVehicleTypeComputerVision) {
         return VehicleMode::CV;
+    }
+
+    // URDF robots → urdfbot server (41454). Not folded into CAR: the car server casts its vehicle
+    // APIs to CarApiBase, so routing a urdfbot there is a bad cast rather than a graceful failure.
+    if (vehicle_type == S::kVehicleTypeUrdfBot) {
+        return VehicleMode::URDFBOT;
     }
 
     RCLCPP_WARN(rclcpp::get_logger("AirsimROSWrapperMultiAgent"),
@@ -317,6 +340,10 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
             case VehicleMode::CV:
                 vehicle_ros = std::make_unique<ComputerVisionROS>();
                 RCLCPP_INFO(nh_->get_logger(), "Vehicle '%s' → CV    (port %u)", curr_vehicle_name.c_str(), CV_PORT);
+                break;
+            case VehicleMode::URDFBOT:
+                vehicle_ros = std::make_unique<UrdfBotROS>();
+                RCLCPP_INFO(nh_->get_logger(), "Vehicle '%s' → URDF  (port %u)", curr_vehicle_name.c_str(), URDFBOT_PORT);
                 break;
         }
 
@@ -388,6 +415,9 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
                 car->car_cmd_sub_ = nh_->create_subscription<airsim_interfaces::msg::CarControls>(topic_prefix + "/car_cmd", 1, fcn_car);
             }
 
+        } else if (vmode == VehicleMode::URDFBOT) {
+            // No type-specific state topic: a URDF robot has no fixed state struct to publish.
+            // Joint state arrives in phase 2 on ~/<vehicle>/joint_states.
         } else { // CV
             auto cv = static_cast<ComputerVisionROS*>(vehicle_ros.get());
             cv->computer_vision_state_pub_ = nh_->create_publisher<airsim_interfaces::msg::ComputerVisionState>(topic_prefix + "/computervision_state", 10);
@@ -670,7 +700,22 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
     bool got_sim_time = false;
     rclcpp::Time curr_ros_time = nh_->now();
 
+    // ⚠ TWO PASSES, and the order is load-bearing.
+    //
+    // Only DRONE/CAR/CV carry a simulator timestamp in their state struct; a URDF robot has none
+    // and inherits curr_ros_time from whichever vehicle set it first. vehicle_name_ptr_map_ is an
+    // std::unordered_map, so "first" is hash order, not insertion or alphabetical order — and it
+    // put the rovers ahead of the cars, so every URDF robot was stamped with WALL CLOCK while a
+    // perfectly good simulator clock existed two entries later. Measured: the wall-clock warning
+    // fired on every cycle of a five-vehicle scene containing two timestamped vehicles.
+    //
+    // Pass 0 takes every vehicle that can establish sim time; pass 1 takes the URDF robots that
+    // depend on it. In a URDF-only scene pass 0 is empty, the fallback still applies, and the
+    // warning is then telling the truth.
+    for (int pass = 0; pass < 2; ++pass) {
     for (auto& vehicle_name_ptr_pair : vehicle_name_ptr_map_) {
+        const bool is_urdf = (vehicle_name_ptr_pair.second->vehicle_mode_ == VehicleMode::URDFBOT);
+        if ((pass == 0) == is_urdf) continue;
         auto& vehicle_ros = vehicle_name_ptr_pair.second;
         const std::string& vname = vehicle_ros->vehicle_name_;
         const VehicleMode vmode  = vehicle_ros->vehicle_mode_;
@@ -728,6 +773,40 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
             state_msg.header.frame_id = vname;
             car->car_state_msg_ = state_msg;
 
+        } else if (vmode == VehicleMode::URDFBOT) {
+            // ⚠ Ground-truth kinematics, not a type-specific state call. There is no
+            // getUrdfBotState, and there should not be: a URDF robot has no fixed control
+            // abstraction to report. simGetGroundTruthKinematics is vehicle-type agnostic and is
+            // already what the drone path uses for truth (see I-V), so the odometry a URDF robot
+            // publishes means exactly what every other vehicle's odom_local means.
+            const auto kin = get_state_client(vmode).simGetGroundTruthKinematics(vname);
+
+            // ⚠ NO SIM TIMESTAMP OF ITS OWN, and this is a real gap rather than a detail.
+            //
+            // Every other vehicle type stamps its odometry from a state struct that carries a
+            // simulator timestamp (MultirotorState/CarState/ComputerVisionState ::timestamp). The
+            // urdfbot API has no equivalent, Kinematics::State carries no time, and
+            // Environment::State carries none either — so there is nothing here to read.
+            //
+            // In a MIXED scene this is harmless: another vehicle has already set curr_ros_time from
+            // its own simulator stamp, and the URDF robot shares it. In a urdfbot-ONLY scene
+            // curr_ros_time is still nh_->now(), i.e. WALL CLOCK, which for a dataset generator is
+            // wrong in a way that is easy not to notice. Warned about rather than hidden.
+            //
+            // The proper fix is a timestamped state call on the urdfbot API; until then, run a
+            // urdfbot alongside any other vehicle if timestamps matter.
+            vehicle_time = curr_ros_time;
+            if (!got_sim_time) {
+                RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 10000,
+                                     "Vehicle '%s' (urdfbot) has no simulator timestamp source and "
+                                     "no other vehicle supplied one: odometry is stamped with WALL "
+                                     "CLOCK time, not sim time.", vname.c_str());
+            }
+
+            vehicle_ros->gps_sensor_msg_ = get_gps_sensor_msg_from_airsim_geo_point(env_data.geo_point);
+            vehicle_ros->gps_sensor_msg_.header.stamp = vehicle_time;
+            vehicle_ros->curr_odom_ = get_odom_msg_from_kinematic_state(kin);
+
         } else { // CV
             auto cv = static_cast<ComputerVisionROS*>(vehicle_ros.get());
             cv->curr_computer_vision_state_ = cv_client_->getComputerVisionState(vname);
@@ -754,6 +833,7 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
         vehicle_ros->curr_odom_.header.frame_id  = vname;
         vehicle_ros->curr_odom_.child_frame_id   = vehicle_ros->odom_frame_id_;
         vehicle_ros->curr_odom_.header.stamp     = vehicle_time;
+    }
     }
 
     return curr_ros_time;
@@ -1107,6 +1187,7 @@ bool AirsimROSWrapperMultiAgent::reset_srv_cb(
     multirotor_client_->reset();
     car_client_->reset();
     cv_client_->reset();
+    urdfbot_client_->reset();
     return true;
 }
 

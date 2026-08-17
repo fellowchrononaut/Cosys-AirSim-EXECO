@@ -17,6 +17,7 @@ STRICT_MODE_OFF
 #include "vehicles/multirotor/api/MultirotorRpcLibClient.hpp"
 #include "vehicles/car/api/CarRpcLibClient.hpp"
 #include "vehicles/computervision/api/ComputerVisionRpcLibClient.hpp"
+#include "vehicles/urdfbot/api/UrdfBotRpcLibClient.hpp"
 #include "yaml-cpp/yaml.h"
 #include <airsim_interfaces/msg/gimbal_angle_euler_cmd.hpp>
 #include <airsim_interfaces/msg/gimbal_angle_quat_cmd.hpp>
@@ -167,7 +168,12 @@ public:
     {
         DRONE = 0,  // SimpleFlight, PX4, ArduCopter  → port 41451
         CAR   = 1,  // PhysXCar, BoxCar, Pioneer, CPHusky, ArduRover → port 41452
-        CV    = 2   // ComputerVision → port 41453
+        CV    = 2,  // ComputerVision → port 41453
+        // ⚠ A URDF robot is not a car with extra joints. It has no fixed control abstraction —
+        // only whatever joints its author gave it — so it gets its own server, its own state
+        // source (ground-truth kinematics; there is no getUrdfBotState) and, in phases 2 and 3,
+        // joint state and joint commands that no other vehicle type has.
+        URDFBOT = 3 // urdfbot → port 41454
     };
 
     AirsimROSWrapperMultiAgent(const std::shared_ptr<rclcpp::Node> nh,
@@ -194,6 +200,7 @@ private:
     static constexpr uint16_t DRONE_PORT = 41451;
     static constexpr uint16_t CAR_PORT   = 41452;
     static constexpr uint16_t CV_PORT    = 41453;
+    static constexpr uint16_t URDFBOT_PORT = 41454;
 
     // -----------------------------------------------------------------------
     // Per-vehicle ROS state structs
@@ -268,6 +275,16 @@ private:
 
         bool has_car_cmd_;
         msr::airlib::CarApiBase::CarControls car_cmd_;
+    };
+
+    /// A URDF robot. No type-specific state struct: there is no getUrdfBotState, and inventing
+    /// one would mean guessing which joints are wheels. Odometry comes from
+    /// simGetGroundTruthKinematics, which is vehicle-type agnostic and is already what the drone
+    /// path uses for ground truth.
+    class UrdfBotROS : public VehicleROS
+    {
+    public:
+        // Phase 2/3 members (joint-state publisher, joint command subscribers) attach here.
     };
 
     class ComputerVisionROS : public VehicleROS
@@ -456,24 +473,29 @@ private:
     std::unique_ptr<msr::airlib::MultirotorRpcLibClient>     multirotor_client_;  // port 41451
     std::unique_ptr<msr::airlib::CarRpcLibClient>            car_client_;         // port 41452
     std::unique_ptr<msr::airlib::ComputerVisionRpcLibClient> cv_client_;          // port 41453
+    std::unique_ptr<msr::airlib::UrdfBotRpcLibClient>        urdfbot_client_;     // port 41454
 
     // Dedicated connections per server for high-frequency sensor/image ops
     // so they don't block the main state-update loop
     msr::airlib::RpcLibClientBase airsim_client_images_drone_;
     msr::airlib::RpcLibClientBase airsim_client_images_car_;
     msr::airlib::RpcLibClientBase airsim_client_images_cv_;
+    msr::airlib::RpcLibClientBase airsim_client_images_urdfbot_;
 
     msr::airlib::RpcLibClientBase airsim_client_lidar_drone_;
     msr::airlib::RpcLibClientBase airsim_client_lidar_car_;
     msr::airlib::RpcLibClientBase airsim_client_lidar_cv_;
+    msr::airlib::RpcLibClientBase airsim_client_lidar_urdfbot_;
 
     msr::airlib::RpcLibClientBase airsim_client_gpulidar_drone_;
     msr::airlib::RpcLibClientBase airsim_client_gpulidar_car_;
     msr::airlib::RpcLibClientBase airsim_client_gpulidar_cv_;
+    msr::airlib::RpcLibClientBase airsim_client_gpulidar_urdfbot_;
 
     msr::airlib::RpcLibClientBase airsim_client_echo_drone_;
     msr::airlib::RpcLibClientBase airsim_client_echo_car_;
     msr::airlib::RpcLibClientBase airsim_client_echo_cv_;
+    msr::airlib::RpcLibClientBase airsim_client_echo_urdfbot_;
 
     // -----------------------------------------------------------------------
     // Per-vehicle metadata
