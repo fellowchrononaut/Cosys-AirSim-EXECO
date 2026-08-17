@@ -402,6 +402,11 @@ void MirrorPass(UWorld* World, float WorldToMeters, const FMirrorOptions& Option
                 continue;
             }
 
+            // Kinematic-only pass: everything below builds STATIC geometry, which the memoised
+            // mirror already owns. Re-emitting it here would give the robot a second, duplicate
+            // copy of the level.
+            if (Options.bKinematicOnly) continue;
+
             TArray<urdf::StaticShape> Shapes;
             bool bGot = false;
             if (Options.Source != ECollisionSource::Simple)
@@ -457,6 +462,14 @@ void MirrorPass(UWorld* World, float WorldToMeters, const FMirrorOptions& Option
 }
 
 } // namespace
+
+FMirrorResult MirrorVehicles(UWorld* World, float WorldToMeters, const FMirrorOptions& Options,
+                             FMirrorStats& OutStats)
+{
+    FMirrorOptions Opts = Options;
+    Opts.bKinematicOnly = true;
+    return MirrorLevel(World, WorldToMeters, Opts, OutStats);
+}
 
 const FMirrorResult& MirrorLevelShared(UWorld* World, float WorldToMeters,
                                        const FMirrorOptions& Options, FMirrorStats& OutStats,

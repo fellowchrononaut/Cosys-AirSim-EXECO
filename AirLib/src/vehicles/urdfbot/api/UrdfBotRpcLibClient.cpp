@@ -70,6 +70,13 @@ namespace airlib
         static_cast<rpc::client*>(getClient())->call("setJointVelocity", joint, value, vehicle_name);
     }
 
+    void UrdfBotRpcLibClient::setDriveCommand(double throttle, double steering,
+                                              const std::string& vehicle_name)
+    {
+        static_cast<rpc::client*>(getClient())->call("setDriveCommand", throttle, steering,
+                                                     vehicle_name);
+    }
+
     void UrdfBotRpcLibClient::setJointEffort(const std::string& joint, double value,
                                              const std::string& vehicle_name)
     {

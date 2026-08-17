@@ -7,6 +7,12 @@
 //
 // Higher-level controllers (Ackermann, differential drive, an arm IK solver) belong above this, in
 // the client, where the robot's semantics are known.
+//
+// ⚠ ONE EXCEPTION: setDriveCommand. It is not a guess about which joints are wheels — the operator
+// already stated that in settings, as UrdfDrive's DriveJoints/SteerJoints with their multipliers,
+// and UrdfBotSimApi::applyDriveInput already implements the mapping for the keyboard. Exposing the
+// same two axes over RPC reuses that one implementation instead of copying it into every client.
+// The rule above still holds for anything the URDF does NOT declare.
 #pragma once
 
 #include "api/VehicleApiBase.hpp"
@@ -14,6 +20,7 @@
 #include "sensors/SensorFactory.hpp"
 #include "urdf/UrdfRobotBackend.hpp"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,9 +68,56 @@ namespace airlib
         virtual urdf::JointState getJointState(const std::string& joint) const = 0;
         virtual LinkPoseInfo getLinkPose(const std::string& link) const = 0;
 
+        /// Drive the robot with the SAME two axes the keyboard uses, in the same units: throttle
+        /// and steering each in [-1, 1], scaled by UrdfDrive's MaxWheelSpeed and MaxSteerAngle and
+        /// distributed over DriveJoints/SteerJoints by their per-joint multipliers.
+        ///
+        /// ⚠ Deliberately NOT implemented by mapping Twist to joints on the client side. The
+        /// wheel/steer distribution, the speed and angle limits and the steering gains all live in
+        /// UrdfBotSimApi::applyDriveInput; a second copy in the ROS wrapper would drift from it,
+        /// and the two would disagree in exactly the situations that are hardest to debug — a robot
+        /// that steers differently depending on who is driving it. One mapping, two input sources.
+        ///
+        /// ⚠ Requires enableApiControl(true). Without it the keyboard remains the source and this
+        /// command is ignored — the same arbiter cars and drones already use.
+        virtual void setDriveCommand(double throttle, double steering)
+        {
+            drive_throttle_.store(clampAxis(throttle), std::memory_order_relaxed);
+            drive_steering_.store(clampAxis(steering), std::memory_order_relaxed);
+            // ⚠ Latches on first use, and never clears while API control is held.
+            //
+            // applyDriveInput must keep standing down entirely for a client that drives individual
+            // joints through setJointPosition/Velocity/Effort — otherwise the drive loop would
+            // overwrite those targets every physics step, which is the silent-no-op failure this
+            // whole gate exists to prevent. So the drive loop runs under API control ONLY once a
+            // drive command has actually been issued.
+            drive_command_issued_.store(true, std::memory_order_relaxed);
+        }
+
+        double getDriveThrottle() const { return drive_throttle_.load(std::memory_order_relaxed); }
+        double getDriveSteering() const { return drive_steering_.load(std::memory_order_relaxed); }
+        bool hasDriveCommand() const { return drive_command_issued_.load(std::memory_order_relaxed); }
+
         // VehicleApiBase — a URDF robot has no arming or flight-control concept, so these are
         // answered honestly rather than emulated.
-        virtual void enableApiControl(bool is_enabled) override { api_control_enabled_ = is_enabled; }
+        /// ⚠ Also RELEASES drive control, in both directions.
+        ///
+        /// setDriveCommand latches: once issued, the drive loop writes every drive and steer joint
+        /// each physics step, so setJointPosition on those joints stops holding. Without a way to
+        /// clear that latch it persisted for the life of the process — measured 2026-08-17, a
+        /// steer joint commanded to +0.20, +0.10, +0.05 and -0.20 sat at -0.007 for all four,
+        /// because a drive command issued minutes earlier still owned it. Every call succeeded.
+        ///
+        /// Tying the release to enableApiControl keeps one arbiter rather than adding a second:
+        /// toggling control off and on returns the robot to joint-level command, and a client that
+        /// never calls setDriveCommand is unaffected either way.
+        virtual void enableApiControl(bool is_enabled) override
+        {
+            api_control_enabled_ = is_enabled;
+            drive_command_issued_.store(false, std::memory_order_relaxed);
+            drive_throttle_.store(0.0, std::memory_order_relaxed);
+            drive_steering_.store(0.0, std::memory_order_relaxed);
+        }
         virtual bool isApiControlEnabled() const override { return api_control_enabled_; }
         virtual bool armDisarm(bool arm) override
         {
@@ -127,6 +181,16 @@ namespace airlib
         /// issued: the call succeeds, returns, and does nothing. Two controllers on one joint need
         /// an arbiter, and enableApiControl is the one AirSim already provides.
         bool api_control_enabled_ = false;
+
+        /// Drive axes last commanded over RPC. Atomic because they are written by the RPC thread
+        /// and read by the physics thread; relaxed ordering throughout, because a one-step-old
+        /// throttle is indistinguishable from a command issued one step later and there is nothing
+        /// to order it against.
+        std::atomic<double> drive_throttle_{ 0.0 };
+        std::atomic<double> drive_steering_{ 0.0 };
+        std::atomic<bool> drive_command_issued_{ false };
+
+        static double clampAxis(double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); }
 
         std::shared_ptr<SensorFactory> sensor_factory_;
         SensorCollection sensors_;

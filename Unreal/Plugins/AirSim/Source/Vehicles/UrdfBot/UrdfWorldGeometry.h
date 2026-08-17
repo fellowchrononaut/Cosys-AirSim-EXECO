@@ -112,6 +112,20 @@ struct FMirrorOptions {
     /// engaged — so a relaxed mirror is never mistaken for a clean one.
     bool bRelaxedFallback = true;
 
+    /// Collect ONLY kinematic bodies (vehicles and movable components); emit no static geometry.
+    ///
+    /// ⚠ This exists because the shared level mirror is taken too early to ever contain a URDF
+    /// robot. The mirror runs once, during the FIRST urdfbot's initialisation, and is memoised per
+    /// UWorld — so at the moment it is built no urdfbot link components exist yet, not even the
+    /// building robot's own. Measured 2026-08-17 with three rovers: every one of them tracked the
+    /// same 7 kinematic bodies (the husky and the drone, which already existed), and not one of the
+    /// 69 URDF link components. That, and not any architectural limit, is why Box3D robots did not
+    /// interact with each other while they did interact with Chaos and FastPhysics vehicles.
+    ///
+    /// The static half must stay memoised — its pointer identity is what makes the cook shared —
+    /// so the fix is to re-collect only the kinematic half, later, when every pawn exists.
+    bool bKinematicOnly = false;
+
     double DefaultFriction = 0.7;
     double DefaultRestitution = 0.0;
 };
@@ -164,5 +178,19 @@ FMirrorResult MirrorLevel(UWorld* World, float WorldToMeters, const FMirrorOptio
 const FMirrorResult& MirrorLevelShared(UWorld* World, float WorldToMeters,
                                        const FMirrorOptions& Options, FMirrorStats& OutStats,
                                        bool& bOutFromCache);
+
+/// Kinematic-only mirror, deliberately NOT memoised.
+///
+/// The companion to `MirrorLevelShared`, for the half of the mirror that must be re-collected after
+/// every vehicle exists rather than during the first robot's initialisation — see
+/// `FMirrorOptions::bKinematicOnly` for what that fixes and how it was measured.
+///
+/// Uncached on purpose: the static cook is shared because its cost is real and its content is
+/// fixed, whereas the set of vehicles is neither. Each robot needs its own kinematic instances
+/// anyway (each is pushed independently), so there is nothing to share here.
+///
+/// ⚠ GAME THREAD ONLY, like `MirrorLevel` — it iterates actors and reads cooked collision.
+FMirrorResult MirrorVehicles(UWorld* World, float WorldToMeters, const FMirrorOptions& Options,
+                             FMirrorStats& OutStats);
 
 } // namespace UrdfWorldGeometry

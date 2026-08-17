@@ -40,6 +40,10 @@ namespace airlib
                               const std::string& vehicle_name = "");
         void setJointVelocity(const std::string& joint, double per_second,
                               const std::string& vehicle_name = "");
+        /// Drive with the same two axes as the keyboard, each in [-1, 1]. Requires
+        /// enableApiControl(true); without it the keyboard stays in charge and this is ignored.
+        void setDriveCommand(double throttle, double steering, const std::string& vehicle_name = "");
+
         void setJointEffort(const std::string& joint, double newton_metres,
                             const std::string& vehicle_name = "");
         void setJointPositionGains(const std::string& joint, double hertz, double damping_ratio,

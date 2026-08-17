@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 namespace
@@ -621,7 +622,17 @@ void UrdfBotSimApi::loadModelAndBackend()
 void UrdfBotSimApi::setupDriveJoints()
 {
     const auto& d = vehicle_setting_->urdf_drive;
-    if (!d.enabled) return;
+
+    // ⚠ NOT gated on d.enabled. The mapping is built whenever the operator declared DriveJoints or
+    // SteerJoints; `enabled` gates the KEYBOARD only, in applyDriveInput.
+    //
+    // These were one flag, and the conflation had teeth: a multi-robot scene must disable the
+    // keyboard on all but one robot (three vehicles bound to the same keys drive in lockstep, which
+    // during a contact test is indistinguishable from the robots pushing each other) — and doing so
+    // silently disabled RPC drive on those robots too. Measured 2026-08-17: with three rovers all
+    // commanded identically over RPC, one moved 2.82 m and the other two moved 0.00 m, every call
+    // returning success. Keyboard ownership and "can be driven at all" are different questions.
+    if (d.drive_joints.empty() && d.steer_joints.empty()) return;
 
     // Resolve names to indices once. A name the URDF does not have is reported here rather than
     // being skipped every step in silence — the whole failure mode this workstream guards against
@@ -693,14 +704,37 @@ void UrdfBotSimApi::applyDriveInput()
     // enableApiControl is the arbiter AirSim already uses for exactly this on cars and drones, so
     // a client that knows those needs no new concept. api_control_enabled_ starts FALSE, so the
     // keyboard keeps working until something asks for control.
-    if (vehicle_api_ != nullptr && vehicle_api_->isApiControlEnabled()) return;
+    const bool api_control = (vehicle_api_ != nullptr && vehicle_api_->isApiControlEnabled());
 
-    // Read the axes the game thread last wrote. Relaxed loads: a one-frame-old throttle is
-    // indistinguishable from a key pressed one frame later, so there is nothing to order against.
-    const auto* pawn = static_cast<const AUrdfBotPawn*>(getPawn());
-    const auto& in = pawn->getDriveInput();
-    const float throttle = in.throttle.load(std::memory_order_relaxed);
-    const float steering = in.steering.load(std::memory_order_relaxed);
+    // ⚠ Under API control the drive loop stands down COMPLETELY until a drive command is actually
+    // issued. A client that commands individual joints (setJointPosition/Velocity/Effort) must not
+    // have those targets overwritten every physics step — that is the silent-no-op failure this
+    // gate exists to prevent, and setDriveCommand must not reintroduce it for joint-level clients.
+    if (api_control && !vehicle_api_->hasDriveCommand()) return;
+
+    // ONE mapping, TWO sources. The axes come from RPC under API control and from the keyboard
+    // otherwise; everything below — the speed and angle limits, the per-joint multipliers, the
+    // control modes — is shared. A second copy of this mapping in a client would drift from this
+    // one, and the robot would steer differently depending on who was driving it.
+    //
+    // Relaxed loads: a one-frame-old throttle is indistinguishable from a key pressed one frame
+    // later, so there is nothing to order against.
+    float throttle, steering;
+    if (api_control) {
+        throttle = static_cast<float>(vehicle_api_->getDriveThrottle());
+        steering = static_cast<float>(vehicle_api_->getDriveSteering());
+    }
+    else {
+        // ⚠ UrdfDrive.Enabled gates the KEYBOARD, and only here. A robot with Enabled=false still
+        // drives over RPC — that is how a multi-robot scene gives the keyboard to exactly one
+        // vehicle while every vehicle stays commandable from ROS or Python.
+        if (!vehicle_setting_->urdf_drive.enabled) return;
+
+        const auto* pawn = static_cast<const AUrdfBotPawn*>(getPawn());
+        const auto& in = pawn->getDriveInput();
+        throttle = in.throttle.load(std::memory_order_relaxed);
+        steering = in.steering.load(std::memory_order_relaxed);
+    }
 
     const auto& d = vehicle_setting_->urdf_drive;
     for (const DriveMapping& m : drive_joints_)
@@ -790,11 +824,84 @@ void UrdfBotSimApi::update(float delta)
 // ---------------------------------------------------------------------------------------------
 // GAME THREAD, under physics_world_->lock()
 // ---------------------------------------------------------------------------------------------
+void UrdfBotSimApi::refreshKinematicMirror()
+{
+    // ⚠ WHY THIS EXISTS. The level mirror is memoised per UWorld and is therefore built exactly
+    // once, during the FIRST urdfbot's initialisation. At that moment no urdfbot link components
+    // exist — not even the building robot's own — so no URDF geometry is ever in it. Measured
+    // 2026-08-17 with three ExoMys: all three tracked the same 7 kinematic bodies (the husky and
+    // the drone, which already existed) and none of the 69 URDF link components.
+    //
+    // That is the entire reason Box3D robots did not interact with each other while they DID
+    // interact with Chaos and FastPhysics vehicles. It is a snapshot-timing bug, not the
+    // one-directional-coupling limit of §6.0c stage 2, and not something a shared b3World is
+    // needed to fix.
+    //
+    // Re-collecting here, on the game thread with physics paused, once every pawn exists, is the
+    // whole fix. The STATIC half is deliberately untouched: its shared_ptr identity is what makes
+    // the cook shared between robots, so it stays memoised.
+    if (!vehicle_setting_->urdf_mirror_world_geometry) return;
+    if (!vehicle_setting_->urdf_mirror_other_vehicles && !vehicle_setting_->urdf_mirror_movable)
+        return;
+
+    auto* box3d = dynamic_cast<urdf::UrdfRobotBackend*>(backend_.get());
+    if (box3d == nullptr) return;
+
+    UrdfWorldGeometry::FMirrorOptions opts;
+    opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
+    opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
+    for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
+        opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+
+    UrdfWorldGeometry::FMirrorStats stats;
+    const UrdfWorldGeometry::FMirrorResult mirror = UrdfWorldGeometry::MirrorVehicles(
+        getPawn()->GetWorld(), getNedTransform().fromNed(1.0f), opts, stats);
+    if (!mirror.World) return;
+
+    // Already-tracked sources, so a repeated pass adds only what is new. Dedup is by COMPONENT
+    // identity rather than by name: two ExoMys have identically-named links and a name-keyed set
+    // would silently mirror only the first one's.
+    std::set<const UPrimitiveComponent*> tracked;
+    for (const KinematicMirror& km : kinematic_mirrors_)
+        tracked.insert(km.component.Get());
+
+    int added = 0;
+    for (size_t i = 0; i < mirror.World->kinematic.size(); ++i) {
+        UPrimitiveComponent* src = (static_cast<int32>(i) < mirror.KinematicSources.Num())
+                                       ? mirror.KinematicSources[static_cast<int32>(i)].Get()
+                                       : nullptr;
+        if (src == nullptr) continue;
+        if (src->GetOwner() == getPawn()) continue;   // never mirror yourself
+        if (tracked.count(src) != 0) continue;        // already registered
+
+        KinematicMirror km;
+        km.component = mirror.KinematicSources[static_cast<int32>(i)];
+        km.handle = box3d->addKinematicBody(mirror.World->kinematic[i]);
+        kinematic_mirrors_.push_back(km);
+        ++added;
+    }
+
+    if (added > 0) {
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("kinematic mirror refresh for '%s': +%d bodies (now %d) - late-spawned "
+                    "vehicles, including other URDF robots, are now solid to this one"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), added,
+               static_cast<int32>(kinematic_mirrors_.size()));
+    }
+}
+
 void UrdfBotSimApi::updateRenderedState(float dt)
 {
     {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         render_poses_ = snapshot_;
+    }
+
+    // Late-arriving vehicles (notably OTHER URDF robots) get picked up here, before their poses are
+    // pushed, so a body registered this frame is driven from this frame.
+    if (kinematic_refresh_frames_ > 0) {
+        --kinematic_refresh_frames_;
+        refreshKinematicMirror();
     }
 
     // ⚠ Kinematic poses are pushed HERE, and this is the only correct place for them.

@@ -69,6 +69,24 @@ class UrdfBotClient:
     def setJointVelocity(self, joint, per_second, vehicle_name=''):
         self.client.call('setJointVelocity', joint, float(per_second), vehicle_name)
 
+    def setDriveCommand(self, throttle, steering, vehicle_name=''):
+        """Drive with the same two axes as the keyboard, each in [-1, 1].
+
+        throttle scales UrdfDrive.MaxWheelSpeed across DriveJoints; steering scales
+        MaxSteerAngle across SteerJoints, each by its per-joint multiplier.
+
+        ⚠ Requires enableApiControl(True) first. Without it the keyboard remains the input
+        source and this command is silently ignored — the call still succeeds.
+
+        ⚠ Issuing this LATCHES drive control: from the first drive command the drive loop
+        writes every drive and steer joint each physics step, so setJointPosition/Velocity/Effort
+        on those particular joints will no longer hold. Other joints are unaffected.
+
+        To go back to joint-level control of the wheels, toggle enableApiControl (False then
+        True) — that clears the latch and zeroes the axes.
+        """
+        self.client.call('setDriveCommand', float(throttle), float(steering), vehicle_name)
+
     def setJointEffort(self, joint, newton_metres, vehicle_name=''):
         """⚠ Box3D has no direct torque input on a revolute joint. Effort is expressed as an
         unreachable speed capped by the requested torque, which is the standard idiom — but it is

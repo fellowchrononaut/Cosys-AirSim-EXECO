@@ -99,6 +99,21 @@ private:
     };
     std::vector<KinematicMirror> kinematic_mirrors_;
 
+    /// Frames of deferred kinematic re-mirroring still to attempt. See refreshKinematicMirror.
+    ///
+    /// ⚠ Not zero, because the mirror taken during initialisation CANNOT see other URDF robots —
+    /// they are still being spawned, and their link components do not exist yet. Re-collecting the
+    /// kinematic half on the game thread once everything exists is what makes Box3D robots
+    /// interact with each other at all.
+    int kinematic_refresh_frames_ = 8;
+
+    /// Re-collect kinematic bodies and register any that are not already tracked.
+    ///
+    /// ⚠ GAME THREAD, WITH PHYSICS PAUSED. Called only from updateRenderedState, which is the one
+    /// place both hold: it reads Unreal actor transforms (game thread) and mutates the backend
+    /// (physics stopped under physics_world_->lock()).
+    void refreshKinematicMirror();
+
     /// Last drive axes written to the log, so the diagnostic fires on change rather than at 333 Hz.
     float last_logged_throttle_ = 0.0f;
     float last_logged_steering_ = 0.0f;
