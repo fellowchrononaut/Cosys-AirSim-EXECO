@@ -144,10 +144,27 @@ void AirsimROSWrapperMultiAgent::initialize_airsim()
         airsim_client_echo_urdfbot_.confirmConnection();
 
         if (enable_api_control_) {
+            // ⚠ PER VEHICLE, and non-fatal. This loop used to be unguarded, so ONE vehicle
+            // refusing API control killed the whole node — and a PX4 multirotor with no flight
+            // controller attached refuses every time ("Cannot perform operation when no vehicle is
+            // connected or vehicle is not responding"). The result was that enable_api_control:=true
+            // could not be used at all in a mixed scene, which is exactly the scene this wrapper
+            // exists for. A vehicle that will not take API control is simply not commandable; that
+            // is not a reason to drop the other four.
             for (const auto& vehicle_name_ptr_pair : vehicle_name_ptr_map_) {
                 const std::string& vname = vehicle_name_ptr_pair.first;
-                get_state_client(vehicle_name_ptr_pair.second->vehicle_mode_).enableApiControl(true, vname);
-                get_state_client(vehicle_name_ptr_pair.second->vehicle_mode_).armDisarm(true, vname);
+                auto& client = get_state_client(vehicle_name_ptr_pair.second->vehicle_mode_);
+                try {
+                    client.enableApiControl(true, vname);
+                    client.armDisarm(true, vname);
+                }
+                catch (const std::exception& e) {
+                    RCLCPP_WARN(nh_->get_logger(),
+                                "Vehicle '%s': could not take API control at startup (%s). It will "
+                                "not accept commands until whatever it is waiting on is available; "
+                                "other vehicles are unaffected.",
+                                vname.c_str(), e.what());
+                }
             }
         }
 
@@ -239,6 +256,8 @@ void AirsimROSWrapperMultiAgent::initialize_ros()
     vel_cmd_duration_ = 0.05;
 
     nh_->declare_parameter("vehicle_name", rclcpp::ParameterValue(""));
+    nh_->declare_parameter("urdf_drive_cmd_timeout", rclcpp::ParameterValue(0.5));
+    nh_->get_parameter("urdf_drive_cmd_timeout", urdf_drive_cmd_timeout_);
     create_ros_pubs_from_settings_json();
     airsim_control_update_timer_ = nh_->create_wall_timer(
         std::chrono::duration<double>(update_airsim_control_every_n_sec),
@@ -479,6 +498,28 @@ void AirsimROSWrapperMultiAgent::create_ros_pubs_from_settings_json()
             urdf_ros->robot_description_pub_ = nh_->create_publisher<std_msgs::msg::String>(
                 topic_prefix + "/robot_description", qos_latched);
             urdf_ros->urdf_file_ = vehicle_setting->urdf_file;
+
+            if (enable_api_control_) {
+                std::function<void(const geometry_msgs::msg::Twist::SharedPtr)> fcn_vel =
+                    std::bind(&AirsimROSWrapperMultiAgent::urdf_cmd_vel_cb, this, _1, curr_vehicle_name);
+                urdf_ros->cmd_vel_sub_ = nh_->create_subscription<geometry_msgs::msg::Twist>(
+                    topic_prefix + "/cmd_vel", 1, fcn_vel);
+
+                std::function<void(const sensor_msgs::msg::JointState::SharedPtr)> fcn_joint =
+                    std::bind(&AirsimROSWrapperMultiAgent::urdf_joint_cmd_cb, this, _1, curr_vehicle_name);
+                urdf_ros->joint_cmd_sub_ = nh_->create_subscription<sensor_msgs::msg::JointState>(
+                    topic_prefix + "/joint_cmd", 1, fcn_joint);
+
+                // ⚠ Say the units out loud, once, per robot. linear.x and angular.z are treated as
+                // NORMALISED axes in [-1, 1], NOT m/s and rad/s. Converting a metric Twist would
+                // need the wheel radius, which the URDF's <collision> does not reliably give and
+                // which UrdfDrive does not state — so a metric-looking mapping would be a guess
+                // dressed as a measurement. A teleop publishing 0.5 gets half throttle.
+                RCLCPP_INFO(nh_->get_logger(),
+                            "Vehicle '%s': cmd_vel accepts NORMALISED axes - linear.x -> throttle "
+                            "[-1,1], angular.z -> steering [-1,1]. These are NOT m/s and rad/s.",
+                            curr_vehicle_name.c_str());
+            }
 
             // ⚠ The DESCRIPTION IS NOT FETCHED HERE. initialize_ros() creates these publishers
             // and only calls initialize_airsim() at its very end, so urdfbot_client_ is still
@@ -1027,6 +1068,81 @@ void AirsimROSWrapperMultiAgent::update_commands()
                 car_client_->setCarControls(car->car_cmd_, vehicle_ros->vehicle_name_);
             }
             car->has_car_cmd_ = false;
+
+        } else if (vmode == VehicleMode::URDFBOT) {
+            auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_ros.get());
+            const std::string& vname = vehicle_ros->vehicle_name_;
+
+            if (enable_api_control_ && (urdf_ros->has_drive_cmd_ || urdf_ros->has_joint_cmd_)) {
+                std::lock_guard<std::mutex> guard(control_mutex_);
+
+                // ⚠ Take API control on the FIRST command, not at startup. Until something
+                // actually commands the robot the keyboard should keep working; the moment ROS
+                // does, the keyboard must stand down, because the drive loop writes every drive
+                // and steer joint on every physics step and would overwrite an RPC command 3 ms
+                // after it was issued — a call that succeeds and does nothing.
+                if (!urdf_ros->api_control_taken_) {
+                    urdfbot_client_->enableApiControl(true, vname);
+                    urdf_ros->api_control_taken_ = true;
+                    RCLCPP_INFO(nh_->get_logger(),
+                                "Vehicle '%s': ROS command received - taking API control; the "
+                                "keyboard no longer drives this robot.", vname.c_str());
+                }
+
+                if (urdf_ros->has_drive_cmd_) {
+                    urdfbot_client_->setDriveCommand(urdf_ros->drive_throttle_,
+                                                     urdf_ros->drive_steering_, vname);
+                    urdf_ros->last_drive_cmd_time_ = nh_->now();
+                    urdf_ros->drive_stopped_by_watchdog_ = false;
+                }
+
+                if (urdf_ros->has_joint_cmd_) {
+                    // ⚠ Whichever array is populated selects the mode, checked in the order
+                    // position, velocity, effort. A message carrying several is not an error but
+                    // only the first is honoured — the alternative is issuing three conflicting
+                    // targets to one joint and letting the last write win invisibly.
+                    const auto& jc = urdf_ros->joint_cmd_;
+                    for (size_t i = 0; i < jc.name.size(); ++i) {
+                        try {
+                            if (i < jc.position.size())
+                                urdfbot_client_->setJointPosition(jc.name[i], jc.position[i], vname);
+                            else if (i < jc.velocity.size())
+                                urdfbot_client_->setJointVelocity(jc.name[i], jc.velocity[i], vname);
+                            else if (i < jc.effort.size())
+                                urdfbot_client_->setJointEffort(jc.name[i], jc.effort[i], vname);
+                        }
+                        catch (const std::exception& e) {
+                            // A joint name the robot does not have is client error, not fatal.
+                            RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 5000,
+                                                 "Vehicle '%s': joint command '%s' rejected: %s",
+                                                 vname.c_str(), jc.name[i].c_str(), e.what());
+                        }
+                    }
+                }
+            }
+            urdf_ros->has_drive_cmd_ = false;
+            urdf_ros->has_joint_cmd_ = false;
+
+            // ⚠ WATCHDOG. setDriveCommand is a latched setpoint in the simulator, so a publisher
+            // that simply stops leaves the robot driving forever. Zero the axes once after
+            // urdf_drive_cmd_timeout seconds of silence, then stay quiet until a new command
+            // arrives — re-sending every cycle would fight a deliberate joint-level command.
+            //
+            // Only armed after this wrapper has actually taken control: a robot being driven by
+            // the keyboard must not be stopped by a ROS topic nobody is publishing to.
+            if (enable_api_control_ && urdf_ros->api_control_taken_ &&
+                !urdf_ros->drive_stopped_by_watchdog_) {
+                const double idle = (nh_->now() - urdf_ros->last_drive_cmd_time_).seconds();
+                if (idle > urdf_drive_cmd_timeout_) {
+                    std::lock_guard<std::mutex> guard(control_mutex_);
+                    urdfbot_client_->setDriveCommand(0.0, 0.0, vname);
+                    urdf_ros->drive_stopped_by_watchdog_ = true;
+                    RCLCPP_WARN(nh_->get_logger(),
+                                "Vehicle '%s': no cmd_vel for %.2f s - drive axes zeroed. The "
+                                "simulator latches the last command, so a stopped publisher would "
+                                "otherwise leave the robot driving.", vname.c_str(), idle);
+                }
+            }
         }
     }
 
@@ -1383,6 +1499,29 @@ void AirsimROSWrapperMultiAgent::vel_cmd_all_world_frame_cb(const airsim_interfa
         drone->vel_cmd_     = get_airlib_world_vel_cmd(*msg);
         drone->has_vel_cmd_ = true;
     }
+}
+
+void AirsimROSWrapperMultiAgent::urdf_cmd_vel_cb(const geometry_msgs::msg::Twist::SharedPtr msg,
+                                                 const std::string& vehicle_name)
+{
+    std::lock_guard<std::mutex> guard(control_mutex_);
+    auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_name_ptr_map_[vehicle_name].get());
+
+    // ⚠ NORMALISED, not metric — see the startup log line. Clamped here so a teleop sending 2.0
+    // saturates rather than being silently rescaled somewhere downstream.
+    auto clamp1 = [](double v) { return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v); };
+    urdf_ros->drive_throttle_ = clamp1(msg->linear.x);
+    urdf_ros->drive_steering_ = clamp1(msg->angular.z);
+    urdf_ros->has_drive_cmd_ = true;
+}
+
+void AirsimROSWrapperMultiAgent::urdf_joint_cmd_cb(const sensor_msgs::msg::JointState::SharedPtr msg,
+                                                   const std::string& vehicle_name)
+{
+    std::lock_guard<std::mutex> guard(control_mutex_);
+    auto urdf_ros = static_cast<UrdfBotROS*>(vehicle_name_ptr_map_[vehicle_name].get());
+    urdf_ros->joint_cmd_ = *msg;
+    urdf_ros->has_joint_cmd_ = true;
 }
 
 void AirsimROSWrapperMultiAgent::car_cmd_cb(const airsim_interfaces::msg::CarControls::SharedPtr msg, const std::string& vehicle_name)

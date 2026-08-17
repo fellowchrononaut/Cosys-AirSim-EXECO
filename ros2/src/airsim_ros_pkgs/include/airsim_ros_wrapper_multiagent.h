@@ -63,6 +63,7 @@ STRICT_MODE_OFF
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <airsim_interfaces/msg/altimeter.hpp>
 #include <sensor_msgs/msg/magnetic_field.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -299,6 +300,37 @@ private:
         /// implementation of kinematics that could disagree with the URDF it came from.
         rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_description_pub_;
 
+        /// ~/<vehicle>/cmd_vel — the two drive axes.
+        rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+        bool has_drive_cmd_ = false;
+        double drive_throttle_ = 0.0, drive_steering_ = 0.0;
+
+        /// ⚠ WATCHDOG STATE. setDriveCommand LATCHES in the simulator — the last axes keep being
+        /// applied every physics step until something changes them. Without a timeout, a publisher
+        /// that stops (a teleop closed, a node crashed, a `ros2 topic pub` that exits) leaves the
+        /// robot driving indefinitely. Measured 2026-08-17: a 6-second test drive left a rover
+        /// still moving and it travelled ~11 m further before being stopped by hand.
+        ///
+        /// Latching is right for the low-level RPC — it is a setpoint, not a pulse — so the
+        /// watchdog belongs here, in the ROS layer, where "no message" is the normal way a
+        /// publisher says nothing.
+        rclcpp::Time last_drive_cmd_time_{0, 0, RCL_ROS_TIME};
+        bool drive_stopped_by_watchdog_ = false;
+
+        /// ~/<vehicle>/joint_cmd — sensor_msgs/JointState used as a COMMAND.
+        ///
+        /// Standard message rather than a new type: name[] selects the joints, and whichever of
+        /// position[]/velocity[]/effort[] is populated selects the control mode. That maps exactly
+        /// onto setJointPosition/Velocity/Effort with nothing invented.
+        rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_cmd_sub_;
+        bool has_joint_cmd_ = false;
+        sensor_msgs::msg::JointState joint_cmd_;
+
+        /// Whether this wrapper has already taken API control for this robot. Taking it is what
+        /// stops the keyboard writing every drive joint each physics step and silently overwriting
+        /// RPC commands 3 ms after they are issued.
+        bool api_control_taken_ = false;
+
         /// UrdfFile as the SIMULATOR sees it. Kept only as a fallback for a node running on the
         /// host; in a container this path generally does not resolve, which is why the description
         /// is fetched over RPC instead.
@@ -407,6 +439,12 @@ private:
     // -----------------------------------------------------------------------
     void create_ros_pubs_from_settings_json();
     void publish_urdf_descriptions();
+
+    /// Seconds without a cmd_vel before the drive axes are zeroed. Declared as a ROS parameter
+    /// (urdf_drive_cmd_timeout) because the right value depends on the publisher's rate.
+    double urdf_drive_cmd_timeout_ = 0.5;
+    void urdf_cmd_vel_cb(const geometry_msgs::msg::Twist::SharedPtr msg, const std::string& vehicle_name);
+    void urdf_joint_cmd_cb(const sensor_msgs::msg::JointState::SharedPtr msg, const std::string& vehicle_name);
     VehicleMode get_vehicle_mode_from_type(const std::string& vehicle_type) const;
 
     void convert_tf_msg_to_ros(geometry_msgs::msg::TransformStamped& tf_msg);
