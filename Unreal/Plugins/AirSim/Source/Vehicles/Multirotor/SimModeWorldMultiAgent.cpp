@@ -21,6 +21,7 @@
 #include "vehicles/multirotor/api/MultirotorRpcLibServer.hpp"
 #include "vehicles/car/api/CarRpcLibServer.hpp"
 #include "vehicles/computervision/api/ComputerVisionRpcLibServer.hpp"
+#include "vehicles/urdfbot/api/UrdfBotRpcLibServer.hpp"
 #include "common/SteppableClock.hpp"
 
 void ASimModeWorldMultiAgent::BeginPlay()
@@ -115,7 +116,19 @@ std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> ASimModeWorldMultiAgent
 
     api_servers.push_back(std::make_unique<msr::airlib::ComputerVisionRpcLibServer>(
         getApiProvider(), getSettings().api_server_address, port_cv));
-    
+
+    // ⚠ A fourth server rather than extra methods on an existing one. Each family's server exposes
+    // a different control surface, and getVehicleApi() static_casts to that family's api type — so
+    // binding urdfbot methods onto, say, the car server would cast a UrdfBotApiBase to a CarApiBase
+    // the moment anyone called them. Separate ports keep the cast honest.
+    //
+    // The server is created unconditionally, like the other three: an empty vehicle list simply
+    // means nothing answers, which is what already happens when a scene has no cars.
+    uint16_t port_urdfbot = 41454;
+
+    api_servers.push_back(std::make_unique<msr::airlib::UrdfBotRpcLibServer>(
+        getApiProvider(), getSettings().api_server_address, port_urdfbot));
+
     return api_servers;
 #endif
 }

@@ -3,6 +3,10 @@
 #include "UrdfTransform.h"
 #include "UrdfWorldGeometry.h"
 
+#include "SimMode/SimModeBase.h"
+
+#include "EngineUtils.h"
+
 #include "Engine/World.h"
 #include "UnrealSensors/UnrealSensorFactory.h"
 
@@ -106,20 +110,32 @@ namespace
 
             LinkPoseInfo out;
             out.name = link;
-            // URDF (FLU) -> NED is a 180 deg rotation about X: y and z both flip. Every pose
-            // crossing an AirSim API is NED, and a link pose is no exception.
-            out.pose.position = msr::airlib::Vector3r(static_cast<float>(p.position.x),
-                                                      static_cast<float>(-p.position.y),
-                                                      static_cast<float>(-p.position.z));
-            out.pose.orientation = msr::airlib::Quaternionr(
-                static_cast<float>(p.orientation.w), static_cast<float>(p.orientation.x),
-                static_cast<float>(-p.orientation.y), static_cast<float>(-p.orientation.z));
-            out.twist.linear = msr::airlib::Vector3r(static_cast<float>(t.linear.x),
-                                                     static_cast<float>(-t.linear.y),
-                                                     static_cast<float>(-t.linear.z));
-            out.twist.angular = msr::airlib::Vector3r(static_cast<float>(t.angular.x),
-                                                      static_cast<float>(-t.angular.y),
-                                                      static_cast<float>(-t.angular.z));
+
+            // ⚠ PLAYERSTART-RELATIVE NED, via NedTransform — not a direct URDF-to-NED flip.
+            //
+            // The direct flip (x, -y, -z) was correct while the solver frame was each robot's own
+            // spawn point. It stopped being correct when that frame moved to the UNREAL WORLD
+            // ORIGIN so a mirrored level could be shared between robots (§6.0c): the numbers stayed
+            // well-formed and silently changed origin. Measured on a live sim, the same rover
+            // reported base_link at x = 119 m here and 0.34 m through simGetVehiclePose — two
+            // different origins, no error, and a client differencing them would be badly wrong.
+            //
+            // Routing through NedTransform is what every other AirSim pose already does, so link
+            // poses now share an origin with simGetVehiclePose, the sensors and the other vehicles.
+            const float world_to_meters = ned_->fromNed(1.0f);
+            const FTransform link_world(UrdfTransform::toFQuat(p.orientation),
+                                        UrdfTransform::toFVector(p.position, world_to_meters));
+            out.pose = ned_->toLocalNed(link_world);
+
+            // ⚠ Velocities use toLocalNedVelocity, which applies the axis flips and the unit scale
+            // but NOT the origin translation — subtracting PlayerStart from a velocity would be
+            // meaningless. The metre-to-centimetre scaling in toFVector and the reciprocal inside
+            // toLocalNedVelocity cancel, so angular velocity in rad/s survives the round trip
+            // unscaled while linear velocity in m/s comes back in m/s.
+            out.twist.linear =
+                ned_->toLocalNedVelocity(UrdfTransform::toFVector(t.linear, world_to_meters));
+            out.twist.angular =
+                ned_->toLocalNedVelocity(UrdfTransform::toFVector(t.angular, world_to_meters));
             return out;
         }
 
@@ -130,10 +146,14 @@ namespace
         // reset() override does not compile, which is the good outcome; overriding it by shadowing
         // would have quietly bypassed that bookkeeping.
         //
-        // Nothing to undo here: the joint targets live in the backend, which UrdfBotSimApi resets.
-        void resetImplementation() override {}
+        // ⚠ Chains to the base rather than doing nothing. UrdfBotApiBase::resetImplementation()
+        // resets the SENSORS; an empty override here silently skipped that. The joint targets need
+        // no undoing — they live in the backend, which UrdfBotSimApi resets separately.
+        void resetImplementation() override { UrdfBotApiBase::resetImplementation(); }
 
-        void update(float delta = 0) override { UpdatableObject::update(delta); }
+        // ⚠ No update() override here on purpose. UrdfBotApiBase::update() ticks the sensor
+        // collection, and an override that called UpdatableObject::update() directly — as this
+        // did — silently skipped it, leaving every sensor frozen at its first sample.
 
     private:
         int requireJoint(const std::string& name) const
@@ -402,6 +422,24 @@ void UrdfBotSimApi::loadModelAndBackend()
     }
 
     auto* pawn = static_cast<AUrdfBotPawn*>(getPawn());
+    // ⚠ Custom-depth stencils are OFF by default and are NOT how Segmentation works here.
+    //
+    // Setting CustomDepthStencilValue on a URDF robot's meshes does not make it appear in
+    // Segmentation: this fork drives Segmentation from the annotation system (a ShowOnlyComponents
+    // whitelist of UAnnotationComponents), not from raw stencils. That path now works for
+    // procedural meshes — see FProceduralAnnotationSceneProxy — so nothing here is needed for it.
+    //
+    // The setting is kept for an operator who wants a stencil for their own post-processing. It
+    // stays off by default because enabling custom depth has a real cost beyond being unnecessary:
+    // it puts the link meshes back into screen-space passes.
+    const int seg_id = vehicle_setting_->urdf_segmentation_id;
+    if (seg_id >= 0) {
+        pawn->setSegmentationId(seg_id);
+        UE_LOG(LogUrdfBot, Log, TEXT("custom-depth stencil %d for '%s' (does NOT drive AirSim "
+                                     "Segmentation - see UrdfMeshAssetDir)"),
+               seg_id, UTF8_TO_TCHAR(getVehicleName().c_str()));
+    }
+
     pawn->setVisualCollision(vehicle_setting_->urdf_visual_collision);
     pawn->setMeshShading(vehicle_setting_->urdf_mesh_cast_shadow,
                          vehicle_setting_->urdf_mesh_smooth_normals,
@@ -451,6 +489,105 @@ void UrdfBotSimApi::loadModelAndBackend()
 
     vehicle_api_->initializeSensors(vehicle_setting_, sensor_factory, *getGroundTruthKinematics(),
                                     *getGroundTruthEnvironment());
+
+    // ⚠ The vehicle api is NOT reset here. UpdatableObject enforces strict reset/update
+    // alternation in BOTH directions: update() before any reset throws "reset() must be called
+    // first", and two resets with no update between them throw "Multiple reset() calls detected".
+    // The framework already calls resetImplementation() at startup, so resetting here as well hits
+    // the second error. Reset lives in resetImplementation() alone.
+
+    // ⚠ Per-link CAMERAS. Re-parented here, after buildFromModel, because PawnSimApi creates every
+    // camera during PawnSimApi::initialize() — which runs BEFORE the URDF is parsed — and attaches
+    // it to the pawn root. The link components do not exist yet at that point, so the mount cannot
+    // be chosen when the camera is made; it has to be corrected once the robot exists.
+    //
+    // KeepRelativeTransform on purpose: the camera's X/Y/Z from settings is an offset from its
+    // mount, so it must survive the re-parent. Re-attaching with KeepWorldTransform would silently
+    // turn a "20 cm forward of the head" camera into "20 cm forward of wherever the head happened
+    // to be at spawn", which is right at spawn and wrong the moment the head moves.
+    for (const auto& cam_pair : vehicle_setting_->cameras) {
+        const std::string& link = cam_pair.second.link;
+        if (link.empty()) continue;  // root-mounted, which is PawnSimApi's default
+
+        USceneComponent* mount = pawn->getLinkComponent(link);
+        if (mount == nullptr) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: camera '",
+                cam_pair.first + "' names link '" + link + "', which is not in " + model_.name +
+                    " - left on the vehicle root",
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("camera '%s' names link '%s', which does not exist - left on the root"),
+                   UTF8_TO_TCHAR(cam_pair.first.c_str()), UTF8_TO_TCHAR(link.c_str()));
+            continue;
+        }
+
+        APIPCamera* camera = getCamera(cam_pair.first);
+        if (camera == nullptr) continue;
+        camera->AttachToComponent(mount, FAttachmentTransformRules::KeepRelativeTransform);
+        UE_LOG(LogUrdfBot, Log, TEXT("camera '%s' mounted on link '%s'"),
+               UTF8_TO_TCHAR(cam_pair.first.c_str()), UTF8_TO_TCHAR(link.c_str()));
+
+        // ⚠ Do NOT add an "hide what the camera is inside" rule here. One was written and removed.
+        //
+        // The symptom that motivated it — a tan border on Scene plus a Depth image reading
+        // 0.17-0.6 m across the WHOLE frame — is not occlusion at all. It is a STALE FIRST FRAME:
+        // the first request of any ImageType on this camera returns a render target that has not
+        // been captured yet. Measured with five consecutive DepthVis calls on 2026-08-17:
+        //
+        //     Rover call 0: min 0.079  max 0.7    med 0.351   <- cold, wrong
+        //     Rover call 1: min 0.008  max 165.0  med 0.184   <- correct, and stable thereafter
+        //     Car1  call 0: min 0.010  max 163.8  med 0.082   <- warm already, never wrong
+        //
+        // Car1's captures are activated during startup; a link-mounted camera's are not, which is
+        // why only URDF robots show it. The giveaway that it was never geometry: the cold depth
+        // image has the correct SCENE STRUCTURE (building, blocks, drone, horizon) at wrong values.
+        //
+        // A consumer must therefore discard the first capture from a URDF camera, or warm it once
+        // at startup. Hiding link meshes treats a symptom that does not exist and costs real
+        // visibility — a wrist camera that should see its own gripper would stop seeing it.
+    }
+
+    // ⚠ Instance segmentation is registered HERE, after buildFromModel, and the placement is the
+    // whole point. This is the recurring shape of every URDF integration bug so far: anything
+    // AirSim sets up in a startup pass misses a URDF robot, because at startup the robot does not
+    // exist yet. The annotator walks the level once at BeginPlay, when this pawn has no link
+    // components at all — the same reason sensors were never ticked and cameras were on the root.
+    //
+    // This call was previously removed, on the grounds that registering was worse than not
+    // registering: it made simListInstanceSegmentationObjects report 23 Rover_* objects that
+    // contributed ZERO pixels, because nothing could paint a procedural mesh. That was true, and it
+    // is now fixed at the root — FProceduralAnnotationSceneProxy — so registration once again means
+    // what it says.
+    {
+        ASimModeBase* sim_mode = nullptr;
+        for (TActorIterator<ASimModeBase> it(pawn->GetWorld()); it; ++it) {
+            sim_mode = *it;
+            break;
+        }
+        if (sim_mode == nullptr) {
+            // ⚠ At Error through UE_LOG, not through LogMessageString. An earlier revision used
+            // UAirBlueprintLib::FindActor<ASimModeBase>(pawn, TEXT("")), which matches on name or
+            // tag and so matches nothing for an empty string, and announced its failure on-screen
+            // only — where it was never seen.
+            UE_LOG(LogUrdfBot, Error,
+                   TEXT("no ASimModeBase in the world; '%s' will be ABSENT from Segmentation"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()));
+        }
+        else {
+            const bool ok = sim_mode->AddNewActorToInstanceSegmentation(pawn);
+
+            // ⚠ Do NOT add ForceUpdateInstanceSegmentation() here. One was added on the theory that
+            // the ShowOnlyComponents whitelist was missing these components; it is not.
+            // PaintRGBComponent adds each new annotation component to annotation_component_list_
+            // as it paints it, and AddNewActorToInstanceSegmentation then pushes that list to every
+            // camera. The whitelist is correct; a robot still absent from Segmentation is absent
+            // for some other reason, so look at the render path rather than re-adding this.
+            UE_LOG(LogUrdfBot, Log, TEXT("instance segmentation registration for '%s': %s"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()),
+                   ok ? TEXT("ok") : TEXT("FAILED - robot will be absent from Segmentation"));
+        }
+    }
 
     // A sensor that named a link the URDF does not have is now silently on the root. Say so — the
     // data it produces will look entirely reasonable and describe the wrong body.
@@ -546,6 +683,18 @@ void UrdfBotSimApi::applyDriveInput()
 {
     if (drive_joints_.empty() && steer_joints_.empty()) return;
 
+    // ⚠ API control wins, and the keyboard stands down completely.
+    //
+    // This loop writes EVERY drive and steer joint every physics step. Without this check an RPC
+    // command is overwritten 3 ms after it is issued — the call succeeds, returns cleanly, and the
+    // robot does not move. That is the worst shape of failure: a working API that silently does
+    // nothing, with the evidence 3 ms in the past.
+    //
+    // enableApiControl is the arbiter AirSim already uses for exactly this on cars and drones, so
+    // a client that knows those needs no new concept. api_control_enabled_ starts FALSE, so the
+    // keyboard keeps working until something asks for control.
+    if (vehicle_api_ != nullptr && vehicle_api_->isApiControlEnabled()) return;
+
     // Read the axes the game thread last wrote. Relaxed loads: a one-frame-old throttle is
     // indistinguishable from a key pressed one frame later, so there is nothing to order against.
     const auto* pawn = static_cast<const AUrdfBotPawn*>(getPawn());
@@ -611,6 +760,18 @@ void UrdfBotSimApi::update(float delta)
         const msr::airlib::TTimeDelta dt = clock->updateSince(last_update_time_);
 
         steps_taken_ += backend_->step(static_cast<double>(dt));
+
+        // ⚠ Tick the vehicle api, which is what drives the SENSORS. Every other vehicle type
+        // reaches this through its own chain (CarPawnSimApi -> CarPawnApi -> CarApiBase), and the
+        // urdfbot had no equivalent — so its IMU and LiDAR were built, mounted and never updated.
+        // They answered every RPC call with their initial sample, which looks exactly like a
+        // stationary robot.
+        //
+        // Called after the step so the sample describes the state the step just produced: the
+        // whole point of a urdfbot over a Chaos vehicle is that kinematics and sensor stamps are
+        // computed in the same executor iteration (§6.0b), and doing this before the step would
+        // throw that away.
+        if (vehicle_api_ != nullptr) vehicle_api_->update(delta);
 
         // Publish. Held only for the copy — the solve above is deliberately outside the lock, so
         // the game thread never waits on Box3D.
@@ -717,6 +878,13 @@ void UrdfBotSimApi::updateRendering(float dt)
 void UrdfBotSimApi::resetImplementation()
 {
     PawnSimApi::resetImplementation();
+
+    // ⚠ Outside the built_ guard on purpose. If the framework resets before the model has finished
+    // loading, a guarded reset would be skipped and the api would then be updated without ever
+    // having been reset — which throws on the physics thread every step and freezes the robot at
+    // its spawn pose with no error visible in the sim.
+    if (vehicle_api_ != nullptr) vehicle_api_->reset();
+
     if (built_) {
         // ⚠ Rebuilds the Box3D world rather than rewriting poses. Box3D has no rollback
         // determinism — contact caches, warm-start impulses and island state survive a pose write,

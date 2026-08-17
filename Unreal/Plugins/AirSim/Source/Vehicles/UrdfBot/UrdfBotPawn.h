@@ -54,6 +54,15 @@ public:
     /// the pawn is spawned before settings are read and cannot parse the file itself.
     void setVisualCollision(bool enabled) { visual_collision_ = enabled; }
 
+    /// Segmentation stencil ID for every mesh this robot draws.
+    ///
+    /// ⚠ Without this a URDF robot is INVISIBLE TO SEGMENTATION while appearing normally in Scene
+    /// and Depth. AirSim assigns stencil IDs in a startup pass (UAirBlueprintLib::
+    /// InitializeMeshStencilIDs); link components are created later, from the URDF, so they miss it
+    /// and render as background. One ID per robot rather than per link, because what another robot
+    /// needs to answer is "which vehicle is that", not "which bracket is that".
+    void setSegmentationId(int id) { segmentation_id_ = id; }
+
     /// Shading switches, settable from settings.json so a shading problem can be bisected without a
     /// rebuild between attempts. See AirSimSettings for what each one tests.
     void setMeshShading(bool cast_shadow, bool smooth_normals, bool flip_winding,
@@ -145,6 +154,7 @@ private:
     /// other robot's. It exists because runtime tri-mesh cooking dominates spawn time on a
     /// mesh-heavy robot, and while iterating on something else that trade is sometimes worth it.
     bool visual_collision_ = true;
+    int segmentation_id_ = -1;
     bool mesh_cast_shadow_ = true;
     bool mesh_smooth_normals_ = false;
     bool mesh_flip_winding_ = false;

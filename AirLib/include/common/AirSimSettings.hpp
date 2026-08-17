@@ -330,6 +330,17 @@ namespace airlib
             bool external_ned = true;                         // define if the external sensor coordinates should be reported back by the API in local NED or Unreal coordinates
             bool draw_sensor = false;
 
+            /// URDF link this camera is mounted on. Empty means the vehicle root, which is what
+            /// every non-URDF vehicle wants and what PawnSimApi does by default.
+            ///
+            /// ⚠ A URDF robot's sensible camera mounts are its own links — a mast, a head, a
+            /// gripper — and only the URDF knows they exist. Sensors already accept a "Link" key;
+            /// this gives cameras the same, so a robot's perception rig can be described where the
+            /// robot is described. An unresolvable name is reported and falls back to the root,
+            /// never silently ignored: a camera quietly on the wrong body produces imagery that
+            /// looks entirely plausible and is wrong.
+            std::string link;
+
             GimbalSetting gimbal;
             CaptureSettingsMap capture_settings;
             NoiseSettingsMap noise_settings;
@@ -516,6 +527,19 @@ namespace airlib
             // material parameter, unbuilt reflection captures — each costing a rebuild. They are
             // settings rather than constants so the remaining candidates can be bisected from JSON,
             // one variable per run, without a rebuild between attempts.
+
+            /// Segmentation stencil ID for this robot, or -1 to derive one from the vehicle name.
+            ///
+            /// ⚠ Without a stencil value a URDF robot is INVISIBLE TO SEGMENTATION while appearing
+            /// normally in Scene and Depth — AirSim assigns IDs in a startup pass, and link
+            /// components are built later from the URDF, so they miss it. Measured: the rover was
+            /// plainly visible in another robot's Scene and Depth captures and absent from its
+            /// Segmentation.
+            ///
+            /// One ID per ROBOT, not per link: what another robot needs from segmentation is "which
+            /// vehicle is that", not "which bracket is that". Derived from the vehicle name so it is
+            /// stable across runs, and 1..254 because 0 means unsegmented and 255 is reserved.
+            int urdf_segmentation_id = -1;
 
             /// Content path holding pre-imported UStaticMesh assets for this robot's <mesh>
             /// visuals, e.g. "/Game/Robots/ExoMy". Empty disables the lookup.
@@ -1404,6 +1428,8 @@ namespace airlib
                     settings_json.getBool("UrdfVisualCollision", true);
                 vehicle_setting->urdf_mesh_base_material =
                     settings_json.getBool("UrdfMeshBaseMaterial", false);
+                vehicle_setting->urdf_segmentation_id =
+                    settings_json.getInt("UrdfSegmentationId", -1);
                 vehicle_setting->urdf_mesh_asset_dir =
                     settings_json.getString("UrdfMeshAssetDir", "");
                 vehicle_setting->urdf_mesh_asset_scale =
@@ -1900,6 +1926,7 @@ namespace airlib
             setting.rotation = createRotationSetting(settings_json, setting.rotation);
 
             setting.external = settings_json.getBool("External", setting.external);
+            setting.link = settings_json.getString("Link", setting.link);
             setting.external_ned = settings_json.getBool("ExternalLocal", setting.external_ned);
             setting.draw_sensor = settings_json.getBool("DrawSensor", setting.draw_sensor);
 

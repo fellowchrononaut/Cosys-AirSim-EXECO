@@ -74,6 +74,35 @@ namespace airlib
         virtual const SensorCollection& getSensors() const override { return sensors_; }
         SensorCollection& getSensors() { return sensors_; }
 
+        /// ⚠ Ticking the sensors is NOT automatic, and forgetting it is silent.
+        ///
+        /// Sensors are created, mounted on their links, and answer RPC calls whether or not
+        /// anything ever updates them — they simply return their initial sample forever. Measured
+        /// on a live simulator before this existed: the IMU returned 40 samples across 2 s with
+        /// **one distinct timestamp**, and the LiDAR returned **0 points**, while every call
+        /// succeeded and every camera worked. Nothing in the API surface distinguishes a frozen
+        /// sensor from a stationary robot.
+        ///
+        /// This mirrors CarApiBase::update exactly; the urdfbot simply never had it.
+        virtual void update(float delta = 0) override
+        {
+            VehicleApiBase::update(delta);
+            getSensors().update(delta);
+        }
+
+        /// ⚠ Sensors are reset LAST, after their ground truth has been reset — same ordering and
+        /// same reason as CarApiBase. A sensor reset before the kinematics it samples would take
+        /// its first sample from the previous run's state.
+        virtual void resetImplementation() override
+        {
+            getSensors().reset();
+        }
+
+        virtual void reportState(StateReporter& reporter) override
+        {
+            getSensors().reportState(reporter);
+        }
+
         /// Build the sensors declared in settings. Identical in shape to every other vehicle type;
         /// what differs is that the factory has been given a link map first, so a sensor naming a
         /// link is mounted on that link rather than on the robot's root.
@@ -90,7 +119,14 @@ namespace airlib
         }
 
     protected:
-        bool api_control_enabled_ = true;
+        /// ⚠ FALSE by default, so the keyboard works on a freshly loaded robot and a client must
+        /// take control explicitly — the same handshake every other AirSim vehicle uses.
+        ///
+        /// This is not cosmetic. The keyboard drive loop writes EVERY drive and steer joint on
+        /// every physics step, so with both active an RPC command is overwritten 3 ms after it is
+        /// issued: the call succeeds, returns, and does nothing. Two controllers on one joint need
+        /// an arbiter, and enableApiControl is the one AirSim already provides.
+        bool api_control_enabled_ = false;
 
         std::shared_ptr<SensorFactory> sensor_factory_;
         SensorCollection sensors_;

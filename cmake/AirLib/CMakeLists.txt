@@ -28,6 +28,7 @@ file(GLOB_RECURSE ${PROJECT_NAME}_sources
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/vehicles/computervision/api/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/vehicles/multirotor/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/vehicles/multirotor/api/*.cpp
+  ${AIRSIM_ROOT}/${PROJECT_NAME}/src/vehicles/urdfbot/api/*.cpp
 )
 
 # ⚠ Non-recursive GLOB on purpose. The call above is GLOB_RECURSE, so listing src/urdf/*.cpp there

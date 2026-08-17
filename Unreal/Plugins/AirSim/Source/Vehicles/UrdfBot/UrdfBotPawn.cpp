@@ -137,6 +137,19 @@ void AUrdfBotPawn::onStop()
     drive_input_.steering.store(0.0f, std::memory_order_relaxed);
 }
 
+
+/// Apply this robot's segmentation stencil to a freshly created mesh component.
+///
+/// ⚠ Called for EVERY drawing path — procedural mesh, imported static-mesh asset, and the
+/// box/cylinder/sphere primitives — because a robot that segments correctly only when drawn one
+/// particular way is worse than one that never segments at all: the gap moves with the settings.
+static void applySegmentationId(UPrimitiveComponent* c, int id)
+{
+    if (c == nullptr || id < 0) return;
+    c->SetCustomDepthStencilValue(id);
+    c->SetRenderCustomDepth(true);
+}
+
 UStaticMesh* AUrdfBotPawn::resolveVisualMesh(const urdf::Geometry& geometry) const
 {
     switch (geometry.type) {
@@ -201,6 +214,7 @@ void AUrdfBotPawn::attachGeometry(USceneComponent* link_component, const urdf::G
     rel.SetScale3D(scale);
     c->SetRelativeTransform(rel);
     c->RegisterComponent();
+    applySegmentationId(c, segmentation_id_);
 }
 
 bool AUrdfBotPawn::attachStaticMeshAsset(USceneComponent* link_component, const urdf::Geometry& g,
@@ -259,6 +273,7 @@ bool AUrdfBotPawn::attachStaticMeshAsset(USceneComponent* link_component, const 
                            static_cast<float>(g.mesh_scale.z * k)));
     c->SetRelativeTransform(rel);
     c->RegisterComponent();
+    applySegmentationId(c, segmentation_id_);
 
     // ⚠ The asset's own materials are kept. Importing a mesh is how an operator supplies the
     // robot's appearance, so overriding it with the URDF's flat <material> colour would discard
@@ -619,6 +634,7 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     // Scale is baked into the vertices above, so only the <origin> transform is carried here.
     c->SetRelativeTransform(UrdfTransform::toFTransform(origin, world_to_meters));
     if (!c->IsRegistered()) c->RegisterComponent();
+    applySegmentationId(c, segmentation_id_);
     return true;
 }
 

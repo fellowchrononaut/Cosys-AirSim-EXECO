@@ -68,4 +68,18 @@ private:
 
 	FPrimitiveSceneProxy* CreateSceneProxy(UStaticMeshComponent* StaticMeshComponent);
 	FPrimitiveSceneProxy* CreateSceneProxy(USkeletalMeshComponent* SkeletalMeshComponent);
+
+	/// ⚠ Third parent type, added for URDF robots, whose links are built at runtime from <mesh>
+	/// files and so have no UStaticMesh asset to point at.
+	///
+	/// Unlike the two above, this one CANNOT subclass the engine's proxy: FProceduralMeshSceneProxy
+	/// is declared `final` inside ProceduralMeshComponent.cpp (a Private translation unit) and is
+	/// reachable from no public header. The annotation proxy therefore derives from
+	/// FPrimitiveSceneProxy directly and rebuilds the render data from the parent's sections, which
+	/// are reachable through the public GetNumSections()/GetProcMeshSection() accessors.
+	///
+	/// Nothing else about the mechanism changes: the component still ends up in the segmentation
+	/// capture's ShowOnlyComponents whitelist alongside the static and skeletal ones, so
+	/// simListInstanceSegmentationObjects and the colour map stay consistent across all three.
+	FPrimitiveSceneProxy* CreateSceneProxy(class UProceduralMeshComponent* ProcMeshComponent);
 };

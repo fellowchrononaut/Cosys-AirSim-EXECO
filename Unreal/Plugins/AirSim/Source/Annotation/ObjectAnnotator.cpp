@@ -8,6 +8,7 @@
 #include "Runtime/Launch/Resources/Version.h"
 #include "AnnotationComponent.h"
 #include "AirBlueprintLib.h"
+#include "ProceduralMeshComponent.h"
 
 // For UE4 < 17
 // check https://github.com/unrealcv/unrealcv/blob/1369a72be8428547318d8a52ae2d63e1eb57a001/Source/UnrealCV/Private/Controller/ObjectAnnotator.cpp#L1
@@ -131,6 +132,12 @@ void FObjectAnnotator::getPaintableComponentMeshes(AActor* actor, TMap<FString, 
 				component_name.Append(FString::FromInt(PersistentPrimitiveIndex));
 				paintable_components_meshes->Emplace(component_name, component);
 			}
+			if (UProceduralMeshComponent* proc_component = Cast<UProceduralMeshComponent>(component)) {
+				FString component_name = actor->GetName();
+				component_name.Append("_");
+				component_name.Append(FString::FromInt(PersistentPrimitiveIndex));
+				paintable_components_meshes->Emplace(component_name, component);
+			}
 		}
 		else {
 			FString component_name;
@@ -158,6 +165,18 @@ void FObjectAnnotator::getPaintableComponentMeshes(AActor* actor, TMap<FString, 
 			}
 			if (USkinnedMeshComponent* skinnedmesh_component = Cast<USkinnedMeshComponent>(component)) {
 				component_name = actor->GetName();
+				component_name.Append("_");
+				component_name.Append(FString::FromInt(PersistentPrimitiveIndex));
+				paintable_components_meshes->Emplace(component_name, component);
+				index++;
+			}
+			// ⚠ Procedural meshes. A URDF robot's links are built at runtime from <mesh> files, so
+			// there is no UStaticMesh asset to take a name from and the component's own name is the
+			// only stable identity it has. Without this branch such a robot is enumerated by
+			// nothing at all, and its Segmentation image is simply empty — a silent zero-pixel
+			// result that looks identical to a rendering failure.
+			if (UProceduralMeshComponent* proc_component = Cast<UProceduralMeshComponent>(component)) {
+				component_name = component->GetName();
 				component_name.Append("_");
 				component_name.Append(FString::FromInt(PersistentPrimitiveIndex));
 				paintable_components_meshes->Emplace(component_name, component);
@@ -242,6 +261,15 @@ void FObjectAnnotator::getPaintableComponentMeshesAndTags(AActor* actor, TMap<FS
 				paintable_components_tags->Emplace(component_name, SkinnedMeshComponent->ComponentTags);
 				paintable_components_meshes->Emplace(component_name, component);
 			}
+			if (UProceduralMeshComponent* proc_component = Cast<UProceduralMeshComponent>(component)) {
+				FString component_name = actor->GetName();
+				component_name.Append("_");
+				component_name.Append(FString::FromInt(PersistentPrimitiveIndex));
+				if (actor->Tags.Num() > 0)
+					paintable_components_tags->Emplace(component_name, actor->Tags);
+				paintable_components_tags->Emplace(component_name, proc_component->ComponentTags);
+				paintable_components_meshes->Emplace(component_name, component);
+			}
 		}
 		else {
 			FString component_name;
@@ -267,6 +295,14 @@ void FObjectAnnotator::getPaintableComponentMeshesAndTags(AActor* actor, TMap<FS
 					paintable_components_meshes->Emplace(component_name, component);
 					index++;
 				}
+			}
+			if (UProceduralMeshComponent* proc_component = Cast<UProceduralMeshComponent>(component)) {
+				component_name = component->GetName();
+				component_name.Append("_");
+				component_name.Append(FString::FromInt(PersistentPrimitiveIndex));
+				paintable_components_tags->Emplace(component_name, proc_component->ComponentTags);
+				paintable_components_meshes->Emplace(component_name, component);
+				index++;
 			}
 			if (USkinnedMeshComponent* skinnedmesh_component = Cast<USkinnedMeshComponent>(component)) {
 				component_name = actor->GetName();
@@ -1052,6 +1088,36 @@ bool FObjectAnnotator::PaintRGBComponent(UMeshComponent* component, const FColor
 	AnnotationComponent->MarkRenderStateDirty();
 	UPrimitiveComponent* PrimitiveComponent = Cast<UPrimitiveComponent>(AnnotationComponent);
 	annotation_component_list_.Add(PrimitiveComponent);
+
+	// ⚠ One-shot state dump for a procedural parent, taken on the GAME THREAD after registration,
+	// where these values are actually populated. Reading them inside the scene proxy's constructor
+	// gives zeros for every primitive and means nothing.
+	//
+	// The open question this answers: a procedural annotation proxy is constructed (confirmed, 69
+	// times) but GetViewRelevance is never called on it (confirmed, 0 times), so it is rejected
+	// before visibility. The usual causes are all visible here.
+	if (Cast<UProceduralMeshComponent>(component))
+	{
+		static bool bLoggedProcState = false;
+		if (!bLoggedProcState)
+		{
+			bLoggedProcState = true;
+			const FBoxSphereBounds B = AnnotationComponent->Bounds;
+			UE_LOG(LogTemp, Log,
+				   TEXT("AirSim Annotation: procedural annotation state '%s' - registered=%d visible=%d "
+						"hiddenInGame=%d shouldRender=%d hasProxy=%d extent=(%.1f,%.1f,%.1f) radius=%.1f "
+						"parentVisible=%d parentBoundsRadius=%.1f"),
+				   *newName,
+				   AnnotationComponent->IsRegistered() ? 1 : 0,
+				   AnnotationComponent->IsVisible() ? 1 : 0,
+				   AnnotationComponent->bHiddenInGame ? 1 : 0,
+				   AnnotationComponent->ShouldRender() ? 1 : 0,
+				   AnnotationComponent->SceneProxy != nullptr ? 1 : 0,
+				   B.BoxExtent.X, B.BoxExtent.Y, B.BoxExtent.Z, B.SphereRadius,
+				   component->IsVisible() ? 1 : 0,
+				   component->Bounds.SphereRadius);
+		}
+	}
 	return true;
 }
 
