@@ -812,6 +812,12 @@ void Box3DRobot::stepOnce()
                                   /*wake=*/true);
     }
 
+    // ⚠ IMMEDIATELY before the solve, and every single step. Box3D clears applied forces and
+    // torques after each step, so a torque issued once is felt for one step and then vanishes —
+    // which reads as a controller that twitches at the step rate rather than as a missing
+    // re-application. The Wrench documentation in UrdfRobotBackend.hpp says the same thing.
+    applyJointTorques();
+
     b3World_Step(world_, static_cast<float>(opts_.fixed_timestep), opts_.substeps);
     ++steps_taken_;
 }
@@ -878,7 +884,21 @@ JointState Box3DRobot::jointState(size_t i) const
     case urdf::JointType::Revolute:
     case urdf::JointType::Continuous: {
         s.position = b3RevoluteJoint_GetAngle(r.joint);
-        s.effort = b3RevoluteJoint_GetMotorTorque(r.joint);
+        // ⚠ In Effort mode the motor is OFF and the torque is applied externally, so
+        // GetMotorTorque reads zero. Report the torque we actually applied — clamped exactly as
+        // applyJointTorques clamps it — or `effort` would say the joint is unloaded while it is
+        // being driven, which is a silent lie to any client logging it.
+        if (r.mode == ControlMode::Effort) {
+            double tau = r.target;
+            if (r.effort_limit > 0.0) {
+                if (tau > r.effort_limit) tau = r.effort_limit;
+                else if (tau < -r.effort_limit) tau = -r.effort_limit;
+            }
+            s.effort = tau;
+        }
+        else {
+            s.effort = b3RevoluteJoint_GetMotorTorque(r.joint);
+        }
         // ⚠ Box3D has b3PrismaticJoint_GetSpeed but **no revolute equivalent**. Joint velocity is
         // therefore derived: project the child's angular velocity relative to the parent onto the
         // joint axis, expressed in world coordinates.
@@ -940,6 +960,48 @@ void Box3DRobot::applyWrench(size_t link, const double force_world[3],
         b3Body_ApplyForce(rec.body, f, p, true);
     }
     b3Body_ApplyTorque(rec.body, t, true);
+}
+
+void Box3DRobot::applyJointTorques()
+{
+    for (const JointRec& r : joints_) {
+        if (r.mode != ControlMode::Effort) continue;
+        if (r.parent_link < 0 || r.child_link < 0) continue;
+        if (r.type != urdf::JointType::Revolute && r.type != urdf::JointType::Continuous) continue;
+
+        // ⚠ Clamp to the URDF's <limit effort>. That figure is a CEILING the robot's actuators
+        // could really produce, and honouring it is what stops a client commanding a torque no
+        // motor could deliver and getting a robot that behaves impossibly. An absent or zero
+        // effort means unlimited (a `continuous` joint legitimately carries none).
+        double tau = r.target;
+        if (r.effort_limit > 0.0) {
+            if (tau > r.effort_limit) tau = r.effort_limit;
+            else if (tau < -r.effort_limit) tau = -r.effort_limit;
+        }
+        if (tau == 0.0) continue;
+
+        // The hinge axis in WORLD coordinates. Taken from the child body's current rotation, the
+        // same way getJointState derives joint velocity, so the two cannot disagree about which
+        // way the joint points.
+        const b3Quat qc = b3Body_GetRotation(links_[r.child_link].body);
+        const b3Vec3 axis_world = rotate(qc, r.axis_child);
+        const b3Vec3 t{ static_cast<float>(axis_world.x * tau),
+                        static_cast<float>(axis_world.y * tau),
+                        static_cast<float>(axis_world.z * tau) };
+        const b3Vec3 anti{ -t.x, -t.y, -t.z };
+
+        // ⚠ EQUAL AND OPPOSITE. A joint torque is an internal force pair: +tau on the child about
+        // the axis, -tau on the parent. Applying only the child half would inject net angular
+        // momentum into the world every step — the robot would slowly spin up from nothing, which
+        // looks like a solver instability and is not one.
+        //
+        // A kinematic link has no dynamics to push on, so the reaction is simply absorbed; that is
+        // correct for a link the operator declared kinematic, and it is what a fixed base is.
+        if (!links_[r.child_link].kinematic)
+            b3Body_ApplyTorque(links_[r.child_link].body, t, true);
+        if (!links_[r.parent_link].kinematic)
+            b3Body_ApplyTorque(links_[r.parent_link].body, anti, true);
+    }
 }
 
 void Box3DRobot::setControlMode(size_t joint, ControlMode mode)
@@ -1017,12 +1079,20 @@ void Box3DRobot::setTarget(size_t joint, double value)
             b3RevoluteJoint_SetMotorSpeed(r.joint, static_cast<float>(value));
             break;
         case ControlMode::Effort:
-            // Box3D has no direct torque input on a revolute joint. Effort control is expressed as
-            // an unreachable speed capped by the requested torque, which is the standard idiom and
-            // the one robox3d uses.
-            b3RevoluteJoint_EnableMotor(r.joint, true);
-            b3RevoluteJoint_SetMaxMotorTorque(r.joint, static_cast<float>(std::fabs(value)));
-            b3RevoluteJoint_SetMotorSpeed(r.joint, value >= 0 ? 1e4f : -1e4f);
+            // ⚠ A REAL TORQUE since 2026-08-18. This used to be an idiom: motor on, max torque set
+            // to |value|, motor speed slammed to +-1e4 so the joint chased an unreachable speed and
+            // the cap did the work. That produces roughly the right magnitude and is NOT a torque
+            // source — the applied torque is whatever the solver needs to chase the speed, so it
+            // collapses to zero the moment the joint reaches the commanded direction freely, and it
+            // cannot hold a joint against a load in the direction it is already moving.
+            //
+            // That mattered the moment a locomotion policy appeared: every legged controller is
+            // `tau = kp*(q* - q) - kd*qd`, and there was nothing here to apply tau with.
+            //
+            // Applied instead as equal-and-opposite torques about the joint axis on the two bodies
+            // (see applyJointTorques, called from stepOnce). The motor stays OFF so it cannot fight
+            // the applied torque.
+            b3RevoluteJoint_EnableMotor(r.joint, false);
             break;
         case ControlMode::None:
             break;

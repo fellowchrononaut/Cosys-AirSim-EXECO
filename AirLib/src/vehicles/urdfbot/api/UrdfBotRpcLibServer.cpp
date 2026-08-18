@@ -84,6 +84,10 @@ namespace airlib
             getVehicleApi(vehicle_name)->setDriveCommand(throttle, steering);
         });
 
+        (static_cast<rpc::server*>(getServer()))->bind("setJointTorques", [&](const std::vector<std::string>& joints, const std::vector<double>& values, const std::string& vehicle_name) -> void {
+            getVehicleApi(vehicle_name)->setJointTorques(joints, values);
+        });
+
         (static_cast<rpc::server*>(getServer()))->bind("setJointEffort", [&](const std::string& joint, double value, const std::string& vehicle_name) -> void {
             getVehicleApi(vehicle_name)->setJointEffort(joint, value);
         });

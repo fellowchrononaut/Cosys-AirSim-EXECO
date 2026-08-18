@@ -108,6 +108,14 @@ namespace airlib
         return out;
     }
 
+    void UrdfBotRpcLibClient::setJointTorques(const std::vector<std::string>& joints,
+                                             const std::vector<double>& newton_metres,
+                                             const std::string& vehicle_name)
+    {
+        static_cast<rpc::client*>(getClient())
+            ->call("setJointTorques", joints, newton_metres, vehicle_name);
+    }
+
     UrdfBotApiBase::UrdfBotState UrdfBotRpcLibClient::getUrdfBotState(const std::string& vehicle_name)
     {
         return static_cast<rpc::client*>(getClient())

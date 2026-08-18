@@ -46,6 +46,13 @@ namespace airlib
 
         void setJointEffort(const std::string& joint, double newton_metres,
                             const std::string& vehicle_name = "");
+
+        /// Every joint's torque in one call, applied together. Prefer this over N setJointEffort
+        /// calls for any controller running a loop: N calls land at N instants, and the torques
+        /// were computed from a single snapshot.
+        void setJointTorques(const std::vector<std::string>& joints,
+                             const std::vector<double>& newton_metres,
+                             const std::string& vehicle_name = "");
         void setJointPositionGains(const std::string& joint, double hertz, double damping_ratio,
                                    const std::string& vehicle_name = "");
 

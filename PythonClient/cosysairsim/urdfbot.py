@@ -117,6 +117,25 @@ class UrdfBotClient:
         an idiom, not a torque source."""
         self.client.call('setJointEffort', joint, float(newton_metres), vehicle_name)
 
+    def setJointTorques(self, joints, newton_metres, vehicle_name=''):
+        """Every joint's torque in ONE call, applied together.
+
+        ⚠ Use this, not N setJointEffort calls, for anything running a control loop. A legged
+        controller is ``tau = kp*(q* - q) - kd*qd`` evaluated on ONE snapshot of the robot; the
+        torques it produces describe a single instant. Sent separately they land at N different
+        instants, each on a slightly different robot — the actuation mirror of the smear that
+        getJointStates exists to avoid. At a quadruped's 50 Hz it is also 600 round trips a second
+        rather than 50.
+
+        ⚠ Torque is CLAMPED per joint to the URDF's <limit effort>, the ceiling the real actuator
+        could produce. getJointStates reports the clamped value back as ``effort``.
+
+        ⚠ All-or-nothing: a name the robot does not have raises, and no torque is applied. A
+        controller silently driving eleven of twelve legs is the failure mode this avoids.
+        """
+        self.client.call('setJointTorques', list(joints),
+                         [float(v) for v in newton_metres], vehicle_name)
+
     def setJointPositionGains(self, joint, hertz, damping_ratio, vehicle_name=''):
         """⚠ Keep hertz below half the physics rate. The sim steps at 3 ms, so the Nyquist ceiling
         is about 166 Hz; 40 Hz with damping 1.0 is what the rover's steering uses."""

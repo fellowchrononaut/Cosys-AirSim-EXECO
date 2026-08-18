@@ -116,6 +116,26 @@ namespace airlib
         virtual void setJointPosition(const std::string& joint, double radians_or_metres) = 0;
         virtual void setJointVelocity(const std::string& joint, double per_second) = 0;
         virtual void setJointEffort(const std::string& joint, double newton_metres) = 0;
+
+        /// Every joint's torque in ONE call, applied together.
+        ///
+        /// ⚠ Not a convenience wrapper over setJointEffort, for the same reason getJointStates is
+        /// not one over getJointState. A legged controller is `tau = kp*(q* - q) - kd*qd` evaluated
+        /// on ONE snapshot of the robot, and the twelve torques it produces describe one instant.
+        /// Sent as twelve separate calls they land at twelve different instants, each on a slightly
+        /// different robot — the actuation equivalent of the smear that batching joint states
+        /// exists to avoid. At a quadruped's 50 Hz that is also 600 round trips a second instead of
+        /// 50.
+        ///
+        /// ⚠ The torque is CLAMPED to each joint's URDF <limit effort>. That figure is a ceiling
+        /// the real actuator could produce; a client that exceeds it would otherwise get a robot no
+        /// hardware could reproduce.
+        ///
+        /// Joints not named keep whatever they were doing. Naming a joint the robot does not have
+        /// is an error rather than a silent skip — a controller quietly driving eleven of twelve
+        /// legs is the failure this workstream exists to avoid.
+        virtual void setJointTorques(const std::vector<std::string>& joints,
+                                     const std::vector<double>& newton_metres) = 0;
         virtual void setJointPositionGains(const std::string& joint, double hertz,
                                            double damping_ratio) = 0;
 

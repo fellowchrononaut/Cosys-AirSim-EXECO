@@ -184,6 +184,12 @@ public:
     void setPositionGains(size_t joint, double hertz, double damping_ratio);
     void setTarget(size_t joint, double value);
 
+    /// Re-apply every Effort-mode joint's torque for the step that is about to run.
+    ///
+    /// ⚠ Called from stepOnce, not from setTarget. Box3D clears applied forces after each step, so
+    /// a torque set once would be felt for a single step and then disappear.
+    void applyJointTorques();
+
     /// Apply a world-frame force and torque to one link for the next step.
     ///
     /// ⚠ Box3D clears applied forces on every step, so this must be re-issued each step for a

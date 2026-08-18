@@ -93,6 +93,28 @@ namespace
         {
             command(joint, urdf::ControlMode::Effort, v);
         }
+
+        void setJointTorques(const std::vector<std::string>& joints,
+                             const std::vector<double>& values) override
+        {
+            if (joints.size() != values.size())
+                throw std::invalid_argument(
+                    "setJointTorques: " + std::to_string(joints.size()) + " joint name(s) but " +
+                    std::to_string(values.size()) + " torque(s)");
+
+            // ⚠ RESOLVE EVERY NAME BEFORE APPLYING ANY TORQUE. A controller that gets eleven of
+            // twelve legs actuated is worse than one that gets none: the robot moves, plausibly,
+            // and the missing joint is invisible until something falls over. requireJoint throws on
+            // a name the robot does not have, so doing the whole lookup pass first makes the call
+            // all-or-nothing.
+            std::vector<size_t> idx;
+            idx.reserve(joints.size());
+            for (const std::string& j : joints)
+                idx.push_back(static_cast<size_t>(requireJoint(j)));
+
+            for (size_t i = 0; i < idx.size(); ++i)
+                backend_->setJointTarget(idx[i], urdf::ControlMode::Effort, values[i]);
+        }
         void setJointPositionGains(const std::string& joint, double hertz, double ratio) override
         {
             backend_->setPositionGains(static_cast<size_t>(requireJoint(joint)), hertz, ratio);
