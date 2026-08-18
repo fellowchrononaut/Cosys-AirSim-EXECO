@@ -1,5 +1,6 @@
 #include "urdf/backends/Box3DRobot.hpp"
 
+#include "urdf/UrdfConvexDecomposition.hpp"
 #include "urdf/UrdfMesh.hpp"
 
 #include "urdf/backends/Box3DMath.hpp"
@@ -51,6 +52,8 @@ void Box3DRobot::destroyWorld()
     joints_.clear();
     mimic_.clear();
     hull_budget_reductions_.clear();
+    decompositions_.clear();
+    decomposition_fallbacks_.clear();
     massless_markers_.clear();
     accumulator_ = 0;
     steps_taken_ = 0;
@@ -355,42 +358,74 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
                                          "' has too few vertices to hull (" +
                                          std::to_string(mesh.vertices.size()) + ").");
 
-            std::vector<b3Vec3> pts;
-            pts.reserve(mesh.vertices.size());
-            for (const urdf::Vec3& v : mesh.vertices)
-                pts.push_back(b3Vec3{ static_cast<float>(v.x * col.geometry.mesh_scale.x),
-                                      static_cast<float>(v.y * col.geometry.mesh_scale.y),
-                                      static_cast<float>(v.z * col.geometry.mesh_scale.z) });
+            // ⚠ ONE HULL PER *PART*, not one per mesh — this is where the comment above stops
+            // being a limitation and becomes a fallback. decomposeConvexSoup returns several
+            // convex pieces when CoACD is present and the input as a single piece when it is not,
+            // so the loop below is identical in both builds and a build without CoACD produces
+            // byte-identical geometry to the one before CoACD existed.
+            const urdf::DecompositionResult decomp =
+                urdf::decomposeConvexSoup(mesh.vertices, opts_.decomposition);
 
-            // ⚠ Box3D's hull builder has a hard ceiling of **255 half-edges**, which is not the
-            // same constraint as the vertex budget and is not checkable in advance: a 64-vertex
-            // budget produced 264 half-edges on ExoMy's base_link and was refused outright. So the
-            // budget is walked down until one is accepted rather than failing on the first try.
-            //
-            // Halving is the right ladder because the failure is a *topology* limit: a hull that
-            // overflows at 64 vertices is not going to fit by shaving two off.
-            b3HullData* hull = nullptr;
-            int budget = opts_.max_hull_vertices;
-            for (; budget >= 8; budget /= 2) {
-                hull = b3CreateHull(pts.data(), static_cast<int>(pts.size()), budget);
-                if (hull != nullptr) break;
+            if (decomp.decomposed)
+                decompositions_.push_back({ link.name, resolved, decomp.parts.size(),
+                                            decomp.seconds, decomp.from_cache });
+            else if (mesh.triangles > 12)
+                // Only worth reporting for a mesh big enough to have had a shape worth recovering.
+                // A four-triangle collision box falling back is not news.
+                decomposition_fallbacks_.push_back({ link.name, resolved, decomp.note });
+
+            for (const urdf::ConvexPart& part : decomp.parts) {
+                std::vector<b3Vec3> pts;
+                pts.reserve(part.points.size());
+                for (const urdf::Vec3& v : part.points)
+                    pts.push_back(b3Vec3{ static_cast<float>(v.x * col.geometry.mesh_scale.x),
+                                          static_cast<float>(v.y * col.geometry.mesh_scale.y),
+                                          static_cast<float>(v.z * col.geometry.mesh_scale.z) });
+                if (pts.size() < 4) continue;   // a degenerate part is dropped, not fatal
+
+                // ⚠ Box3D's hull builder has a hard ceiling of **255 half-edges**, which is not
+                // the same constraint as the vertex budget and is not checkable in advance: a
+                // 64-vertex budget produced 264 half-edges on ExoMy's base_link and was refused
+                // outright. So the budget is walked down until one is accepted rather than failing
+                // on the first try.
+                //
+                // Halving is the right ladder because the failure is a *topology* limit: a hull
+                // that overflows at 64 vertices is not going to fit by shaving two off.
+                //
+                // ⚠ Decomposition makes this ceiling much easier to live with, incidentally: each
+                // part is a simpler solid than the whole mesh, so budgets that were refused for
+                // the union are routinely accepted per part.
+                b3HullData* hull = nullptr;
+                int budget = opts_.max_hull_vertices;
+                for (; budget >= 8; budget /= 2) {
+                    hull = b3CreateHull(pts.data(), static_cast<int>(pts.size()), budget);
+                    if (hull != nullptr) break;
+                }
+                if (hull == nullptr) {
+                    // ⚠ Fatal only when the WHOLE mesh produced nothing. With a decomposition, one
+                    // refused part out of fourteen is a small hole; refusing to load the robot
+                    // over it would be a worse outcome than the hole.
+                    if (decomp.parts.size() == 1)
+                        throw std::runtime_error(
+                            "link '" + link.name + "': b3CreateHull rejected mesh '" + resolved +
+                            "' at every vertex budget from " +
+                            std::to_string(opts_.max_hull_vertices) +
+                            " down to 8 (degenerate or coplanar point cloud).");
+                    hull_budget_reductions_.push_back({ link.name, opts_.max_hull_vertices, 0 });
+                    continue;
+                }
+
+                // Recorded, not swallowed. A coarser hull is a *different shape* from the one the
+                // operator thinks is being simulated, and the difference grows as the budget falls.
+                if (budget < opts_.max_hull_vertices)
+                    hull_budget_reductions_.push_back({ link.name, opts_.max_hull_vertices, budget });
+
+                // b3CreateHullShape and b3CreateTransformedHullShape both CLONE the hull, so ours
+                // is freed immediately. (b3CreateMeshShape does not clone — the two differ, and
+                // the static-geometry cache depends on that difference.)
+                b3CreateTransformedHullShape(body, &sd, hull, xf, b3Vec3_one);
+                b3DestroyHull(hull);
             }
-            if (hull == nullptr)
-                throw std::runtime_error("link '" + link.name + "': b3CreateHull rejected mesh '" +
-                                         resolved + "' at every vertex budget from " +
-                                         std::to_string(opts_.max_hull_vertices) +
-                                         " down to 8 (degenerate or coplanar point cloud).");
-
-            // Recorded, not swallowed. A coarser hull is a *different shape* from the one the
-            // operator thinks is being simulated, and the difference grows as the budget falls.
-            if (budget < opts_.max_hull_vertices)
-                hull_budget_reductions_.push_back({ link.name, opts_.max_hull_vertices, budget });
-
-            // b3CreateHullShape and b3CreateTransformedHullShape both CLONE the hull, so ours is
-            // freed immediately. (b3CreateMeshShape does not clone — the two differ, and the
-            // static-geometry cache depends on that difference.)
-            b3CreateTransformedHullShape(body, &sd, hull, xf, b3Vec3_one);
-            b3DestroyHull(hull);
             break;
         }
         }

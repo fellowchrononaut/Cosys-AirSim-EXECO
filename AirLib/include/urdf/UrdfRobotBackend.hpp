@@ -17,6 +17,7 @@
 // engine type through this interface defeats its purpose.
 #pragma once
 
+#include "urdf/UrdfConvexDecomposition.hpp"
 #include "urdf/UrdfMimic.hpp"
 #include "urdf/UrdfModel.hpp"
 #include "urdf/UrdfStaticWorld.hpp"
@@ -67,6 +68,16 @@ struct JointState {
 /// Options every backend must honour. Engine-specific tuning (solver substeps, hull budgets,
 /// worker counts) belongs to the concrete backend, not here.
 struct BackendOptions {
+    /// The URDF **as text**, when the caller has it.
+    ///
+    /// ⚠ Optional, and only some backends need it. Box3D builds from the parsed `Robot` struct and
+    /// ignores this. MuJoCo has its own URDF reader (`src/xml/xml_urdf.cc`) and takes XML, so
+    /// handing it the original bytes avoids re-serialising a parsed model back into XML — a round
+    /// trip that would quietly become a second, divergent definition of the robot.
+    ///
+    /// Empty means "not supplied"; a backend that requires it must say so rather than guess.
+    std::string urdf_xml;
+
     /// Internal step. A backend must consume whole steps of exactly this size and carry the
     /// remainder, so the outer loop's dt cannot perturb the result. MultiAgent advances
     /// SteppableClock by getPhysicsLoopPeriod() * 1E-9 = 3 ms per executor iteration.
@@ -108,6 +119,11 @@ struct BackendOptions {
     bool add_ground_plane = false;
     double ground_plane_z = 0.0;
 
+    /// Convex decomposition of <mesh> collision, shared by both backends. Defaults are in
+    /// UrdfConvexDecomposition.hpp; `enabled` with no CoACD in the build is harmless and simply
+    /// yields one part, i.e. the behaviour that existed before.
+    DecompositionOptions decomposition;
+
     /// How <mimic> joints are to be honoured. See UrdfMimic.hpp: exact handling is automatic,
     /// approximate handling is opt-in.
     MimicPolicy mimic;
@@ -134,6 +150,20 @@ public:
     /// A null pointer means "no static world", which is a legitimate configuration (a fixed-base
     /// arm needs none) and is not the same as an empty one.
     virtual void setStaticWorld(std::shared_ptr<const StaticWorld> world) = 0;
+
+    /// Whether setStaticWorld actually puts the level into this engine's world.
+    ///
+    /// ⚠ PURE VIRTUAL, AND DELIBERATELY NOT DEFAULTED TO TRUE. A backend that accepts a
+    /// StaticWorld and quietly does nothing with it is indistinguishable, from the caller's side,
+    /// from one that mirrored it perfectly — until the robot falls through the floor. That is
+    /// exactly what happened when MuJoCo was added: UrdfBotSimApi suppresses its scaffolding
+    /// ground plane whenever the level mirrored, on the reasoning that a flat plane and a real
+    /// level are not additive, and the MuJoCo robot was left with a physics world containing
+    /// itself and nothing else.
+    ///
+    /// A new backend must therefore answer this question rather than inherit an answer, because
+    /// the wrong answer is silent and the failure is a robot falling out of the map.
+    virtual bool mirrorsStaticWorld() const = 0;
 
     /// Register a body whose pose is driven from outside the solver, and return a handle for
     /// `setKinematicPose`. May be called before or after `buildFromUrdf`.

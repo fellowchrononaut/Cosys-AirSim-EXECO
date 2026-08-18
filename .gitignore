@@ -315,6 +315,17 @@ external/*
 !external/box3d/**
 !external/tinyxml2/
 !external/tinyxml2/**
+# MuJoCo, vendored 2026-08-18 as a SECOND URDF physics backend alongside Box3D — not a replacement.
+# Same reasoning as box3d: the pin must be exact bytes, because a recorded dataset has to be
+# attributable to the engine that produced it. See external/mujoco/VENDORED.md.
+!external/mujoco/
+!external/mujoco/**
+# CoACD, vendored 2026-08-19. Approximate convex decomposition, shared by BOTH backends: it is what
+# stops a moving concave mesh being simulated as one fat convex hull (Box3DRobot.cpp:330) and what
+# makes a mirrored level usable by MuJoCo at all. Same exact-bytes reasoning as the others.
+# See external/coacd/VENDORED.md.
+!external/coacd/
+!external/coacd/**
 deps/
 cmake_build/
 
@@ -327,6 +338,16 @@ cmake_build/
 /[Ee]igen
 /build_debug
 /build_release
+# Out-of-tree third-party build (build_thirdparty.sh). Separate from build_release because it
+# uses Unreal's toolchain rather than the host's - see cmake/cmake-modules/UnrealToolchain.cmake.
+/build_thirdparty
+/build_mujoco
+# MuJoCo's FetchContent cache. ⚠ These are GIT CLONES of qhull, ccd, lodepng, miniz,
+# tinyobjloader and tinyxml2 - `git add` on cmake/ will otherwise embed six repositories.
+# They are fetched, not vendored; see external/mujoco/VENDORED.md, which records that as
+# the weak point of the pin.
+/.fetchcontent-cache
+/cmake/.fetchcontent-cache
 /cmake/CPackSourceConfig.cmake
 /cmake/CPackConfig.cmake
 /cmake/arch.c

@@ -127,6 +127,20 @@ if [ -f "$build_dir/output/lib/libbox3d.a" ]; then
     cp $build_dir/output/lib/libbox3d.a AirLib/deps/box3d/lib/libbox3d.a
 fi
 
+# MuJoCo is OPTIONAL, INDEPENDENT of box3d, and NOT BUILT HERE.
+#
+# It is built out-of-tree by ./build_thirdparty.sh, against Unreal's bundled clang and sysroot rather
+# than the host's - one CMake tree has one compiler, and MuJoCo needs a different one. The reason
+# is in cmake/cmake-modules/UnrealToolchain.cmake: on a glibc >= 2.38 host the C++ standard headers
+# redirect sscanf/strtol to __isoc23_* symbols that Unreal's glibc 2.28 sysroot does not export,
+# and unlike AirLib's tinyxml2 the redirect cannot be switched off, because libc++ itself requires
+# _GNU_SOURCE.
+#
+# So there is nothing to copy here. build_thirdparty.sh stages AirLib/deps/mujoco/{lib,include}
+# directly, and the rsync below carries it into the plugin like any other dependency. If it was
+# never run, AirLib/deps/mujoco does not exist, WITH_MUJOCO_BINDING=0, and Box3D is the only URDF
+# backend - exactly as before MuJoCo was vendored.
+
 # Update AirLib/lib, AirLib/deps, Plugins folders with new binaries
 rsync -a --delete $build_dir/output/lib/ AirLib/lib/x64/$folder_name
 rsync -a --delete external/rpclib/$RPC_VERSION_FOLDER/include AirLib/deps/rpclib

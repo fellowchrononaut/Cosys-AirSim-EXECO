@@ -58,6 +58,15 @@ public class AirSim : ModuleRules
                 AddLibDependency("AirLib", Path.Combine(AirLibPath, "lib"), "AirLib", Target, false);
                 LoadAirSimDependency(Target, "rpclib", "rpc");
                 LoadOptionalAirSimDependency(Target, "box3d", "box3d");
+                // The SECOND URDF physics backend. Independent of box3d in both directions: either,
+                // both or neither may be present, and the choice is made per vehicle at runtime by
+                // "PhysicsEngine". Staged only by build_thirdparty.sh (NOT by build.sh), so a tree that
+                // has never run it gets WITH_MUJOCO_BINDING=0 and a Box3D-only plugin.
+                LoadOptionalAirSimDependency(Target, "mujoco", "mujoco");
+                // Approximate convex decomposition, shared by BOTH backends rather than owned by
+                // either. Absent => WITH_COACD_BINDING=0 and every mesh keeps the single-convex-hull
+                // behaviour it has today. Also staged only by build_thirdparty.sh.
+                LoadOptionalAirSimDependency(Target, "coacd", "coacd");
                 break;
 
             case CompileMode.CppCompileNoRpc:
@@ -68,6 +77,8 @@ public class AirSim : ModuleRules
             case CompileMode.CppCompileWithRpc:
                 LoadAirSimDependency(Target, "rpclib", "rpc");
                 LoadOptionalAirSimDependency(Target, "box3d", "box3d");
+                LoadOptionalAirSimDependency(Target, "mujoco", "mujoco");
+                LoadOptionalAirSimDependency(Target, "coacd", "coacd");
                 break;
 
             default:

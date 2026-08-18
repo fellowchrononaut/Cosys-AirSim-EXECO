@@ -5,6 +5,7 @@
 // the AirSim side and are unaffected by which backend moves the robot.
 #pragma once
 
+#include "urdf/UrdfConvexDecomposition.hpp"
 #include "urdf/UrdfMimic.hpp"
 #include "urdf/UrdfModel.hpp"
 #include "urdf/UrdfStaticWorld.hpp"
@@ -49,6 +50,10 @@ struct BuildOptions {
 
     /// Convex-hull vertex budget per collision shape.
     int max_hull_vertices = 64;
+
+    /// Convex decomposition of <mesh> collision. Without it a concave link is one fat hull; see
+    /// UrdfConvexDecomposition.hpp. Passed straight through from BackendOptions.
+    urdf::DecompositionOptions decomposition;
 
     /// Where to look for `<mesh>` files named by `<collision>`. `mesh_base_dir` is the directory
     /// holding the URDF, which is what a plain relative filename resolves against; the search paths
@@ -226,6 +231,37 @@ public:
         return hull_budget_reductions_;
     }
 
+    /// A link <mesh> that was broken into several convex parts instead of being collapsed to one
+    /// hull. This is the fidelity WIN, and it is reported for the same reason the losses are:
+    /// a link that suddenly has fourteen shapes instead of one costs more per step, and an
+    /// operator should be able to see where that went.
+    struct MeshDecomposition {
+        std::string link;
+        std::string mesh;
+        size_t parts = 0;
+        double seconds = 0;
+        bool from_cache = false;
+    };
+
+    /// A link <mesh> that did NOT decompose and is therefore still one convex hull — i.e. still
+    /// "fatter than it looks".
+    ///
+    /// ⚠ This is the one that matters. Every entry here is a concave link being simulated as a
+    /// solid block, which is invisible in the render and looks exactly like correct behaviour
+    /// until something fails to fit through a gap. `note` carries the reason: no CoACD in the
+    /// build, disabled by settings, or a CoACD failure on that specific mesh.
+    struct MeshDecompositionFallback {
+        std::string link;
+        std::string mesh;
+        std::string note;
+    };
+
+    const std::vector<MeshDecomposition>& decompositions() const { return decompositions_; }
+    const std::vector<MeshDecompositionFallback>& decompositionFallbacks() const
+    {
+        return decomposition_fallbacks_;
+    }
+
     /// True if this link's pose is computed by forward kinematics rather than integrated by Box3D
     /// — i.e. it sits at or below a cosmetic <mimic> joint.
     bool isLinkKinematic(size_t link) const { return links_[link].kinematic; }
@@ -337,6 +373,8 @@ private:
     BuildOptions opts_;
     std::vector<urdf::MimicClassification> mimic_;
     std::vector<HullBudgetReduction> hull_budget_reductions_;
+    std::vector<MeshDecomposition> decompositions_;
+    std::vector<MeshDecompositionFallback> decomposition_fallbacks_;
     std::vector<std::string> massless_markers_;
     std::vector<JointControl> control_;
     std::vector<KinematicRec> kinematic_;

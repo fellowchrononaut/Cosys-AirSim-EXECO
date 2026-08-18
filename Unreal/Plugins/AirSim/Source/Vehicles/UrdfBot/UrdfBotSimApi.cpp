@@ -18,7 +18,14 @@
 #include "urdf/backends/Box3DUrdfBackend.hpp"
 #endif
 
+#if WITH_MUJOCO_BINDING
+#include "urdf/backends/mujoco/MuJoCoUrdfBackend.hpp"
+#endif
+
+#include "HAL/PlatformFileManager.h"
+
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <cmath>
@@ -274,10 +281,11 @@ void UrdfBotSimApi::initialize()
 
 void UrdfBotSimApi::loadModelAndBackend()
 {
-#if !WITH_BOX3D_BINDING
+#if !WITH_BOX3D_BINDING && !WITH_MUJOCO_BINDING
     throw std::runtime_error(
-        "Vehicle '" + getVehicleName() + "' is of type \"urdfbot\", but this build has no Box3D "
-        "dependency (WITH_BOX3D_BINDING=0). Build box3d and re-run build.sh, or remove the "
+        "Vehicle '" + getVehicleName() + "' is of type \"urdfbot\", but this build has NO URDF "
+        "physics backend at all (WITH_BOX3D_BINDING=0 and WITH_MUJOCO_BINDING=0). Build box3d and "
+        "re-run build.sh - and ./build_thirdparty.sh too if you want the MuJoCo engine - or remove the "
         "vehicle from settings.json.");
 #else
     const std::string urdf_path = vehicle_setting_->urdf_file;
@@ -323,15 +331,73 @@ void UrdfBotSimApi::loadModelAndBackend()
                UTF8_TO_TCHAR(getVehicleName().c_str()), UTF8_TO_TCHAR(audit_.report().c_str()));
     }
 
+    // --- which physics engine runs this robot -------------------------------------------------
+    //
+    // ⚠ Per VEHICLE, not per simulation. Two urdfbots in one settings file may name different
+    // engines and each gets its own solver; nothing is shared between them, and neither engine is
+    // aware of the other. That is the point: the Go2 trot needs kp = 160 on Box3D against the
+    // kp = 20 it is trained at in MuJoCo, and running one robot and one controller against both
+    // engines is what turns an 8x discrepancy into something attributable.
+    //
+    // ⚠ Box3D remains the DEFAULT. An absent "PhysicsEngine", an empty one, or "Box3D" all take
+    // the path that existed before MuJoCo was added; every existing settings file keeps its exact
+    // previous behaviour.
     const std::string engine = Utils::toLower(vehicle_setting_->physics_engine);
-    if (!engine.empty() && engine != "box3d")
-        throw std::invalid_argument("Vehicle '" + getVehicleName() + "': PhysicsEngine \"" +
-                                    vehicle_setting_->physics_engine +
-                                    "\" is not available. Only \"Box3D\" is implemented.");
 
-    auto box3d = std::make_unique<urdf::Box3DUrdfBackend>();
+    // Listed for the error message below, so an operator is told what this BUILD can do rather
+    // than what the source could do if it had been built differently. "MuJoCo is not available"
+    // and "MuJoCo is not a thing" are very different problems and must not read the same.
+    std::string available;
+#if WITH_BOX3D_BINDING
+    available += "\"Box3D\"";
+#endif
+#if WITH_MUJOCO_BINDING
+    available += (available.empty() ? "" : ", ") + std::string("\"MuJoCo\"");
+#endif
+
+    std::unique_ptr<urdf::UrdfRobotBackend> backend;
+
+    if (engine.empty() || engine == "box3d") {
+#if WITH_BOX3D_BINDING
+        backend = std::make_unique<urdf::Box3DUrdfBackend>();
+#else
+        throw std::invalid_argument(
+            "Vehicle '" + getVehicleName() + "': PhysicsEngine \"Box3D\" is not in this build "
+            "(WITH_BOX3D_BINDING=0). Available: " + available + ". Build box3d and re-run "
+            "build.sh.");
+#endif
+    }
+    else if (engine == "mujoco") {
+#if WITH_MUJOCO_BINDING
+        backend = std::make_unique<urdf::MuJoCoUrdfBackend>();
+#else
+        // ⚠ The overwhelmingly likely cause, so it is named first. MuJoCo is not built by
+        // build.sh - it needs Unreal's own toolchain and has its own script.
+        throw std::invalid_argument(
+            "Vehicle '" + getVehicleName() + "': PhysicsEngine \"MuJoCo\" is not in this build "
+            "(WITH_MUJOCO_BINDING=0). Available: " + available + ". MuJoCo is NOT built by "
+            "build.sh: run ./build_thirdparty.sh once, then ./build.sh.");
+#endif
+    }
+    else {
+        throw std::invalid_argument(
+            "Vehicle '" + getVehicleName() + "': PhysicsEngine \"" +
+            vehicle_setting_->physics_engine + "\" is not a URDF physics backend. Available: " +
+            available + ".");
+    }
+
+    UAirBlueprintLib::LogMessageString(
+        "UrdfBot physics engine: ",
+        getVehicleName() + " -> " + backend->backendName(), LogDebugLevel::Informational);
+    UE_LOG(LogUrdfBot, Log, TEXT("'%s' runs on the %s backend"),
+           UTF8_TO_TCHAR(getVehicleName().c_str()), UTF8_TO_TCHAR(backend->backendName()));
 
     urdf::BackendOptions opts;
+    // ⚠ MuJoCo builds its model from the URDF **TEXT**, not from our parsed Robot - it has its own
+    // URDF reader (xml_urdf.cc) and re-serialising our parse would create a second, quietly
+    // divergent definition of the same robot. Box3D ignores this field. Set unconditionally so the
+    // two engines are never handed different information.
+    opts.urdf_xml = urdf_xml_raw_;
     // The MultiAgent sim clock advances by exactly getPhysicsLoopPeriod() * 1E-9 per executor
     // iteration (ASimModeWorldMultiAgent::setupClockSpeed overrides the 20 ms ASimModeBase
     // default, which applies to Car/ComputerVision/SkidVehicle only). Matching the backend's
@@ -341,6 +407,34 @@ void UrdfBotSimApi::loadModelAndBackend()
     opts.mesh_base_dir = dirOf(urdf_path);
     opts.mesh_search_paths = vehicle_setting_->urdf_mesh_search_paths;
     opts.mimic.allow_servo_follower = vehicle_setting_->urdf_allow_mimic_follower;
+
+    // --- convex decomposition -----------------------------------------------------------------
+    // Shared by both backends. Without CoACD in the build this is a no-op that yields one part per
+    // mesh, i.e. exactly the behaviour that existed before, so nothing here needs a guard.
+    opts.decomposition.enabled = vehicle_setting_->urdf_convex_decomposition;
+    opts.decomposition.threshold = vehicle_setting_->urdf_convex_decomposition_threshold;
+    opts.decomposition.max_hulls = vehicle_setting_->urdf_convex_decomposition_max_hulls;
+    opts.decomposition.cache_dir = vehicle_setting_->urdf_convex_decomposition_cache_dir;
+
+    // ⚠ Default the cache NEXT TO THE URDF rather than to a global directory, so a robot carries
+    // its own cook and copying the model copies the cook with it. Left empty the cache is off, and
+    // off is not a viable default: the Go2 hip alone takes 20-30 s to decompose.
+    if (opts.decomposition.enabled && opts.decomposition.cache_dir.empty())
+        opts.decomposition.cache_dir = dirOf(urdf_path) + "/.convex_cache";
+
+    if (!opts.decomposition.cache_dir.empty()) {
+        // Created here rather than in the service: AirLib has no filesystem helper of its own, and
+        // a service that silently does not cache because a directory is missing is the failure
+        // this whole arrangement exists to avoid.
+        IPlatformFile& pf = FPlatformFileManager::Get().GetPlatformFile();
+        const FString dir = UTF8_TO_TCHAR(opts.decomposition.cache_dir.c_str());
+        if (!pf.DirectoryExists(*dir) && !pf.CreateDirectoryTree(*dir)) {
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("could not create the convex-decomposition cache at '%s' - every load will "
+                        "re-cook, which is minutes for a mesh-heavy robot"), *dir);
+            opts.decomposition.cache_dir.clear();
+        }
+    }
 
     const float world_to_meters = getNedTransform().fromNed(1.0f);
 
@@ -387,12 +481,33 @@ void UrdfBotSimApi::loadModelAndBackend()
                 LogDebugLevel::Informational);
         }
 
-        box3d->setStaticWorld(static_world_);
+        backend->setStaticWorld(static_world_);
+
+        // ⚠ Said out loud, because the level mirrored SUCCESSFULLY and the report above says so.
+        // Without this line the log reads as though this robot has 172 bodies of world to collide
+        // with, and the only symptom of the truth is the robot falling out of the map.
+        if (!backend->mirrorsStaticWorld()) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: ",
+                getVehicleName() + " runs on " + backend->backendName() + ", which does NOT yet "
+                "mirror level geometry - the mirror above was built and then ignored. This robot "
+                "collides only with its own links and the scaffolding ground plane, and will drive "
+                "through walls that stop a Box3D robot.",
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("'%s': %s ignores the static world mirror; falling back to the "
+                        "scaffolding ground plane"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()),
+                   UTF8_TO_TCHAR(backend->backendName()));
+        }
 
         // Kinematic bodies: registered per robot, because each robot owns its own b3World and gets
         // its own handles. The mirror itself is shared, so the self-exclusion has to happen here —
         // a robot that mirrored its own pawn would weld itself to an obstacle shaped like itself.
-        if (static_world_) {
+        // ⚠ Skipped entirely for a backend that does not mirror. addKinematicBody returns -1
+        // there, so every handle would be dead and the "tracking N bodies" log would describe
+        // motion that cannot happen.
+        if (static_world_ && backend->mirrorsStaticWorld()) {
             for (size_t i = 0; i < static_world_->kinematic.size(); ++i) {
                 UPrimitiveComponent* src =
                     (static_cast<int32>(i) < mirror.KinematicSources.Num())
@@ -403,7 +518,7 @@ void UrdfBotSimApi::loadModelAndBackend()
 
                 KinematicMirror km;
                 km.component = mirror.KinematicSources[static_cast<int32>(i)];
-                km.handle = box3d->addKinematicBody(static_world_->kinematic[i]);
+                km.handle = backend->addKinematicBody(static_world_->kinematic[i]);
                 kinematic_mirrors_.push_back(km);
             }
             UE_LOG(LogUrdfBot, Log, TEXT("kinematic mirror: tracking %d bodies for '%s'"),
@@ -418,7 +533,14 @@ void UrdfBotSimApi::loadModelAndBackend()
                from_cache ? 1 : 0);
     }
 
-    const bool have_static_world = static_world_ && !static_world_->bodies.empty();
+    // ⚠ "Does THIS ROBOT have a world", not "did the level mirror". The two differ for any backend
+    // that ignores the mirror, and conflating them is what dropped the MuJoCo Scout through the
+    // floor: the level mirrored 172 bodies, the scaffolding plane was suppressed as redundant, and
+    // MuJoCo's setStaticWorld discarded the mirror — leaving a physics world containing the robot
+    // and nothing else. Everything below keys off this: the ground-plane suppression, the ground
+    // probe, and the free-fall warning.
+    const bool have_static_world =
+        static_world_ && !static_world_->bodies.empty() && backend->mirrorsStaticWorld();
     // --- scaffolding floor: FALLBACK ONLY, now that the level is mirrored ----------------------
     //
     // ⚠ Suppressed whenever real geometry exists. A flat plane and a mirrored level are not
@@ -468,8 +590,8 @@ void UrdfBotSimApi::loadModelAndBackend()
         opts.ground_plane_z = vehicle_setting_->urdf_ground_plane_z;
     }
 
-    box3d->buildFromUrdf(model_, opts);
-    backend_ = std::move(box3d);
+    backend->buildFromUrdf(model_, opts);
+    backend_ = std::move(backend);
 
     // Cross-check the realised mass against the file. A mismatch means links were merged, dropped
     // or given shape-derived mass, and it is far cheaper to catch here than to explain later.
@@ -482,9 +604,18 @@ void UrdfBotSimApi::loadModelAndBackend()
             LogDebugLevel::Failure);
     }
 
-    // Two things the backend can only discover while building, both of which change what is
-    // actually simulated and neither of which is visible in the render.
-    {
+    // ⚠ THE ONLY WAY TO ASK "which backend is this?" IN THIS CODEBASE. Unreal builds with RTTI off,
+    // so dynamic_cast is unavailable and a static_cast to the wrong type is undefined behaviour
+    // that will not announce itself. backendName() is a pure virtual on UrdfRobotBackend and is the
+    // discriminator; the same gap on VehicleApiBase is what lets a wrong-family RPC call SIGSEGV
+    // the editor, so it is worth not repeating here.
+    const bool is_box3d = (std::strcmp(backend_->backendName(), "Box3D") == 0);
+
+    // Two things the BOX3D backend can only discover while building, both of which change what is
+    // actually simulated and neither of which is visible in the render. Both are properties of
+    // Box3D's hull builder and mass handling, so there is nothing to report for another engine.
+    if (is_box3d) {
+#if WITH_BOX3D_BINDING
         const b3urdf::Box3DRobot& robot =
             static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->robot();
 
@@ -502,6 +633,29 @@ void UrdfBotSimApi::loadModelAndBackend()
                    UTF8_TO_TCHAR(r.link.c_str()), r.requested, r.used);
         }
 
+        // ⚠ The fidelity WIN and the fidelity LOSS, both reported, because both change what is
+        // simulated and neither is visible in the render.
+        for (const auto& d : robot.decompositions()) {
+            UE_LOG(LogUrdfBot, Log,
+                   TEXT("link '%s': mesh decomposed into %d convex parts (%.1f s%s)"),
+                   UTF8_TO_TCHAR(d.link.c_str()), static_cast<int32>(d.parts), d.seconds,
+                   d.from_cache ? TEXT(", from cache") : TEXT(""));
+        }
+        if (!robot.decompositionFallbacks().empty()) {
+            std::string list;
+            for (const auto& f : robot.decompositionFallbacks())
+                list += (list.empty() ? "" : "\n  ") + f.link + " - " + f.note;
+            // Failure level, not informational: every entry is a concave link being simulated as a
+            // solid block. It looks completely correct until something will not fit through a gap.
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: links still simulated as ONE convex hull ",
+                Utils::stringf("(%d) - concave shapes are FATTER THAN THEY LOOK",
+                               static_cast<int>(robot.decompositionFallbacks().size())),
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Warning, TEXT("no convex decomposition for:\n  %s"),
+                   UTF8_TO_TCHAR(list.c_str()));
+        }
+
         if (!robot.masslessMarkers().empty()) {
             std::string names;
             for (const std::string& n : robot.masslessMarkers())
@@ -516,7 +670,43 @@ void UrdfBotSimApi::loadModelAndBackend()
             UE_LOG(LogUrdfBot, Log, TEXT("massless frame links resolved kinematically: %s"),
                    UTF8_TO_TCHAR(names.c_str()));
         }
+#endif
     }
+
+#if WITH_MUJOCO_BINDING
+    // The MuJoCo equivalent, and it exists for the same reason as the R2 audit: a robot whose
+    // collision geometry quietly did not load looks completely normal and collides with nothing.
+    // MuJoCo drops what it cannot read WITHOUT reporting it — package:// URIs (it has no notion of
+    // ROS packages) and COLLADA meshes (it reads STL, OBJ and MSH) — which between them covers most
+    // robot URDFs. Our own loader handles both, so a model that works perfectly on Box3D can arrive
+    // here hollow.
+    if (!is_box3d) {
+        const urdf::MuJoCoUrdfBackend* mj =
+            static_cast<const urdf::MuJoCoUrdfBackend*>(backend_.get());
+        const size_t declared = mj->collisionGeomsDeclared();
+        const size_t realised = mj->collisionGeomsRealised();
+
+        UE_LOG(LogUrdfBot, Log, TEXT("MuJoCo collision geometry: %d of %d <collision> elements"),
+               static_cast<int32>(realised), static_cast<int32>(declared));
+
+        if (!mj->droppedCollisions().empty()) {
+            std::string list;
+            for (const std::string& d : mj->droppedCollisions())
+                list += (list.empty() ? "" : "\n  ") + d;
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: MuJoCo dropped collision geometry ",
+                Utils::stringf("- %d of %d <collision> elements compiled. The mesh collisions "
+                               "below did not load; MuJoCo cannot resolve package:// and cannot "
+                               "read .dae. Those links collide with NOTHING.",
+                               static_cast<int>(realised), static_cast<int>(declared)),
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Error,
+                   TEXT("MuJoCo dropped mesh collisions (package:// unsupported, .dae unreadable) "
+                        "for '%s':\n  %s"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()), UTF8_TO_TCHAR(list.c_str()));
+        }
+    }
+#endif
 
     auto* pawn = static_cast<AUrdfBotPawn*>(getPawn());
     // ⚠ Custom-depth stencils are OFF by default and are NOT how Segmentation works here.
@@ -566,8 +756,19 @@ void UrdfBotSimApi::loadModelAndBackend()
 
     // Borrowed from the backend, which outlives the api — both are members of this sim api and
     // the backend is declared first, so it is destroyed last.
-    const std::vector<urdf::MimicClassification>* mimic =
-        &static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->robot().mimicClassifications();
+    //
+    // ⚠ Box3D-only, and EMPTY rather than null for anything else. <mimic> classification is
+    // currently a Box3DRobot product, not part of the UrdfRobotBackend interface, so a MuJoCo robot
+    // has none to report. UrdfBotApi dereferences this pointer unconditionally when answering
+    // getJoints(), so the honest answer is an empty list: a MuJoCo robot's joints come back with no
+    // mimic_role rather than crashing. Hoisting classification onto the interface is the real fix
+    // and is listed in NEXT-SESSION.md.
+    static const std::vector<urdf::MimicClassification> no_mimic;
+    const std::vector<urdf::MimicClassification>* mimic = &no_mimic;
+#if WITH_BOX3D_BINDING
+    if (is_box3d)
+        mimic = &static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->robot().mimicClassifications();
+#endif
 
     {
         auto api = std::make_unique<UrdfBotApi>(&model_, backend_.get(), mimic, &getNedTransform(),
@@ -998,8 +1199,13 @@ void UrdfBotSimApi::refreshKinematicMirror()
     if (!vehicle_setting_->urdf_mirror_other_vehicles && !vehicle_setting_->urdf_mirror_movable)
         return;
 
-    auto* box3d = dynamic_cast<urdf::UrdfRobotBackend*>(backend_.get());
-    if (box3d == nullptr) return;
+    // ⚠ The SAME capability gate as the initial registration in loadModelAndBackend, and it has to
+    // be here too — this is a second, independent path to addKinematicBody. Without it a MuJoCo
+    // robot logged "kinematic mirror refresh: +6 bodies (now 6) ... now solid to this one" while
+    // every handle was -1 and nothing was solid to anything. Observed 2026-08-19.
+    if (!backend_->mirrorsStaticWorld()) return;
+
+    urdf::UrdfRobotBackend* backend = backend_.get();
 
     UrdfWorldGeometry::FMirrorOptions opts;
     opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
@@ -1030,7 +1236,7 @@ void UrdfBotSimApi::refreshKinematicMirror()
 
         KinematicMirror km;
         km.component = mirror.KinematicSources[static_cast<int32>(i)];
-        km.handle = box3d->addKinematicBody(mirror.World->kinematic[i]);
+        km.handle = backend->addKinematicBody(mirror.World->kinematic[i]);
         kinematic_mirrors_.push_back(km);
         ++added;
     }

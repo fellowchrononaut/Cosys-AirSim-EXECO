@@ -20,6 +20,18 @@ if(BOX3D_FOUND)
   include_directories(${BOX3D_LIB_INCLUDES})
 endif()
 
+# MuJoCo headers likewise. The two backends are INDEPENDENT: either, both or neither may be built,
+# and the choice is made per vehicle at runtime by the "PhysicsEngine" setting.
+if(MUJOCO_FOUND)
+  include_directories(${MUJOCO_LIB_INCLUDES})
+endif()
+
+# CoACD likewise. Unlike the two backends this is not an engine — it is a shared service BOTH of
+# them use (UrdfConvexDecomposition.cpp), so it is guarded independently of either.
+if(COACD_FOUND)
+  include_directories(${COACD_LIB_INCLUDES})
+endif()
+
 file(GLOB_RECURSE ${PROJECT_NAME}_sources 
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/api/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/common/common_utils/*.cpp
@@ -65,8 +77,12 @@ set_source_files_properties(${AIRSIM_ROOT}/external/tinyxml2/tinyxml2.cpp
   PROPERTIES COMPILE_OPTIONS "-U_GNU_SOURCE")
 
 # The Box3D-backed URDF robot compiles only when the optional dependency is present.
+# ⚠ GLOB, not GLOB_RECURSE. The Box3D sources sit directly in backends/; recursing would also sweep
+# backends/mujoco/ into the BOX3D_FOUND guard, so a build with box3d but without MuJoCo would try to
+# compile the MuJoCo backend and fail on a missing mujoco.h. The two engines are independent and
+# their guards must be too.
 if(BOX3D_FOUND)
-  file(GLOB_RECURSE ${PROJECT_NAME}_box3d_sources
+  file(GLOB ${PROJECT_NAME}_box3d_sources
     ${AIRSIM_ROOT}/${PROJECT_NAME}/src/urdf/backends/*.cpp)
   list(APPEND ${PROJECT_NAME}_sources ${${PROJECT_NAME}_box3d_sources})
   add_definitions(-DWITH_BOX3D_BINDING=1)
@@ -74,10 +90,37 @@ else()
   add_definitions(-DWITH_BOX3D_BINDING=0)
 endif()
 
+# The MuJoCo-backed URDF robot, added 2026-08-18. Additive: Box3D is unaffected and remains the
+# default. See external/mujoco/VENDORED.md and SIMVAL/urdf_physics/NEWTON-ASSESSMENT.md.
+if(MUJOCO_FOUND)
+  file(GLOB ${PROJECT_NAME}_mujoco_sources
+    ${AIRSIM_ROOT}/${PROJECT_NAME}/src/urdf/backends/mujoco/*.cpp)
+  list(APPEND ${PROJECT_NAME}_sources ${${PROJECT_NAME}_mujoco_sources})
+  add_definitions(-DWITH_MUJOCO_BINDING=1)
+else()
+  add_definitions(-DWITH_MUJOCO_BINDING=0)
+endif()
+
+# ⚠ UrdfConvexDecomposition.cpp is compiled ALWAYS - it is in src/urdf/ and swept up by the glob
+# above - and only its CoACD call is compiled out. That is deliberate: without the dependency it
+# returns the input as a single convex part, which is exactly the behaviour every call site has
+# today, so callers need no #if of their own and a build without CoACD is unchanged.
+if(COACD_FOUND)
+  add_definitions(-DWITH_COACD_BINDING=1)
+else()
+  add_definitions(-DWITH_COACD_BINDING=0)
+endif()
+
 add_library(${PROJECT_NAME} STATIC ${${PROJECT_NAME}_sources})
 
 CommonTargetLink()
 target_link_libraries(${PROJECT_NAME} ${RPC_LIB})
+if(MUJOCO_FOUND)
+  target_link_libraries(${PROJECT_NAME} ${MUJOCO_LIB})
+endif()
+if(COACD_FOUND)
+  target_link_libraries(${PROJECT_NAME} ${COACD_LIB})
+endif()
 target_link_libraries(${PROJECT_NAME} MavLinkCom)
 if(BOX3D_FOUND)
   target_link_libraries(${PROJECT_NAME} ${BOX3D_LIB})

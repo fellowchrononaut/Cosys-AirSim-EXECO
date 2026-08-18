@@ -31,6 +31,7 @@ void Box3DUrdfBackend::buildFromUrdf(const Robot& model, const BackendOptions& o
     b.fixed_base = opts.fixed_base;
     b.collide_connected = opts.collide_connected;
     b.mimic = opts.mimic;
+    b.decomposition = opts.decomposition;
     b.add_ground_plane = opts.add_ground_plane;
     b.ground_plane_z = opts.ground_plane_z;
 

@@ -16,6 +16,7 @@ public:
     const char* backendName() const override { return "Box3D"; }
 
     void setStaticWorld(std::shared_ptr<const StaticWorld> world) override;
+    bool mirrorsStaticWorld() const override { return true; }
     int addKinematicBody(const KinematicBody& body) override;
     void setKinematicPose(int handle, const Vec3& position, const Quat& orientation) override;
     void buildFromUrdf(const Robot& model, const BackendOptions& opts) override;

@@ -25,7 +25,14 @@ endmacro(SetupConsoleBuild)
 
 macro(CommonSetup)
     find_package(Threads REQUIRED)
-    find_path(AIRSIM_ROOT NAMES AirSim.sln PATHS ".." "../.." "../../.." "../../../.." "../../../../.." "../../../../../.." REQUIRED)
+    #⚠ NO_CMAKE_FIND_ROOT_PATH, and it is load-bearing for the third-party build. That build uses
+    #cmake-modules/UnrealToolchain.cmake, which confines find_* to Unreal's sysroot so no host
+    #library can be linked into the plugin (see the find-root note there — find_package(ZLIB) was
+    #caught reaching into /usr/lib). find_path obeys the same confinement, so without this opt-out
+    #it goes looking for OUR OWN AirSim.sln inside the sysroot and fails with
+    #"Could not find AIRSIM_ROOT". This is locating the repository, not a dependency, so it is
+    #exactly the case the opt-out is for.
+    find_path(AIRSIM_ROOT NAMES AirSim.sln PATHS ".." "../.." "../../.." "../../../.." "../../../../.." "../../../../../.." REQUIRED NO_CMAKE_FIND_ROOT_PATH)
 
     #setup output paths
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/output/lib)
@@ -48,6 +55,61 @@ macro(CommonSetup)
         set(BOX3D_FOUND FALSE)
         set(BOX3D_LIB_INCLUDES "")
         set(BOX3D_LIB "")
+    endif()
+
+    #setup include and lib for MuJoCo, a SECOND URDF backend alongside box3d. Also OPTIONAL, and
+    #independent of it: absent => MUJOCO_FOUND is FALSE and WITH_MUJOCO_BINDING=0 compiles it out,
+    #leaving a build byte-identical to one from before this dependency existed. Box3D remains the
+    #default and is unaffected either way — the two are selected per vehicle by "PhysicsEngine".
+    #
+    #⚠ TWO SEPARATE FLAGS, and conflating them deadlocks the build.
+    #  MUJOCO_SOURCE_FOUND — the vendored source is present, so mujoco_wrapper CAN build it.
+    #  MUJOCO_FOUND        — a PREBUILT archive is staged, so AirLib can compile and link against it.
+    #
+    #MuJoCo is not built by build.sh with everything else: it is built out-of-tree by
+    #build_thirdparty.sh against UNREAL'S toolchain, for the reasons in cmake-modules/UnrealToolchain.cmake
+    #(host glibc >= 2.38 emits __isoc23_* symbols that Unreal's glibc 2.28 sysroot does not have, and
+    #libc++ cannot be built without _GNU_SOURCE, so no compiler flag can fix it). Keying MUJOCO_FOUND
+    #on the staged archive rather than on the source is what makes "not built yet" and "not vendored"
+    #behave identically — both simply leave Box3D as the only backend.
+    if(EXISTS "${AIRSIM_ROOT}/external/mujoco/CMakeLists.txt")
+        set(MUJOCO_SOURCE_FOUND TRUE)
+    else()
+        set(MUJOCO_SOURCE_FOUND FALSE)
+    endif()
+
+    if(EXISTS "${AIRSIM_ROOT}/AirLib/deps/mujoco/lib/libmujoco.a")
+        set(MUJOCO_FOUND TRUE)
+        #Headers come from the STAGED copy, not from external/, so the headers and the archive can
+        #never disagree about which pin was built.
+        set(MUJOCO_LIB_INCLUDES "${AIRSIM_ROOT}/AirLib/deps/mujoco/include")
+        set(MUJOCO_LIB "${AIRSIM_ROOT}/AirLib/deps/mujoco/lib/libmujoco.a")
+    else()
+        set(MUJOCO_FOUND FALSE)
+        set(MUJOCO_LIB_INCLUDES "")
+        set(MUJOCO_LIB "")
+    endif()
+
+    #setup include and lib for CoACD — approximate convex decomposition, shared by BOTH backends
+    #rather than owned by either. Same two-flag split as MuJoCo above and for the same reason:
+    #COACD_SOURCE_FOUND says the vendored source is here and coacd_wrapper CAN build it,
+    #COACD_FOUND says a prebuilt archive is staged so AirLib can compile and link against it.
+    #Built out-of-tree by build_thirdparty.sh; absent => WITH_COACD_BINDING=0 and every mesh keeps
+    #the single-convex-hull behaviour it has today.
+    if(EXISTS "${AIRSIM_ROOT}/external/coacd/CMakeLists.txt")
+        set(COACD_SOURCE_FOUND TRUE)
+    else()
+        set(COACD_SOURCE_FOUND FALSE)
+    endif()
+
+    if(EXISTS "${AIRSIM_ROOT}/AirLib/deps/coacd/lib/libcoacd.a")
+        set(COACD_FOUND TRUE)
+        set(COACD_LIB_INCLUDES "${AIRSIM_ROOT}/AirLib/deps/coacd/include")
+        set(COACD_LIB "${AIRSIM_ROOT}/AirLib/deps/coacd/lib/libcoacd.a")
+    else()
+        set(COACD_FOUND FALSE)
+        set(COACD_LIB_INCLUDES "")
+        set(COACD_LIB "")
     endif()
 
     #tinyxml2 is vendored as two source files, compiled straight into AirLib (no separate lib).

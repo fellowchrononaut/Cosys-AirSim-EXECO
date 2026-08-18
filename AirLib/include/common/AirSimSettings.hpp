@@ -494,6 +494,34 @@ namespace airlib
             /// explicit here: true for an arm on a bench, false for anything that drives.
             bool urdf_fixed_base = false;
 
+            /// Break a concave <collision><mesh> into several convex parts instead of collapsing
+            /// it to one hull.
+            ///
+            /// ⚠ ON by default, and safe to leave on in a build without CoACD: the decomposition
+            /// service returns the mesh as a single part there, which is exactly the behaviour
+            /// that existed before. Turning it OFF is how you rule decomposition out when
+            /// diagnosing a contact problem, and how you avoid the cook cost on a robot whose
+            /// collision meshes are already convex.
+            bool urdf_convex_decomposition = true;
+
+            /// Lower means more parts and a tighter fit. 0.10 rather than CoACD's own 0.05,
+            /// because this is collision geometry and every part is a shape the solver tests every
+            /// step: measured on the Go2 hip, 0.05 gives 99 parts in 97 s where 0.10 gives 14 in
+            /// 30 s. See UrdfConvexDecomposition.hpp.
+            double urdf_convex_decomposition_threshold = 0.10;
+
+            /// Hard ceiling on parts per mesh. A safety net against an unlucky mesh, not a knob to
+            /// tune. -1 = unlimited.
+            int urdf_convex_decomposition_max_hulls = 32;
+
+            /// Where decomposition results are cached between runs.
+            ///
+            /// ⚠ WITHOUT THIS THE FEATURE IS UNUSABLE, which is a measurement rather than a
+            /// caution: the Go2 hip takes 20-30 s to decompose and a mirrored Blocks level is 172
+            /// meshes. Empty disables the cache, which is right for a test and wrong for a robot.
+            /// The default is resolved at load next to the URDF, so a robot carries its own cook.
+            std::string urdf_convex_decomposition_cache_dir;
+
             /// Accept the servo-follower approximation for load-bearing <mimic> joints. Off by
             /// default: cosmetic mimics are resolved exactly without it, and a load-bearing one is
             /// refused rather than silently approximated.
@@ -1434,6 +1462,14 @@ namespace airlib
                     settings_json.getBool("UrdfAllowMimicFollower", false);
                 vehicle_setting->urdf_report_collision_audit =
                     settings_json.getBool("UrdfReportCollisionAudit", true);
+                vehicle_setting->urdf_convex_decomposition =
+                    settings_json.getBool("UrdfConvexDecomposition", true);
+                vehicle_setting->urdf_convex_decomposition_threshold =
+                    settings_json.getDouble("UrdfConvexDecompositionThreshold", 0.10);
+                vehicle_setting->urdf_convex_decomposition_max_hulls =
+                    settings_json.getInt("UrdfConvexDecompositionMaxHulls", 32);
+                vehicle_setting->urdf_convex_decomposition_cache_dir =
+                    settings_json.getString("UrdfConvexDecompositionCacheDir", "");
 
                 if (vehicle_setting->urdf_file.empty())
                     throw std::invalid_argument(
