@@ -72,7 +72,7 @@ void accumulateGeometry(const Geometry& g, const Origin& origin, const std::stri
             return;
         }
         try {
-            const MeshData mesh = loadStl(path);
+            const MeshData mesh = loadMesh(path);
             for (const Vec3& v : mesh.vertices)
                 out.expand(transformPoint(origin, Vec3{ v.x * g.mesh_scale.x,
                                                         v.y * g.mesh_scale.y,

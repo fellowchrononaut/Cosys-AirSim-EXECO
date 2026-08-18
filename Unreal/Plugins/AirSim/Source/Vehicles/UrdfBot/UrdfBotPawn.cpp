@@ -305,16 +305,17 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     if (it == mesh_cache_.end()) {
         const double t0 = FPlatformTime::Seconds();
         try {
-            it = mesh_cache_.emplace(resolved, urdf::loadStl(resolved)).first;
+            it = mesh_cache_.emplace(resolved, urdf::loadMesh(resolved)).first;
             mesh_load_seconds_ += FPlatformTime::Seconds() - t0;
         }
         catch (const std::exception& e) {
-            // ⚠ STL only. OBJ is a short addition; DAE/Collada is a real one, and a large fraction
-            // of published URDFs use it. Named rather than silently skipped, because "the robot is
-            // partly invisible" must not be something the operator has to infer.
+            // ⚠ Named rather than silently skipped, because "the robot is partly invisible" must
+            // not be something the operator has to infer — a link with no geometry is also
+            // untraceable by every sensor, so it vanishes from perception as well as from view.
+            // STL, Collada and Wavefront are handled (urdf::loadMesh); USD is not.
             UAirBlueprintLib::LogMessageString(
                 "UrdfBot WARNING: cannot load mesh ",
-                resolved + " (" + e.what() + "). Only STL is supported by the runtime loader.",
+                resolved + " (" + e.what() + ")",
                 LogDebugLevel::Failure);
             return false;
         }

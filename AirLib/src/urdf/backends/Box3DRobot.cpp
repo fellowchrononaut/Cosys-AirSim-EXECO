@@ -349,7 +349,7 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
                                          "' could not be found. Set UrdfMeshSearchPaths. Refusing "
                                          "rather than simulating a link with no shape.");
 
-            const urdf::MeshData mesh = urdf::loadStl(resolved);
+            const urdf::MeshData mesh = urdf::loadMesh(resolved);
             if (mesh.vertices.size() < 4)
                 throw std::runtime_error("link '" + link.name + "': mesh '" + resolved +
                                          "' has too few vertices to hull (" +

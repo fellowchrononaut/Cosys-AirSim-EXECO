@@ -742,6 +742,34 @@ void UrdfBotSimApi::setupDriveJoints()
     resolve(d.drive_joints, drive_joints_, "drive");
     resolve(d.steer_joints, steer_joints_, "steer");
 
+    // ⚠ Skid-steer entries are MERGED into drive_joints_, not kept in a list of their own.
+    //
+    // A wheel that both drives and steers has ONE velocity target, and it is the sum of the two
+    // contributions. Two independent loops writing setJointTarget on the same joint would leave
+    // whichever ran last, so steering would quietly replace throttle instead of adding to it — the
+    // robot would spin on the spot the instant you touched the steering key and lose all forward
+    // speed, which reads as a physics problem rather than a bookkeeping one.
+    //
+    // A joint named ONLY in SkidSteerJoints is legitimate (a wheel that contributes to turning but
+    // not to forward drive), so it is appended with multiplier 0.
+    for (const auto& kv : d.skid_steer_joints) {
+        const int j = backend_->findJoint(kv.first);
+        if (j < 0) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: UrdfDrive names skid-steer joint '",
+                kv.first + "', which is not in " + model_.name + " - ignored",
+                LogDebugLevel::Failure);
+            continue;
+        }
+        auto it = std::find_if(
+            drive_joints_.begin(), drive_joints_.end(),
+            [&](const DriveMapping& m) { return m.joint == static_cast<size_t>(j); });
+        if (it != drive_joints_.end())
+            it->skid = kv.second;
+        else
+            drive_joints_.push_back(DriveMapping{ static_cast<size_t>(j), 0.0, kv.second });
+    }
+
     // Control modes are set once, not per step. ⚠ Setting a mode re-enables the joint's spring or
     // motor, so doing it every step would fight the solver's warm-start rather than merely being
     // wasteful.
@@ -754,10 +782,11 @@ void UrdfBotSimApi::setupDriveJoints()
 
     UAirBlueprintLib::LogMessageString(
         "UrdfBot: keyboard drive ready - ",
-        Utils::stringf("%d drive joint(s), %d steer joint(s). W/S or Up/Down = throttle, "
-                       "A/D or Left/Right or Numpad4/6 = steer, Space = stop.",
+        Utils::stringf("%d drive joint(s), %d steer joint(s), %d skid-steer. W/S or Up/Down = "
+                       "throttle, A/D or Left/Right or Numpad4/6 = steer, Space = stop.",
                        static_cast<int>(drive_joints_.size()),
-                       static_cast<int>(steer_joints_.size())),
+                       static_cast<int>(steer_joints_.size()),
+                       static_cast<int>(d.skid_steer_joints.size())),
         LogDebugLevel::Informational);
 
     // To Blocks.log, because the on-screen channel cannot be read back after the fact and these
@@ -824,9 +853,12 @@ void UrdfBotSimApi::applyDriveInput()
     }
 
     const auto& d = vehicle_setting_->urdf_drive;
+    // ⚠ ONE target per joint, carrying BOTH contributions. On a skid-steer robot the turn IS the
+    // difference between the two sides' wheel speeds, so throttle and steering have to be summed
+    // here rather than written separately — see the merge in setupDriveJoints.
     for (const DriveMapping& m : drive_joints_)
         backend_->setJointTarget(m.joint, urdf::ControlMode::Velocity,
-                                 throttle * d.max_wheel_speed * m.multiplier);
+                                 (throttle * m.multiplier + steering * m.skid) * d.max_wheel_speed);
     for (const DriveMapping& m : steer_joints_)
         backend_->setJointTarget(m.joint, urdf::ControlMode::Position,
                                  steering * d.max_steer_angle * m.multiplier);
@@ -848,6 +880,19 @@ void UrdfBotSimApi::applyDriveInput()
             target = steering * d.max_steer_angle * m.multiplier;
             actual = backend_->getJointState(m.joint).position;
             name = backend_->jointName(m.joint).c_str();
+        }
+        else {
+            // Skid steer has no steering joint to report an angle for, so report the wheel the
+            // steering axis actually reaches: its VELOCITY target and the velocity it reached. A
+            // line showing target != 0 and actual == 0 is a physics or contact problem; a line
+            // showing target == 0 means the axis or the multiplier is missing, not the solver.
+            for (const DriveMapping& m : drive_joints_) {
+                if (m.skid == 0.0) continue;
+                target = (throttle * m.multiplier + steering * m.skid) * d.max_wheel_speed;
+                actual = backend_->getJointState(m.joint).velocity;
+                name = backend_->jointName(m.joint).c_str();
+                break;
+            }
         }
         UE_LOG(LogUrdfBot, Log,
                TEXT("drive input: throttle=%.3f steer=%.3f -> %s target=%.3f actual=%.3f"),

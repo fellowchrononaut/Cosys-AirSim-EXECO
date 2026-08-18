@@ -739,6 +739,28 @@ namespace airlib
                 /// Joint name -> multiplier applied to the steering axis. Position control, rad.
                 std::map<std::string, double> steer_joints;
 
+                /// Joint name -> multiplier applied to the steering axis and SUMMED INTO THAT
+                /// JOINT'S VELOCITY TARGET. This is skid steer / differential drive: the robot
+                /// turns because its wheels run at different speeds, not because anything pivots.
+                ///
+                /// ⚠ Without this, a robot with no steering joints cannot turn at all. SteerJoints
+                /// is position control on a joint that physically rotates (Ackermann, rocker-bogie
+                /// corner steering); an AgileX Scout, Husky, Jackal or TurtleBot has no such joint,
+                /// so its steering axis arrived and had nothing to act on — the input was read, the
+                /// robot drove straight, and nothing reported a problem.
+                ///
+                /// ⚠ Units are JOINT VELOCITY, the same space as drive_joints, NOT robot yaw. The
+                /// rule that follows from that:
+                ///
+                ///     skid multiplier = drive multiplier x (+1 on the left, -1 on the right)
+                ///
+                /// so on a robot whose left and right drive multipliers already differ in sign
+                /// (because the two sides are mounted mirrored, as on the Scout) BOTH skid
+                /// multipliers come out with the SAME sign. That looks wrong and is not: a uniform
+                /// offset in joint-velocity space is a differential in robot space precisely
+                /// because the drive multipliers encode the mounting flip.
+                std::map<std::string, double> skid_steer_joints;
+
                 double max_wheel_speed = 6.0;   // rad/s at full throttle
                 double max_steer_angle = 0.6;   // rad at full steering deflection
                 double steer_hertz = 40.0;      // position-control gains for the steering joints
@@ -1482,12 +1504,27 @@ namespace airlib
                     };
                     readJointMap(drive_json, "DriveJoints", d.drive_joints);
                     readJointMap(drive_json, "SteerJoints", d.steer_joints);
+                    readJointMap(drive_json, "SkidSteerJoints", d.skid_steer_joints);
 
-                    if (d.enabled && d.drive_joints.empty() && d.steer_joints.empty())
+                    if (d.enabled && d.drive_joints.empty() && d.steer_joints.empty() &&
+                        d.skid_steer_joints.empty())
                         throw std::invalid_argument(
                             "Vehicle '" + vehicle_name + "': \"UrdfDrive\" is enabled but names no "
-                            "DriveJoints and no SteerJoints. A URDF does not say which joints are "
-                            "wheels, so there is nothing to drive and the keys would do nothing.");
+                            "DriveJoints, SteerJoints or SkidSteerJoints. A URDF does not say which "
+                            "joints are wheels, so there is nothing to drive and the keys would do "
+                            "nothing.");
+
+                    // ⚠ A robot that can be driven but not turned is almost always a mistake, and
+                    // it is invisible from the driver's seat: throttle works, the steering axis is
+                    // read, and the robot simply goes straight. Say so at load rather than letting
+                    // it be discovered by pushing the key.
+                    if (d.enabled && !d.drive_joints.empty() && d.steer_joints.empty() &&
+                        d.skid_steer_joints.empty())
+                        Utils::log("Vehicle '" + vehicle_name + "': UrdfDrive names DriveJoints but "
+                                   "neither SteerJoints nor SkidSteerJoints - this robot will drive "
+                                   "but cannot turn. Skid-steer platforms (Scout, Husky, Jackal, "
+                                   "TurtleBot) want SkidSteerJoints.",
+                                   Utils::kLogLevelWarn);
                 }
             }
             else if (!settings_json.getString("PhysicsEngine", "").empty()) {

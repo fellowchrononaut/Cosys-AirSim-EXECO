@@ -93,6 +93,11 @@ private:
     {
         size_t joint = 0;
         double multiplier = 1.0;
+        /// Steering contribution SUMMED into this joint's velocity target — skid steer. Zero for a
+        /// joint the operator did not list in SkidSteerJoints, which is why drive and skid must be
+        /// accumulated per joint rather than written by two separate loops: the second would
+        /// overwrite the first and steering would silently replace throttle.
+        double skid = 0.0;
     };
     std::vector<DriveMapping> drive_joints_;
     std::vector<DriveMapping> steer_joints_;
