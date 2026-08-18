@@ -179,23 +179,55 @@ inline b3Vec3 normalized(const urdf::Vec3& v)
 /// simply never translates — it behaves as a weld with ~70 um of soft-constraint sag. That is
 /// exactly what the first version of this code did, and only tests/test_joint_frames.cpp caught it.
 ///
-/// With R_axis = quatBetween(urdf_axis, box3d_free_axis), and remembering that a URDF joint
-/// <origin> is the transform from the parent link frame to the joint frame while the child link
-/// frame *coincides* with the joint frame at zero position:
+/// ⚠⚠ THE DIRECTION OF THIS ROTATION WAS WRONG UNTIL 2026-08-18, and the way it was wrong is the
+/// lesson. It was `quatBetween(urdf_axis, box3d_free_axis)` — the rotation that maps the URDF axis
+/// ONTO the free axis. But what the joint frame needs is the opposite: the frame's rotation `q`
+/// takes frame-local coordinates into body coordinates, so the hinge axis expressed in the body is
+/// `q * free_axis`, and that is what must equal the URDF axis. Hence:
+///
+///     R_axis = quatBetween(box3d_free_axis, urdf_axis)     <- Z to axis, NOT axis to Z
+///
+/// The old direction is a REFLECTION of the axis through the free axis, so what it produced
+/// depended on the joint:
+///
+///     axis parallel to the free axis  -> correct, by luck (this is why Z-hinges always worked)
+///     axis perpendicular to it        -> EXACTLY INVERTED (every wheel, most steering joints)
+///     axis oblique                    -> a genuinely DIFFERENT AXIS, e.g.
+///                                        (0.30, -0.50, 0.81) became (-0.30, 0.50, 0.81)
+///
+/// Nothing crashed. Wheels span in the wrong direction, which is invisible on a symmetric wheel and
+/// merely looked like the drive multipliers needing a sign; steering went the wrong way on ExoMy
+/// and on the Scout, which was written off twice as a settings sign. What actually exposed it was
+/// UrdfRobotBackend::getJointState CONTRADICTING ITSELF: `position` comes from Box3D
+/// (b3RevoluteJoint_GetAngle, so it followed the flipped frame) while `velocity` is derived by
+/// projecting onto the URDF axis. Commanding +3 rad/s gave velocity -2.97 and an angle advancing at
+/// +3.00. One struct, two conventions, and only their disagreement made the bug visible.
+///
+/// ⚠ The unit tests DID NOT CATCH IT, and could not have: they asserted
+/// `rotate(axisToZ(a), a) == Z` — that the function does what its name says — and the joint tests
+/// checked only that the arm "swung in the plane it should", i.e. the axis LINE. An exactly
+/// inverted axis passes every one of those. A test that encodes the same misunderstanding as the
+/// code is worse than no test, because it is cited as evidence. They now assert DIRECTION.
+///
+/// Remembering that a URDF joint <origin> is the transform from the parent link frame to the joint
+/// frame while the child link frame *coincides* with the joint frame at zero position:
 ///
 ///     localFrameA (on parent) = T_origin * R_axis
 ///     localFrameB (on child)  =            R_axis
-///
-/// UrdfSim's equivalent code was never unit-tested. This one is, per joint type.
-inline b3Quat axisToZ(const urdf::Vec3& axis)
+/// Rotation of a REVOLUTE joint's local frame, such that the frame's +Z — Box3D's hinge axis —
+/// coincides with the URDF <axis>. Named for what it returns, not for a mapping: the old name
+/// `axisToZ` described the rotation that was actually wanted nowhere and was implemented literally.
+inline b3Quat revoluteAxisFrame(const urdf::Vec3& axis)
 {
-    return quatBetween(normalized(axis), b3Vec3_axisZ);
+    return quatBetween(b3Vec3_axisZ, normalized(axis));
 }
 
-/// Prismatic joints slide along local frame A's +X. See axisToZ for why this is separate.
-inline b3Quat axisToX(const urdf::Vec3& axis)
+/// Rotation of a PRISMATIC joint's local frame: frame A's +X is Box3D's slide axis, so +X must
+/// coincide with the URDF <axis>. Separate from the revolute case because Box3D uses a different
+/// free axis per joint type — see the note above.
+inline b3Quat prismaticAxisFrame(const urdf::Vec3& axis)
 {
-    return quatBetween(normalized(axis), b3Vec3_axisX);
+    return quatBetween(b3Vec3_axisX, normalized(axis));
 }
 
 /// Rotate a symmetric 3x3 inertia tensor into another frame: I' = R * I * R^T.

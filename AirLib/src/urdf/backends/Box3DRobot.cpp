@@ -591,13 +591,13 @@ void Box3DRobot::instantiate()
             continue;
         }
 
-        // See b3_math.h::axisToZ for the derivation of these two frames, and for why the target
+        // See Box3DMath.hpp::revoluteAxisFrame for the derivation of these two frames, and for why the target
         // axis differs by joint type: revolute rotates about local +Z, prismatic slides along
         // local +X.
         const bool slides = (j.type == urdf::JointType::Prismatic);
         b3Transform axis_only;
         axis_only.p = b3Vec3_zero;
-        axis_only.q = slides ? axisToX(j.axis) : axisToZ(j.axis);
+        axis_only.q = slides ? prismaticAxisFrame(j.axis) : revoluteAxisFrame(j.axis);
 
         const b3Transform frame_a = mulT(transformFromOrigin(j.origin), axis_only);
         const b3Transform frame_b = axis_only;
