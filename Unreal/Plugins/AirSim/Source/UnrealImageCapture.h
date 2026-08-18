@@ -6,6 +6,9 @@
 #include "common/ImageCaptureBase.hpp"
 #include "common/common_utils/UniqueValueMap.hpp"
 
+#include <stdexcept>
+#include <string>
+
 class AIRSIM_API UnrealImageCapture : public msr::airlib::ImageCaptureBase
 {
 public:
@@ -17,6 +20,10 @@ public:
     virtual void getImages(const std::vector<ImageRequest>& requests, std::vector<ImageResponse>& responses) const override;
 
 private:
+    /// Resolve a camera name or throw std::invalid_argument naming what IS available.
+    /// Never use cameras_->at() directly — see the definition for why.
+    APIPCamera* requireCamera(const std::string& camera_name) const;
+
     void getSceneCaptureImage(const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,
                               std::vector<msr::airlib::ImageCaptureBase::ImageResponse>& responses, bool use_safe_method) const;
 

@@ -61,6 +61,51 @@ namespace airlib
             Twist twist;
         };
 
+        /// The robot's rigid-body state and the SIMULATOR time at which it was sampled.
+        ///
+        /// ⚠ This exists for the timestamp, not for the kinematics. simGetGroundTruthKinematics
+        /// already returns the same pose and twist, but it returns them BARE: Kinematics::State
+        /// carries no time and neither does Environment::State, so a client had nothing to stamp
+        /// urdfbot odometry with. The ROS 2 wrapper fell back to wall clock in a urdfbot-only
+        /// scene, which is wrong in a way nothing complains about — the data looks fine and only
+        /// registers incorrectly against every other stream.
+        ///
+        /// ⚠ Deliberately NOT split into a separate "what time is it" call. A clock read and a
+        /// kinematics read are two RPCs at two different instants, so the stamp would describe
+        /// neither sample; worse, under a paused or scaled clock the error is unbounded rather
+        /// than one round-trip. Both fields are published together by the simulator at the moment
+        /// the kinematics are computed, which is the only pairing that is true by construction.
+        ///
+        /// Shaped like ComputerVisionState (kinematics + timestamp, no control surface) rather
+        /// than CarState, for the reason given at the top of this file: a URDF robot has no fixed
+        /// control abstraction to report, and this struct does not invent one.
+        struct UrdfBotState
+        {
+            Kinematics::State kinematics_estimated;
+            /// Nanoseconds on the simulator clock — the same clock CarState::timestamp and
+            /// MultirotorState::timestamp use, so stamps are directly comparable across vehicles.
+            uint64_t timestamp = 0;
+
+            UrdfBotState()
+            {
+            }
+
+            UrdfBotState(const Kinematics::State& kinematics_estimated_val, uint64_t timestamp_val)
+                : kinematics_estimated(kinematics_estimated_val), timestamp(timestamp_val)
+            {
+            }
+
+            //shortcuts
+            const Vector3r& getPosition() const
+            {
+                return kinematics_estimated.pose.position;
+            }
+            const Quaternionr& getOrientation() const
+            {
+                return kinematics_estimated.pose.orientation;
+            }
+        };
+
         virtual ~UrdfBotApiBase() = default;
 
         /// What the robot is made of. Enumerable rather than assumed: a client cannot command a
@@ -89,6 +134,13 @@ namespace airlib
         /// transforms from the URDF itself.
         virtual std::vector<JointStateInfo> getJointStates() const = 0;
         virtual LinkPoseInfo getLinkPose(const std::string& link) const = 0;
+
+        /// Pose, twist, accelerations and the simulator time they were sampled at, in one call.
+        ///
+        /// ⚠ The pose frame is the same hybrid every AirSim vehicle reports: position is relative
+        /// to this vehicle's own spawn point, orientation is absolute. That is upstream behaviour
+        /// (NedTransform's per-pawn pivot is a translation only), not something this call changes.
+        virtual UrdfBotState getUrdfBotState() const = 0;
 
         /// The robot's URDF, as the simulator actually loaded it.
         ///

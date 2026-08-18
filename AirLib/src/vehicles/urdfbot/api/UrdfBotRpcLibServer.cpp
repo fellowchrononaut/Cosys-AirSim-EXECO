@@ -68,6 +68,10 @@ namespace airlib
             return getVehicleApi(vehicle_name)->getUrdfXml();
         });
 
+        (static_cast<rpc::server*>(getServer()))->bind("getUrdfBotState", [&](const std::string& vehicle_name) -> UrdfBotRpcLibAdaptors::UrdfBotState {
+            return UrdfBotRpcLibAdaptors::UrdfBotState(getVehicleApi(vehicle_name)->getUrdfBotState());
+        });
+
         (static_cast<rpc::server*>(getServer()))->bind("getJointStates", [&](const std::string& vehicle_name) -> std::vector<UrdfBotRpcLibAdaptors::JointStateInfo> {
             const auto states = getVehicleApi(vehicle_name)->getJointStates();
             std::vector<UrdfBotRpcLibAdaptors::JointStateInfo> out;

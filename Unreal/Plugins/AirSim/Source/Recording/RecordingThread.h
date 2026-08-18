@@ -8,6 +8,7 @@
 #include "Recording/RecordingFile.h"
 #include "physics/Kinematics.hpp"
 #include <memory>
+#include <set>
 #include "common/ClockFactory.hpp"
 #include "common/AirSimSettings.hpp"
 #include "common/WorkerThread.hpp"
@@ -53,6 +54,11 @@ private:
     common_utils::UniqueValueMap<std::string, VehicleSimApiBase*> vehicle_sim_apis_;
     std::unordered_map<std::string, const ImageCaptureBase*> image_captures_;
     std::unordered_map<std::string, msr::airlib::Pose> last_poses_;
+
+    /// Vehicles dropped from recording after a capture threw. Recording is a diagnostic and must
+    /// never take down the run it is observing, so a vehicle that cannot be captured is skipped
+    /// for the rest of the session rather than retried 20 times a second.
+    std::set<std::string> failed_vehicles_;
 
     msr::airlib::TTimePoint last_screenshot_on_;
 

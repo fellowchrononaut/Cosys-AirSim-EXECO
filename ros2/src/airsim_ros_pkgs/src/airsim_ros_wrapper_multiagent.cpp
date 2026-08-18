@@ -808,22 +808,18 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
     bool got_sim_time = false;
     rclcpp::Time curr_ros_time = nh_->now();
 
-    // ⚠ TWO PASSES, and the order is load-bearing.
+    // ⚠ Single pass, and it is single deliberately — this loop used to run TWICE.
     //
-    // Only DRONE/CAR/CV carry a simulator timestamp in their state struct; a URDF robot has none
-    // and inherits curr_ros_time from whichever vehicle set it first. vehicle_name_ptr_map_ is an
-    // std::unordered_map, so "first" is hash order, not insertion or alphabetical order — and it
-    // put the rovers ahead of the cars, so every URDF robot was stamped with WALL CLOCK while a
-    // perfectly good simulator clock existed two entries later. Measured: the wall-clock warning
-    // fired on every cycle of a five-vehicle scene containing two timestamped vehicles.
+    // A URDF robot had no simulator timestamp of its own, so it inherited curr_ros_time from
+    // whichever other vehicle set it first. vehicle_name_ptr_map_ is an std::unordered_map, so
+    // "first" is hash order rather than insertion order, and it happened to put the rovers ahead
+    // of the cars: every URDF robot was stamped with WALL CLOCK while a perfectly good simulator
+    // clock existed two entries later. The two-pass ordering fixed that symptom.
     //
-    // Pass 0 takes every vehicle that can establish sim time; pass 1 takes the URDF robots that
-    // depend on it. In a URDF-only scene pass 0 is empty, the fallback still applies, and the
-    // warning is then telling the truth.
-    for (int pass = 0; pass < 2; ++pass) {
+    // getUrdfBotState now carries a simulator stamp (added 2026-08-18), so every vehicle type
+    // establishes sim time from its own state and no vehicle depends on another's ordering. The
+    // ordering scaffolding is gone with the dependency it existed to sequence.
     for (auto& vehicle_name_ptr_pair : vehicle_name_ptr_map_) {
-        const bool is_urdf = (vehicle_name_ptr_pair.second->vehicle_mode_ == VehicleMode::URDFBOT);
-        if ((pass == 0) == is_urdf) continue;
         auto& vehicle_ros = vehicle_name_ptr_pair.second;
         const std::string& vname = vehicle_ros->vehicle_name_;
         const VehicleMode vmode  = vehicle_ros->vehicle_mode_;
@@ -882,38 +878,32 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
             car->car_state_msg_ = state_msg;
 
         } else if (vmode == VehicleMode::URDFBOT) {
-            // ⚠ Ground-truth kinematics, not a type-specific state call. There is no
-            // getUrdfBotState, and there should not be: a URDF robot has no fixed control
-            // abstraction to report. simGetGroundTruthKinematics is vehicle-type agnostic and is
-            // already what the drone path uses for truth (see I-V), so the odometry a URDF robot
-            // publishes means exactly what every other vehicle's odom_local means.
-            const auto kin = get_state_client(vmode).simGetGroundTruthKinematics(vname);
+            // ⚠ getUrdfBotState, NOT simGetGroundTruthKinematics — for the timestamp, not the pose.
+            //
+            // The kinematics the two return are the same. What simGetGroundTruthKinematics cannot
+            // return is a time: Kinematics::State carries none and neither does Environment::State,
+            // so a URDF robot used to have no simulator stamp at all. It inherited one from another
+            // vehicle in a mixed scene, and in a urdfbot-ONLY scene fell back to WALL CLOCK — which
+            // for a dataset generator is wrong in the worst way available, since the poses are
+            // correct and only their times are not. Nothing downstream complains; the data simply
+            // fails to register against every other stream.
+            //
+            // ⚠ Not fixed by reading a clock separately. That is two RPCs at two instants, so the
+            // stamp describes neither sample, and under a paused or scaled clock the gap is
+            // unbounded rather than one round-trip. The simulator publishes the pair together at
+            // the moment it computes the kinematics (UrdfBotSimApi::updateRenderedState).
+            //
+            // This does NOT reintroduce a type-specific control abstraction — UrdfBotState is
+            // shaped like ComputerVisionState: kinematics and a timestamp, nothing else. A URDF
+            // robot still has no fixed control surface to report, and this does not invent one.
+            const auto urdf_state = urdfbot_client_->getUrdfBotState(vname);
 
-            // ⚠ NO SIM TIMESTAMP OF ITS OWN, and this is a real gap rather than a detail.
-            //
-            // Every other vehicle type stamps its odometry from a state struct that carries a
-            // simulator timestamp (MultirotorState/CarState/ComputerVisionState ::timestamp). The
-            // urdfbot API has no equivalent, Kinematics::State carries no time, and
-            // Environment::State carries none either — so there is nothing here to read.
-            //
-            // In a MIXED scene this is harmless: another vehicle has already set curr_ros_time from
-            // its own simulator stamp, and the URDF robot shares it. In a urdfbot-ONLY scene
-            // curr_ros_time is still nh_->now(), i.e. WALL CLOCK, which for a dataset generator is
-            // wrong in a way that is easy not to notice. Warned about rather than hidden.
-            //
-            // The proper fix is a timestamped state call on the urdfbot API; until then, run a
-            // urdfbot alongside any other vehicle if timestamps matter.
-            vehicle_time = curr_ros_time;
-            if (!got_sim_time) {
-                RCLCPP_WARN_THROTTLE(nh_->get_logger(), *nh_->get_clock(), 10000,
-                                     "Vehicle '%s' (urdfbot) has no simulator timestamp source and "
-                                     "no other vehicle supplied one: odometry is stamped with WALL "
-                                     "CLOCK time, not sim time.", vname.c_str());
-            }
+            vehicle_time = rclcpp::Time(urdf_state.timestamp);
+            if (!got_sim_time) { curr_ros_time = vehicle_time; got_sim_time = true; }
 
             vehicle_ros->gps_sensor_msg_ = get_gps_sensor_msg_from_airsim_geo_point(env_data.geo_point);
             vehicle_ros->gps_sensor_msg_.header.stamp = vehicle_time;
-            vehicle_ros->curr_odom_ = get_odom_msg_from_kinematic_state(kin);
+            vehicle_ros->curr_odom_ = get_odom_msg_from_kinematic_state(urdf_state.kinematics_estimated);
 
             // ⚠ ONE batched call, not one call per joint. Polling joints individually samples them
             // at different instants, and a JointState assembled from that describes a pose the
@@ -959,7 +949,6 @@ rclcpp::Time AirsimROSWrapperMultiAgent::update_state()
         vehicle_ros->curr_odom_.header.frame_id  = vname;
         vehicle_ros->curr_odom_.child_frame_id   = vehicle_ros->odom_frame_id_;
         vehicle_ros->curr_odom_.header.stamp     = vehicle_time;
-    }
     }
 
     return curr_ros_time;

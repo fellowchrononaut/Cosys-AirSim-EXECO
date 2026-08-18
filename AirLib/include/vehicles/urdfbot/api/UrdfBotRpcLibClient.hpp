@@ -63,6 +63,13 @@ namespace airlib
         UrdfBotApiBase::LinkPoseInfo getLinkPose(const std::string& link,
                                                  const std::string& vehicle_name = "");
 
+        /// The robot's kinematics AND the simulator time they were sampled at, together.
+        ///
+        /// ⚠ Prefer this over simGetGroundTruthKinematics for anything that will be timestamped.
+        /// The kinematics are identical; what that call cannot give you is the stamp, and pairing
+        /// it with a separate clock read stamps a sample that was never taken at that instant.
+        UrdfBotApiBase::UrdfBotState getUrdfBotState(const std::string& vehicle_name = "");
+
         virtual ~UrdfBotRpcLibClient(); //required for pimpl
     };
 }

@@ -29,6 +29,38 @@ void UnrealImageCapture::getImages(const std::vector<msr::airlib::ImageCaptureBa
         getSceneCaptureImage(requests, responses, false);
 }
 
+/// Resolve a camera name, or throw something a human can act on.
+///
+/// ⚠ Replaces a bare cameras_->at(name). std::map::at throws std::out_of_range whose what() is
+/// just "map::at: key not found" — no camera name, no list of what exists — and on the RECORDING
+/// thread nothing catches it at all, so the editor aborted outright (confirmed from a core dump,
+/// 2026-08-18). The same lookup is reached from simGetImages, where the message was the only clue
+/// a client got and it named neither the camera asked for nor the ones available.
+///
+/// Naming the alternatives matters more than it looks: the usual cause is a camera that exists on
+/// one vehicle and not another, and the fix is invisible until you can see both lists.
+APIPCamera* UnrealImageCapture::requireCamera(const std::string& camera_name) const
+{
+    const auto& map = cameras_->getMap();
+    const auto it = map.find(camera_name);
+    if (it != map.end() && it->second != nullptr)
+        return it->second;
+
+    std::string available;
+    for (const auto& p : map) {
+        if (!available.empty())
+            available += ", ";
+        available += p.first.empty() ? "\"\" (default)" : "'" + p.first + "'";
+    }
+    if (available.empty())
+        available = "(none - this vehicle has no cameras)";
+
+    throw std::invalid_argument(
+        "no camera named " +
+        (camera_name.empty() ? std::string("\"\" (the default camera)") : "'" + camera_name + "'") +
+        " on this vehicle; available: " + available);
+}
+
 void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,
                                               std::vector<msr::airlib::ImageCaptureBase::ImageResponse>& responses, bool use_safe_method) const
 {
@@ -39,7 +71,7 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
 
     bool visibilityChanged = false;
     for (unsigned int i = 0; i < requests.size(); ++i) {
-        APIPCamera* camera = cameras_->at(requests.at(i).camera_name);
+        APIPCamera* camera = requireCamera(requests.at(i).camera_name);
         //TODO: may be we should have these methods non-const?
         if (requests[i].image_type == ImageType::Annotation) {
             if (camera->GetAnnotationNameExist(requests[i].annotation_name)){
@@ -60,7 +92,7 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
     UGameViewportClient* gameViewport = nullptr;
     for (unsigned int i = 0; i < requests.size(); ++i) {
 
-        APIPCamera* camera = cameras_->at(requests.at(i).camera_name);
+        APIPCamera* camera = requireCamera(requests.at(i).camera_name);
 
         if (gameViewport == nullptr) {
             gameViewport = camera->GetWorld()->GetGameViewport();
@@ -188,7 +220,7 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
         size_t count = requests.size();
         for (size_t i = 0; i < count; i++) {
             const ImageRequest& request = requests.at(i);
-            APIPCamera* camera = cameras_->at(request.camera_name);
+            APIPCamera* camera = requireCamera(request.camera_name);
             ImageResponse& response = responses.at(i);
             auto camera_pose = camera->getPose();
             response.camera_position = camera_pose.position;
@@ -210,7 +242,7 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
 
         if (use_safe_method) {
             // Currently, we don't have a way to synthronize image capturing and camera pose when safe method is used,
-            APIPCamera* camera = cameras_->at(request.camera_name);
+            APIPCamera* camera = requireCamera(request.camera_name);
             msr::airlib::Pose pose = camera->getPose();
             response.camera_position = pose.position;
             response.camera_orientation = pose.orientation;

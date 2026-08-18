@@ -6,6 +6,7 @@
 #include <mutex>
 #include "RenderRequest.h"
 #include "PIPCamera.h"
+#include "AirBlueprintLib.h"
 
 std::unique_ptr<FRecordingThread> FRecordingThread::running_instance_;
 std::unique_ptr<FRecordingThread> FRecordingThread::finishing_instance_;
@@ -112,6 +113,8 @@ uint32 FRecordingThread::Run()
 
                 for (const auto& vehicle_sim_api : vehicle_sim_apis_) {
                     const auto& vehicle_name = vehicle_sim_api->getVehicleName();
+                    if (failed_vehicles_.count(vehicle_name))
+                        continue;
 
                     const auto* kinematics = vehicle_sim_api->getGroundTruthKinematics();
                     bool is_pose_unequal = kinematics && last_poses_[vehicle_name] != kinematics->pose;
@@ -121,8 +124,32 @@ uint32 FRecordingThread::Run()
 
                         std::vector<ImageCaptureBase::ImageResponse> responses;
 
-                        image_captures_[vehicle_name]->getImages(settings_.requests[vehicle_name], responses);
-                        recording_file_->appendRecord(responses, vehicle_sim_api);
+                        // ⚠ CATCH HERE, and do not let anything escape this thread.
+                        //
+                        // This is an FRunnable, not a UE task: an exception leaving Run() finds no
+                        // handler anywhere on the stack, so it reaches std::terminate and ABORTS
+                        // THE WHOLE EDITOR. That is what happened on 2026-08-18 — a recording
+                        // request named a camera the vehicle did not have, std::map::at threw
+                        // std::out_of_range, and a bad camera name in a settings file took the
+                        // simulator down with a SIGABRT and no usable message.
+                        //
+                        // Recording is a diagnostic, so it must never be able to destroy the run
+                        // it is observing. A vehicle that cannot be captured is dropped for the
+                        // rest of the session, once, with the reason; the others keep recording.
+                        try {
+                            image_captures_[vehicle_name]->getImages(settings_.requests[vehicle_name], responses);
+                            recording_file_->appendRecord(responses, vehicle_sim_api);
+                        }
+                        catch (const std::exception& e) {
+                            // ⚠ Logged once per vehicle, not per frame. At the default 0.05 s
+                            // interval an unconditional log would emit 20 identical lines a second
+                            // and bury whatever else the operator was reading.
+                            if (failed_vehicles_.insert(vehicle_name).second) {
+                                UAirBlueprintLib::LogMessageString(
+                                    "recording DISABLED for vehicle '" + vehicle_name + "': ",
+                                    e.what(), LogDebugLevel::Failure);
+                            }
+                        }
                     }
                 }
             }

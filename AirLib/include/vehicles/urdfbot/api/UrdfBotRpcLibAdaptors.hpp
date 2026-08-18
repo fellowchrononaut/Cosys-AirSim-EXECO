@@ -183,6 +183,31 @@ namespace airlib_rpclib
                 return d;
             }
         };
+
+        /// Kinematics plus the simulator stamp they were sampled at.
+        ///
+        /// Identical in shape to the computer-vision adaptor, because the two carry the same
+        /// thing: a vehicle whose state is its motion, with no control surface to report.
+        struct UrdfBotState
+        {
+            KinematicsState kinematics_estimated;
+            uint64_t timestamp = 0;
+
+            MSGPACK_DEFINE_MAP(kinematics_estimated, timestamp);
+
+            UrdfBotState() {}
+
+            UrdfBotState(const msr::airlib::UrdfBotApiBase::UrdfBotState& s)
+                : kinematics_estimated(s.kinematics_estimated), timestamp(s.timestamp)
+            {
+            }
+
+            msr::airlib::UrdfBotApiBase::UrdfBotState to() const
+            {
+                return msr::airlib::UrdfBotApiBase::UrdfBotState(kinematics_estimated.to(),
+                                                                 timestamp);
+            }
+        };
     };
 }
 } //namespace

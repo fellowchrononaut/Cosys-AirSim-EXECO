@@ -129,6 +129,24 @@ class UrdfBotClient:
         constraint reaction — those differ and the distinction is preserved deliberately."""
         return self.client.call('getJointState', joint, vehicle_name)
 
+    def getUrdfBotState(self, vehicle_name=''):
+        """The robot's kinematics AND the simulator time they were sampled at, as one value.
+
+        Returns a dict: ``kinematics_estimated`` (position, orientation, linear/angular velocity
+        and acceleration) and ``timestamp`` in nanoseconds on the simulator clock — the same clock
+        CarState.timestamp and MultirotorState.timestamp use, so stamps compare directly across
+        vehicle types.
+
+        ⚠ Use this, not simGetGroundTruthKinematics, for anything you intend to timestamp. The
+        kinematics are the same; what that call cannot give you is the time. Reading a clock
+        separately stamps the sample with an instant it was not taken at, and under a paused or
+        scaled clock that gap is unbounded rather than one round-trip.
+
+        ⚠ Position is relative to this vehicle's own spawn point while orientation is absolute —
+        the hybrid frame every AirSim vehicle reports, not something this call introduces.
+        """
+        return self.client.call('getUrdfBotState', vehicle_name)
+
     def getLinkPose(self, link, vehicle_name=''):
         """Pose and twist of a link, in **AirSim NED** like every other pose crossing this API —
         not in the URDF's own frame. The conversion happens simulator-side, so a script that

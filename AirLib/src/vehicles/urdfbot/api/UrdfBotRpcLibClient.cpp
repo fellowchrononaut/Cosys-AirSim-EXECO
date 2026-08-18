@@ -108,6 +108,14 @@ namespace airlib
         return out;
     }
 
+    UrdfBotApiBase::UrdfBotState UrdfBotRpcLibClient::getUrdfBotState(const std::string& vehicle_name)
+    {
+        return static_cast<rpc::client*>(getClient())
+            ->call("getUrdfBotState", vehicle_name)
+            .as<UrdfBotRpcLibAdaptors::UrdfBotState>()
+            .to();
+    }
+
     urdf::JointState UrdfBotRpcLibClient::getJointState(const std::string& joint,
                                                         const std::string& vehicle_name)
     {

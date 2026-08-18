@@ -70,6 +70,15 @@ public:
     const urdf::Robot& getModel() const { return model_; }
     urdf::UrdfRobotBackend* getBackend() const { return backend_.get(); }
 
+    /// The robot's kinematics and the simulator time they were sampled at, as ONE value.
+    ///
+    /// ⚠ Called from the RPC thread. It returns a copy of a snapshot published by the game thread
+    /// rather than reading kinematics_ live, and that is the entire point: the pair has to be
+    /// taken at one instant. Reading getGroundTruthKinematics() here and clock()->nowNanos()
+    /// separately would stamp the kinematics with a time up to a frame later than the frame they
+    /// describe, and under a paused or scaled clock the gap is unbounded.
+    msr::airlib::UrdfBotApiBase::UrdfBotState getUrdfBotState() const;
+
 protected:
     virtual void resetImplementation() override;
 
@@ -135,6 +144,15 @@ private:
     mutable std::mutex snapshot_mutex_;
     std::vector<urdf::LinkPose> snapshot_;       // physics thread writes, under the mutex
     std::vector<urdf::LinkPose> render_poses_;   // game thread only, no lock needed to read
+
+    /// Kinematics + simulator stamp, published together by the game thread at the moment the
+    /// kinematics are recomputed, and read by the RPC thread.
+    ///
+    /// ⚠ Guarded rather than atomic for the same reason snapshot_ is: it is wider than a word, and
+    /// a torn read would pair one frame's pose with another frame's timestamp — which is precisely
+    /// the error this member exists to remove, and would be invisible in the data.
+    mutable std::mutex state_mutex_;
+    msr::airlib::UrdfBotApiBase::UrdfBotState published_state_;
 
     /// The clock time this vehicle was last stepped. World::update() calls update() with delta
     /// defaulted to **0** (worldUpdatorAsync passes nothing), so dt has to come from the clock —

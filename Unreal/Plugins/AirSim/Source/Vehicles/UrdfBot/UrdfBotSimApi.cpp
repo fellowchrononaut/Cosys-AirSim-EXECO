@@ -177,6 +177,17 @@ namespace
             return out;
         }
 
+        /// Forwarded to the sim api, which publishes the kinematics and the clock reading as one
+        /// snapshot from the game thread. Not assembled here: this class runs on the RPC thread,
+        /// where the two would be two separate reads and the stamp would not describe the sample.
+        UrdfBotState getUrdfBotState() const override
+        {
+            if (sim_api_ == nullptr)
+                throw std::runtime_error("urdfbot state is not available before initialisation");
+            return sim_api_->getUrdfBotState();
+        }
+        void setSimApi(const UrdfBotSimApi* s) { sim_api_ = s; }
+
         msr::airlib::GeoPoint getHomeGeoPoint() const override { return home_; }
 
         // ⚠ resetImplementation(), not reset(). UpdatableObject::reset() is non-virtual - it does
@@ -211,6 +222,9 @@ namespace
         const std::vector<urdf::MimicClassification>* mimic_;
         const NedTransform* ned_;
         msr::airlib::GeoPoint home_;
+        /// The owning sim api. Borrowed, not owned — it outlives this object, which is one of its
+        /// members.
+        const UrdfBotSimApi* sim_api_ = nullptr;
     };
 } // namespace
 
@@ -224,6 +238,16 @@ void UrdfBotSimApi::initialize()
 {
     PawnSimApi::initialize();
     loadModelAndBackend();
+
+    // Seed the published pair, so a client that calls getUrdfBotState before the first rendered
+    // frame gets the spawn pose at a real clock reading rather than a timestamp of 0. A zero stamp
+    // is not merely unhelpful: rclcpp::Time(0) is a valid time that TF will happily extrapolate
+    // from, so the bad value would propagate rather than announce itself.
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        published_state_ = msr::airlib::UrdfBotApiBase::UrdfBotState(*getGroundTruthKinematics(),
+                                                                     clock()->nowNanos());
+    }
 }
 
 void UrdfBotSimApi::loadModelAndBackend()
@@ -529,6 +553,7 @@ void UrdfBotSimApi::loadModelAndBackend()
         // Hand over the raw URDF so clients that cannot see the file path can still obtain the
         // description — see UrdfBotApiBase::getUrdfXml.
         api->setUrdfXml(urdf_xml_raw_);
+        api->setSimApi(this);
         if (urdf_xml_raw_.empty()) {
             UE_LOG(LogUrdfBot, Warning,
                    TEXT("could not re-read '%s' for getUrdfXml; ROS clients will get an EMPTY "
@@ -990,6 +1015,30 @@ void UrdfBotSimApi::updateRenderedState(float dt)
     // vehicle whose dynamics AirSim does not own (PawnSimApi.cpp:701 — "update kinematics from
     // pawn's movement instead of physics engine"). It is how every Chaos car already works.
     PawnSimApi::updateRenderedState(dt);
+
+    // ⚠ Publish kinematics and the clock reading TOGETHER, immediately after the kinematics are
+    // recomputed, and do it here rather than letting the RPC thread sample them itself.
+    //
+    // A URDF robot has no state struct carrying a simulator timestamp the way MultirotorState,
+    // CarState and ComputerVisionState do, so before this a ROS client had nothing to stamp
+    // odometry with and fell back to wall clock in a urdfbot-only scene. The failure was silent:
+    // the poses were correct, only their times were, so the data merely failed to register against
+    // every other stream.
+    //
+    // The pairing is what has to be right. PawnSimApi::updateKinematics has just run, so the
+    // kinematics describe this frame and nothing else has advanced the clock — sampling both
+    // anywhere else, or in two steps, reintroduces exactly the skew this removes.
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        published_state_ = msr::airlib::UrdfBotApiBase::UrdfBotState(*getGroundTruthKinematics(),
+                                                                     clock()->nowNanos());
+    }
+}
+
+msr::airlib::UrdfBotApiBase::UrdfBotState UrdfBotSimApi::getUrdfBotState() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return published_state_;
 }
 
 // ---------------------------------------------------------------------------------------------

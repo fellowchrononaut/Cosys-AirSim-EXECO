@@ -109,6 +109,39 @@ void PawnSimApi::setupCamerasFromSettings(const common_utils::UniqueValueMap<std
     //create or replace cameras specified in settings
     createCamerasFromSettings();
 
+    // ⚠ Guarantee a DEFAULT camera under the empty name.
+    //
+    // "" is AirSim's established convention for "this vehicle's default camera" — every stock pawn
+    // registers it explicitly (FlyingPawn.cpp:68, CarPawn.cpp:221, ComputerVisionPawn.cpp:88,
+    // SkidVehiclePawn.cpp:224) — and AirSim's OWN code relies on it: loadDefaultRecordingSettings
+    // builds an ImageRequest("") for every vehicle when settings declare no Recording section
+    // (AirSimSettings.hpp:1228).
+    //
+    // A pawn whose cameras come only from settings has no such entry, because nothing registers
+    // one. UrdfBotPawn::getCameras() returns an empty map by design — a URDF robot has whatever
+    // cameras its operator declared and no built-in rig — so pressing Record on a scene of URDF
+    // robots resolved "" through std::map::at, threw std::out_of_range on FRecordingThread where
+    // nothing catches it, and ABORTED THE EDITOR. Confirmed from the core dump 2026-08-18.
+    //
+    // Aliasing rather than special-casing the recording path, because the convention is what is
+    // missing: any client passing "" for "the default camera" hit the same wall.
+    //
+    // ⚠ "0" is deliberately NOT aliased as well. Stock pawns provide it, and a Recording section
+    // without CameraName asks for it (AirSimSettings.hpp:1218-1220), so it is tempting. But "0"
+    // means "the camera at index 0", and for a robot with named cameras there is no meaningful
+    // index — map order is alphabetical, not physical. Picking one would answer a question the
+    // settings never asked; an error naming the available cameras tells the operator to name one.
+    if (cameras_.getMap().count("") == 0 && !cameras_.getMap().empty()) {
+        // ⚠ Read the name BEFORE inserting. "" sorts first in a std::map, so after the insert
+        // begin() is the alias itself and the log would report the empty name it just created.
+        const std::string default_name = cameras_.getMap().begin()->first;
+        APIPCamera* default_camera = cameras_.getMap().begin()->second;
+        cameras_.insert_or_assign("", default_camera);
+        UAirBlueprintLib::LogMessageString(
+            "no built-in camera rig; default camera (\"\") aliased to: ",
+            default_name, LogDebugLevel::Informational);
+    }
+
     //setup individual cameras
     const auto& camera_defaults = AirSimSettings::singleton().camera_defaults;
     for (auto& pair : cameras_.getMap()) {
