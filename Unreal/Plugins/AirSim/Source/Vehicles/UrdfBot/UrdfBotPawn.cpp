@@ -286,15 +286,9 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
     desc.ReserveNewPolygons(tri_count);
 
     for (int32 t = 0; t < tri_count; ++t) {
-        // ⚠ Same Y mirror as the procedural path — Unreal is left-handed — and the SAME winding
-        // decision, so the two paths cannot disagree about which way a face points. Reversing the
-        // order here compensates for the mirror's handedness flip; signed-volume measurement on the
-        // real meshes showed +V in source space and -V after the mirror, i.e. the mirror alone
-        // leaves every face inward.
-        // ⚠ HONOURS UrdfMeshFlipWinding, like the procedural path. Hardcoding the reversal here
-        // made the two paths untestable against each other: the procedural one could be flipped
-        // from settings while this one could not, so "both look wrong" could not distinguish
-        // "both wound the same wrong way" from "the winding is irrelevant".
+        // Use the same baked Y-axis basis conversion and winding rule as the procedural path. For a
+        // positive URDF mesh scale the source indices are retained; an additional odd negative scale
+        // reverses them. The normal below follows Unreal's Cross(e2,e1) convention.
         const bool reverse = ((sx * sy * sz) < 0.0) != mesh_flip_winding_;
         const int32 src[3] = { t * 3 + 0,
                                reverse ? t * 3 + 2 : t * 3 + 1,
@@ -322,7 +316,7 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
                              positions[desc.GetVertexInstanceVertex(inst[0])];
         const FVector3f e2 = positions[desc.GetVertexInstanceVertex(inst[2])] -
                              positions[desc.GetVertexInstanceVertex(inst[0])];
-        const FVector3f n = FVector3f::CrossProduct(e1, e2).GetSafeNormal();
+        const FVector3f n = FVector3f::CrossProduct(e2, e1).GetSafeNormal();
         for (int32 k = 0; k < 3; ++k) normals[inst[k]] = n;
 
         desc.CreatePolygon(group, TArray<FVertexInstanceID>({ inst[0], inst[1], inst[2] }));
@@ -417,12 +411,12 @@ bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
     c->SetRelativeTransform(UrdfTransform::toFTransform(origin, world_to_meters));
     c->SetCollisionEnabled(collidable ? ECollisionEnabled::QueryOnly
                                       : ECollisionEnabled::NoCollision);
-    c->RegisterComponent();
 
     // Same tint the procedural path applies — the material was measured to be correct, so this
     // path must not diverge from it.
-    if (mesh_material_ != nullptr && !mesh_tint_) {
-        // Same as the primitives: the instance itself, no MID. See the note in the procedural path.
+    const bool apply_urdf_tint = mesh_tint_ && material.present;
+    if (mesh_material_ != nullptr && !apply_urdf_tint) {
+        // No declared URDF material (or tinting explicitly disabled): keep the shared parent.
         c->SetMaterial(0, mesh_material_);
     }
     else if (mesh_material_ != nullptr) {
@@ -430,13 +424,14 @@ bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
             const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
                                     static_cast<float>(material.b), static_cast<float>(material.a));
             mid->SetVectorParameterValue(TEXT("Color"), tint);
-            mid->SetVectorParameterValue(TEXT("BaseColor"), tint);
-            // Roughness is the only parameter this material exposes - see the note in the
-            // procedural path.
+            // BasicShapeMaterial_Inst exposes Color and Roughness. Keep generated URDF visuals
+            // matte and use the same policy in both the procedural and runtime-static paths.
             mid->SetScalarParameterValue(TEXT("Roughness"), 1.0f);
             c->SetMaterial(0, mid);
         }
     }
+    c->RegisterComponent();
+    applySegmentationId(c, segmentation_id_);
     return true;
 }
 
@@ -634,22 +629,9 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     for (const urdf::Vec3& v : *verts)
         positions.Add(FVector(v.x * sx, -v.y * sy, v.z * sz));
 
-    // ⚠ Winding is NOT reversed, and this is settled by OBSERVATION, not by derivation.
-    //
-    // I derived the opposite twice — that the Y mirror flips a triangle's orientation relative to
-    // its solid, so the winding must be flipped back — and built it. It was wrong. The robot
-    // rendered correctly with the winding left alone and the normal taken as cross(e1, e2); the
-    // black robot was ALWAYS the material (the bare BasicShapeMaterial base rather than
-    // BasicShapeMaterial_Inst), and it changed the moment the instance was used, with these lines
-    // untouched.
-    //
-    // The derivation failed because it reasoned about "outward" using right-handed intuition while
-    // Unreal is left-handed, and the handedness change is exactly what the mirror performs. That is
-    // not a detail worth re-deriving: it is worth deferring to the rendered result, which is cheap
-    // to check and cannot be argued with. The rule also matches what the level mirror already does
-    // for the same conversion — only a mirrored (negative) scale needs reversing.
-    // Base rule: only a mirrored (negative) <scale> reverses. mesh_flip_winding_ inverts that
-    // decision wholesale, so the alternative can be tested in one run rather than argued about.
+    // The baked Y-axis conversion changes coordinate basis, while Unreal's mesh helpers define the
+    // outward face normal as Cross(e2,e1). Retain source indices for positive mesh scale; reverse
+    // only for an additional odd negative scale. mesh_flip_winding_ remains a diagnostic override.
     const bool reverse_winding = ((sx * sy * sz) < 0.0) != mesh_flip_winding_;
 
     normals.SetNum(vertex_count);
@@ -668,7 +650,7 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
         // consistent whichever branch above ran.
         const FVector e1 = positions[i1] - positions[i0];
         const FVector e2 = positions[i2] - positions[i0];
-        const FVector n = FVector::CrossProduct(e1, e2).GetSafeNormal();
+        const FVector n = FVector::CrossProduct(e2, e1).GetSafeNormal();
 
         // ⚠ Tangents are REQUIRED, not merely for normal mapping: UProceduralMeshComponent builds a
         // per-vertex tangent basis, and a zero-length TangentX leaves it degenerate. Any unit vector
@@ -814,20 +796,12 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
         UE_LOG(LogUrdfBot, Log, TEXT("mesh base material: %s"), *GetNameSafe(mesh_material_));
     }
 
-    // ⚠ NO MID AT ALL when tinting is off — the last difference between the links that shade
-    // correctly and the ones that do not.
-    //
-    // The Go2's head and LiDAR are drawn by the <collision> FALLBACK as engine BasicShapes, which
-    // keep BasicShapeMaterial_Inst untouched, and they look right in BOTH mesh paths. Every other
-    // link goes through a MID we create from that same instance, and every one of them looks
-    // wrong — under the same lights, the same VSM, the same Lumen. Winding, UVs, normals, shadow
-    // flags and the mesh path itself have all been changed and measured with no effect, which
-    // leaves the MID.
-    //
-    // A UMaterialInstanceDynamic cannot carry its own STATIC parameters, so one created from an
-    // instance can render with a different shader permutation than the instance does. Assigning
-    // the instance directly is exactly what the primitives do.
-    if (mesh_material_ != nullptr && !mesh_tint_) {
+    // UrdfMeshTint is a diagnostic/compatibility escape hatch. When enabled, a generated visual
+    // that declares a URDF material gets a component-specific MID. Visuals with no declared URDF
+    // material keep the shared parent instead of receiving an invented grey MID. A MID keeps its
+    // parent's compiled static permutation; Color and Roughness below are uniform overrides.
+    const bool apply_urdf_tint = mesh_tint_ && material.present;
+    if (mesh_material_ != nullptr && !apply_urdf_tint) {
         c->SetMaterial(0, mesh_material_);
     }
     else if (mesh_material_ != nullptr) {
@@ -858,11 +832,8 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
             }
             const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
                                     static_cast<float>(material.b), static_cast<float>(material.a));
-            // The parameter name differs between engine base materials, and a MID silently ignores
-            // one it does not have. Setting both costs nothing and means a base-material change
-            // does not turn the robot grey again.
+            // This parent material's vector parameter is named Color.
             mid->SetVectorParameterValue(TEXT("Color"), tint);
-            mid->SetVectorParameterValue(TEXT("BaseColor"), tint);
 
             // ⚠ SET THE SHADING PARAMETERS, do not inherit them. Only the colour was being
             // overridden, so the robot took whatever Metallic/Roughness BasicShapeMaterial_Inst
@@ -914,21 +885,10 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
                        has_metallic ? 1 : 0, got_metallic);
             }
 
-            // ⚠ Forced matte, and this is why the rover went black only when the camera got CLOSE.
-            //
-            // A smooth surface takes most of its colour from reflections. Blocks reports
-            // "REFLECTION CAPTURES NEED TO BE REBUILT", so up close the unbuilt local capture is
-            // sampled and contributes nothing, while at a distance the sky ambient still dominates
-            // — giving a robot that is correctly coloured far away and black near to. Pinning
-            // roughness makes a URDF robot's appearance depend on its <material> rather than on
-            // whether the operator has built lighting in their level.
-            mid->SetScalarParameterValue(TEXT("Roughness"), 0.85f);
-
-            // ⚠ AFTER RegisterComponent, not before. An override material set on an unregistered
-            // component is not reliably carried into the scene proxy built at registration.
-            c->RegisterComponent();
+            // Set the override before registration so the first scene proxy is built with the MID.
+            // SetMaterial retains it in OverrideMaterials; no explicit render-state dirty call is
+            // needed here.
             c->SetMaterial(0, mid);
-            c->MarkRenderStateDirty();
 
             // Ask the MID what it actually took. GetVectorParameterValue returns false when the
             // parameter does not exist on the material, which is the one thing that distinguishes

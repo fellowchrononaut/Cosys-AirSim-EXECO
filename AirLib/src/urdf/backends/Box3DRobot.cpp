@@ -643,14 +643,20 @@ void Box3DRobot::instantiate()
     if (opts_.add_ground_plane) {
         b3BodyDef bd = b3DefaultBodyDef();
         bd.type = b3_staticBody;
-        bd.position = toB3Pos(0.0, 0.0, opts_.ground_plane_z - 0.5);
+        // Each robot owns an independent Box3D world, so centre its finite fallback slab under
+        // that robot's world-space spawn. Centring it at the level origin silently fails in maps
+        // such as CPLite, whose PlayerStart is more than 150 m from (0,0): the requested plane is
+        // created correctly, but the robot falls beside it. root_position is also the reset pose,
+        // so instantiate() recreates the slab at the same deterministic location after reset.
+        bd.position = toB3Pos(opts_.root_position.x, opts_.root_position.y,
+                              opts_.ground_plane_z - 0.5);
         bd.name = "ground_plane";
         b3BodyId ground = b3CreateBody(world_, &bd);
 
         b3ShapeDef sd = b3DefaultShapeDef();
         sd.baseMaterial.friction = static_cast<float>(opts_.ground_friction);
-        // A thick, wide slab rather than a true half-space: Box3D has no infinite plane, and depth
-        // keeps a fast-moving wheel from tunnelling through it.
+        // A thick, 100 m-wide slab rather than a true half-space: Box3D has no infinite plane,
+        // and depth keeps a fast-moving wheel from tunnelling through it.
         const b3BoxHull box = b3MakeBoxHull(50.0f, 50.0f, 0.5f);
         b3CreateHullShape(ground, &sd, &box.base);
     }

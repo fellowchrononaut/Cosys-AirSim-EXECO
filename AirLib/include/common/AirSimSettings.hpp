@@ -499,12 +499,8 @@ namespace airlib
             /// concavely (Box3D) ignore both.
             /// Apply the URDF <material> colour through a dynamic material instance.
             ///
-            /// ⚠ FALSE assigns the base material instance directly, exactly as the engine
-            /// BasicShapes primitives do — and those primitives are the ONLY links that shade
-            /// correctly. The Go2's head and LiDAR have no <visual>, so they fall back to their
-            /// <collision> cylinder and sphere, keep BasicShapeMaterial_Inst untouched, and look
-            /// right in both mesh paths while every MID-tinted link looks wrong under identical
-            /// lighting. Turning this off costs per-link colour and tests that difference.
+            /// FALSE assigns the shared base material directly and intentionally drops per-visual
+            /// colour. This remains available as a rendering diagnostic; normal operation uses MIDs.
             bool urdf_mesh_tint = true;
 
             /// Build real UStaticMeshes at runtime for <visual><mesh> links instead of using
@@ -744,11 +740,12 @@ namespace airlib
             /// without reintroducing that function's cost, which dominated load time.
             bool urdf_mesh_smooth_normals = false;
 
-            /// Reverse triangle winding and the face normal together.
+            /// Reverse triangle winding and its generated face normal together.
             ///
-            /// ⚠ Which winding is correct after the URDF-to-Unreal Y mirror was derived twice, both
-            /// times wrongly, because "outward" was reasoned about with right-handed intuition while
-            /// Unreal is left-handed. This makes it a one-run experiment instead of an argument.
+            /// Diagnostic override only. With the normal positive-scale URDF-to-Unreal basis
+            /// conversion this must remain false; true turns a closed mesh inside-out, so the
+            /// camera-facing exterior is culled and the far interior can look like a hollow shell.
+            /// An odd negative URDF mesh scale is handled independently by the renderer.
             bool urdf_mesh_flip_winding = false;
 
             /// Build the link material from the bare BasicShapeMaterial base instead of from
@@ -807,10 +804,11 @@ namespace airlib
 
             /// Height of a flat static floor, in metres, or NaN for none.
             ///
-            /// ⚠ SCAFFOLDING, and a FALLBACK ONLY — suppressed whenever the level mirror produces
-            /// geometry, because a flat 100 m slab and a real level are not additive: the slab
-            /// would sit through the map and a rover driving down a ramp would stop dead on an
-            /// invisible floor. Two floors is a worse failure than none, because none is obvious.
+            /// ⚠ SCAFFOLDING, and an explicit OPERATOR OVERRIDE. Unlike the automatic fallback,
+            /// an explicit value is honoured even when the level mirror contains geometry. This is
+            /// for maps whose props have collision but whose terrain does not: unrelated mirrored
+            /// props must not silently erase the requested floor. Keep it project-specific because
+            /// a flat 100 m slab can cut through ramps and uneven terrain.
             ///
             /// ⚠ Now an ABSOLUTE height in the world frame, not a height in the robot's frame.
             /// The solver frame is the Unreal world frame as of §6.0c.
@@ -818,9 +816,9 @@ namespace airlib
 
             /// Put the scaffolding floor wherever a downward probe from the spawn point hits.
             ///
-            /// Preferred over UrdfGroundPlaneZ, and still the right answer when a level genuinely
-            /// has no mirrorable collision. Measuring beats asking the operator for an offset
-            /// between two things neither of you can see.
+            /// Preferred over UrdfGroundPlaneZ when a level genuinely has no mirrorable collision.
+            /// It remains fallback-only and is suppressed after a non-empty successful mirror;
+            /// use the explicit override when the mirror contains props but no usable terrain.
             bool urdf_ground_plane_auto = false;
 
             /// Keyboard/gamepad driving for a URDF robot.

@@ -517,8 +517,20 @@ void UrdfBotSimApi::loadModelAndBackend()
     // Deriving a floor from mirrored geometry failed repeatedly on Blocks, whose ground is one
     // 40 km mesh with a bounding box 442 m tall around a surface at z = 0.36.
     //
+    // An explicit plane is an operator override. Do not also sample a height field: the two
+    // scaffolds would overlap, and the explicit value must remain deterministic.
+    const bool has_explicit_ground_plane =
+        !std::isnan(vehicle_setting_->urdf_ground_plane_z);
+    UE_LOG(LogUrdfBot, Log,
+           TEXT("ground configuration [%s]: auto=%d explicit=%d z=%.6f m"),
+           UTF8_TO_TCHAR(getVehicleName().c_str()),
+           vehicle_setting_->urdf_ground_plane_auto ? 1 : 0,
+           has_explicit_ground_plane ? 1 : 0,
+           vehicle_setting_->urdf_ground_plane_z);
+
     // Only backends that ask for it get one; Box3D cooks the real triangles and needs nothing.
-    if (backend->needsScaffoldingGroundPlane() && vehicle_setting_->urdf_ground_plane_auto) {
+    if (backend->needsScaffoldingGroundPlane() && vehicle_setting_->urdf_ground_plane_auto &&
+        !has_explicit_ground_plane) {
         urdf::BackendOptions::HeightField hf;
         if (sampleGroundHeightField(opts.root_position,
                                     vehicle_setting_->urdf_ground_sample_extent, hf)) {
@@ -657,16 +669,37 @@ void UrdfBotSimApi::loadModelAndBackend()
     // instead. Box3D cooks the real ground triangles and must NOT get a second floor through the
     // map. Suppressing the plane purely on "did the level mirror" conflated the two and left the
     // MuJoCo robot with nothing to stand on.
-    const bool suppress_ground_plane = have_static_world && !backend->needsScaffoldingGroundPlane();
+    const bool suppress_automatic_ground_plane =
+        have_static_world && !backend->needsScaffoldingGroundPlane();
     // --- scaffolding floor: FALLBACK ONLY, now that the level is mirrored ----------------------
     //
-    // ⚠ Suppressed whenever real geometry exists. A flat plane and a mirrored level are not
+    // ⚠ The automatic plane is suppressed whenever real geometry exists. A flat plane and a
+    // mirrored level are not
     // additive: the plane is infinite-ish (a 100 m slab) and would sit *through* the map, so a
     // rover driving down a ramp would stop dead in mid-air on an invisible floor. Two floors is a
     // worse failure than none, because none is obvious.
-    if (suppress_ground_plane) {
-        if (vehicle_setting_->urdf_ground_plane_auto ||
-            !std::isnan(vehicle_setting_->urdf_ground_plane_z)) {
+    // An explicit Z is deliberately different: it is an operator assertion that the mirrored
+    // world lacks usable support (for example, a NoCollision Landscape plus solid park props).
+    // Honour it even beside a non-empty mirror; project-specific settings carry the flat-floor
+    // tradeoff rather than silently dropping the requested floor.
+    if (has_explicit_ground_plane) {
+        opts.add_ground_plane = true;
+        opts.ground_plane_z = vehicle_setting_->urdf_ground_plane_z;
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("explicit ground plane [%s]: enabled at world z=%.6f m alongside %d "
+                    "mirrored shapes"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), opts.ground_plane_z,
+               static_cast<int32>(static_world_ ? static_world_->shapeCount() : 0));
+        UAirBlueprintLib::LogMessageString(
+            "UrdfBot: ground override ",
+            Utils::stringf("%s - explicit scaffolding floor placed at z = %.3f m alongside %d "
+                           "mirrored shapes.",
+                           getVehicleName().c_str(), opts.ground_plane_z,
+                           static_cast<int32>(static_world_ ? static_world_->shapeCount() : 0)),
+            LogDebugLevel::Informational);
+    }
+    else if (suppress_automatic_ground_plane) {
+        if (vehicle_setting_->urdf_ground_plane_auto) {
             UAirBlueprintLib::LogMessageString(
                 "UrdfBot: ",
                 getVehicleName() + " asked for a scaffolding ground plane, but the level mirrored "
@@ -702,11 +735,6 @@ void UrdfBotSimApi::loadModelAndBackend()
                 LogDebugLevel::Failure);
         }
     }
-    else if (!std::isnan(vehicle_setting_->urdf_ground_plane_z)) {
-        opts.add_ground_plane = true;
-        opts.ground_plane_z = vehicle_setting_->urdf_ground_plane_z;
-    }
-
     // --- progress, because a cold cook freezes the editor for minutes -------------------------
     //
     // ⚠ This work is SYNCHRONOUS on the game thread. buildFromUrdf decomposes every <mesh>
@@ -1094,7 +1122,7 @@ void UrdfBotSimApi::loadModelAndBackend()
     UE_LOG(LogUrdfBot, Log,
            TEXT("mesh shading [%s]: cast_shadow=%d contact_shadow=%d inset_shadow=%d "
                 "two_sided_shadow=%d smooth_normals=%d flip_winding=%d base_material=%d "
-                "runtime_static=%d"),
+                "runtime_static=%d tint=%d"),
            UTF8_TO_TCHAR(getVehicleName().c_str()),
            vehicle_setting_->urdf_mesh_cast_shadow ? 1 : 0,
            vehicle_setting_->urdf_mesh_contact_shadow ? 1 : 0,
@@ -1103,7 +1131,8 @@ void UrdfBotSimApi::loadModelAndBackend()
            vehicle_setting_->urdf_mesh_smooth_normals ? 1 : 0,
            vehicle_setting_->urdf_mesh_flip_winding ? 1 : 0,
            vehicle_setting_->urdf_mesh_base_material ? 1 : 0,
-           vehicle_setting_->urdf_mesh_runtime_static ? 1 : 0);
+           vehicle_setting_->urdf_mesh_runtime_static ? 1 : 0,
+           vehicle_setting_->urdf_mesh_tint ? 1 : 0);
     pawn->buildFromModel(model_, dirOf(urdf_path), vehicle_setting_->urdf_mesh_search_paths);
 
     // Settled below, AFTER the render buffers exist — see settleAndPublish().

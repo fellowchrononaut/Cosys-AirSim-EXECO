@@ -198,9 +198,8 @@ private:
     /// tangents and shadow-cache behaviour.
     bool mesh_runtime_static_ = true;
 
-    /// Apply the URDF <material> colour through a dynamic material instance.
-    /// FALSE assigns the base material instance directly, exactly as the engine
-    /// BasicShapes primitives do - which are the only links that shade correctly.
+    /// Apply inline URDF <material><color> values through one MID per generated mesh visual.
+    /// FALSE assigns the shared base material directly and is retained as a diagnostic escape hatch.
     bool mesh_tint_ = true;
 
     class UStaticMesh* buildStaticMeshFromData(const urdf::MeshData& mesh,
