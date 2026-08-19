@@ -497,6 +497,16 @@ namespace airlib
             /// Half-extent of the box around the robot within which level triangles become
             /// collision geometry, and the hard ceiling on how many. Backends that mirror the level
             /// concavely (Box3D) ignore both.
+            /// Apply the URDF <material> colour through a dynamic material instance.
+            ///
+            /// ⚠ FALSE assigns the base material instance directly, exactly as the engine
+            /// BasicShapes primitives do — and those primitives are the ONLY links that shade
+            /// correctly. The Go2's head and LiDAR have no <visual>, so they fall back to their
+            /// <collision> cylinder and sphere, keep BasicShapeMaterial_Inst untouched, and look
+            /// right in both mesh paths while every MID-tinted link looks wrong under identical
+            /// lighting. Turning this off costs per-link colour and tests that difference.
+            bool urdf_mesh_tint = true;
+
             /// Build real UStaticMeshes at runtime for <visual><mesh> links instead of using
             /// UProceduralMeshComponent.
             ///
@@ -1550,6 +1560,8 @@ namespace airlib
                     settings_json.getBool("UrdfDumpCollisionObj", false);
                 vehicle_setting->urdf_mesh_runtime_static =
                     settings_json.getBool("UrdfMeshRuntimeStatic", false);
+                vehicle_setting->urdf_mesh_tint =
+                    settings_json.getBool("UrdfMeshTint", true);
                 vehicle_setting->urdf_static_world_max_triangles =
                     settings_json.getInt("UrdfStaticWorldMaxTriangles", 20000);
 

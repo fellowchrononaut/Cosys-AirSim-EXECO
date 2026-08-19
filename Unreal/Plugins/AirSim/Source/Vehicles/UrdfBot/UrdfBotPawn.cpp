@@ -291,7 +291,14 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
         // order here compensates for the mirror's handedness flip; signed-volume measurement on the
         // real meshes showed +V in source space and -V after the mirror, i.e. the mirror alone
         // leaves every face inward.
-        const int32 src[3] = { t * 3 + 0, t * 3 + 2, t * 3 + 1 };
+        // ⚠ HONOURS UrdfMeshFlipWinding, like the procedural path. Hardcoding the reversal here
+        // made the two paths untestable against each other: the procedural one could be flipped
+        // from settings while this one could not, so "both look wrong" could not distinguish
+        // "both wound the same wrong way" from "the winding is irrelevant".
+        const bool reverse = ((sx * sy * sz) < 0.0) != mesh_flip_winding_;
+        const int32 src[3] = { t * 3 + 0,
+                               reverse ? t * 3 + 2 : t * 3 + 1,
+                               reverse ? t * 3 + 1 : t * 3 + 2 };
 
         FVertexInstanceID inst[3];
         for (int32 k = 0; k < 3; ++k) {
@@ -301,7 +308,13 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
                                        static_cast<float>(-v.y * sy),
                                        static_cast<float>(v.z * sz));
             inst[k] = desc.CreateVertexInstance(vid);
-            uvs[inst[k]] = FVector2f(0.0f, 0.0f);
+            // ⚠ NOT all-zero. Every vertex sharing one UV means any texture in the material
+            // samples a single texel, and it leaves the tangent basis degenerate — the engine
+            // derives tangents from UV gradients, so a zero gradient yields no usable basis. The
+            // engine's own BasicShapes have proper UVs, which is one concrete difference between
+            // the links that shade correctly and the ones that do not. A planar projection is
+            // arbitrary but well-formed, which is all a flat-shaded robot needs.
+            uvs[inst[k]] = FVector2f(static_cast<float>(v.x), static_cast<float>(v.z));
         }
 
         // Flat face normal; the engine recomputes tangents during the build.
@@ -376,7 +389,14 @@ bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
     const urdf::MeshData& data = it->second;
     if (data.vertices.size() < 3) return false;
 
-    const double sx = g.mesh_scale.x, sy = g.mesh_scale.y, sz = g.mesh_scale.z;
+    // ⚠ × world_to_meters, EXACTLY as the procedural path does at its own scale computation.
+    // URDF vertices are in METRES and Unreal is centimetre-based, so omitting this builds the mesh
+    // 100x too small: correct triangles, correct bounds, one section, right material — and half a
+    // millimetre across, which looks precisely like "invisible". That is what it was.
+    const float world_to_meters = 100.0f;
+    const double sx = g.mesh_scale.x * world_to_meters;
+    const double sy = g.mesh_scale.y * world_to_meters;
+    const double sz = g.mesh_scale.z * world_to_meters;
     const FString key = FString::Printf(TEXT("%s|%f|%f|%f"), UTF8_TO_TCHAR(resolved.c_str()),
                                         sx, sy, sz);
     UStaticMesh* built = buildStaticMeshFromData(data, key, sx, sy, sz);
@@ -394,9 +414,6 @@ bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
     c->bCastContactShadow = mesh_contact_shadow_;
 
     c->SetStaticMesh(built);
-    // Same fixed scale the other attach paths use — AirSim's world-to-metres is 100 and these are
-    // relative offsets only.
-    const float world_to_meters = 100.0f;
     c->SetRelativeTransform(UrdfTransform::toFTransform(origin, world_to_meters));
     c->SetCollisionEnabled(collidable ? ECollisionEnabled::QueryOnly
                                       : ECollisionEnabled::NoCollision);
@@ -404,14 +421,19 @@ bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
 
     // Same tint the procedural path applies — the material was measured to be correct, so this
     // path must not diverge from it.
-    if (mesh_material_ != nullptr) {
+    if (mesh_material_ != nullptr && !mesh_tint_) {
+        // Same as the primitives: the instance itself, no MID. See the note in the procedural path.
+        c->SetMaterial(0, mesh_material_);
+    }
+    else if (mesh_material_ != nullptr) {
         if (UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this)) {
             const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
                                     static_cast<float>(material.b), static_cast<float>(material.a));
             mid->SetVectorParameterValue(TEXT("Color"), tint);
             mid->SetVectorParameterValue(TEXT("BaseColor"), tint);
-            mid->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
-            mid->SetScalarParameterValue(TEXT("Roughness"), 0.75f);
+            // Roughness is the only parameter this material exposes - see the note in the
+            // procedural path.
+            mid->SetScalarParameterValue(TEXT("Roughness"), 1.0f);
             c->SetMaterial(0, mid);
         }
     }
@@ -792,7 +814,23 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
         UE_LOG(LogUrdfBot, Log, TEXT("mesh base material: %s"), *GetNameSafe(mesh_material_));
     }
 
-    if (mesh_material_ != nullptr) {
+    // ⚠ NO MID AT ALL when tinting is off — the last difference between the links that shade
+    // correctly and the ones that do not.
+    //
+    // The Go2's head and LiDAR are drawn by the <collision> FALLBACK as engine BasicShapes, which
+    // keep BasicShapeMaterial_Inst untouched, and they look right in BOTH mesh paths. Every other
+    // link goes through a MID we create from that same instance, and every one of them looks
+    // wrong — under the same lights, the same VSM, the same Lumen. Winding, UVs, normals, shadow
+    // flags and the mesh path itself have all been changed and measured with no effect, which
+    // leaves the MID.
+    //
+    // A UMaterialInstanceDynamic cannot carry its own STATIC parameters, so one created from an
+    // instance can render with a different shader permutation than the instance does. Assigning
+    // the instance directly is exactly what the primitives do.
+    if (mesh_material_ != nullptr && !mesh_tint_) {
+        c->SetMaterial(0, mesh_material_);
+    }
+    else if (mesh_material_ != nullptr) {
         UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this);
         if (mid) {
             // ⚠ ENUMERATE THE PARAMETERS ONCE. A MID silently ignores a parameter the material does
@@ -836,9 +874,22 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
             // A URDF <material> describes a diffuse colour and nothing else — there is no notion of
             // metalness in the format — so treating it as a matte dielectric is the faithful
             // reading, not a stylistic choice.
-            mid->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
-            mid->SetScalarParameterValue(TEXT("Roughness"), 0.75f);
-            mid->SetScalarParameterValue(TEXT("Specular"), 0.35f);
+            // ⚠ ROUGHNESS IS THE ONLY LEVER THIS MATERIAL GIVES US. Enumerating the parameters shows
+            // BasicShapeMaterial_Inst exposes exactly two: Color and Roughness. There is NO Metallic
+            // and no Specular, so setting them was a silent no-op — a MID discards any parameter the
+            // material does not expose, and does so without complaint.
+            //
+            // ⚠ And the read-back diagnostic LIED about it: GetScalarParameterValue reported
+            // "Metallic exists=1 (0.00)" while the enumeration proves it is not a parameter. The
+            // enumeration is the trustworthy one. Two of my own measurements disagreed and I
+            // believed the wrong one.
+            //
+            // 1.0 is fully matte. A dark Color on a glossy surface reads as near-black with bright
+            // specular rims that pick up nearby lights and shift with view angle — which is exactly
+            // the "shiny, tinted, dark up close" appearance that sent this investigation through
+            // normals, winding, shadows, VSM and Lumen before anyone looked at what the material
+            // actually exposes.
+            mid->SetScalarParameterValue(TEXT("Roughness"), 1.0f);
 
             // ⚠ Read the value BACK. Setting a parameter always "succeeds"; only a read-back shows
             // whether the material actually holds it.

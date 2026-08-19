@@ -69,9 +69,10 @@ public:
                         bool base_material, bool inset_shadow, bool two_sided_shadow,
                         bool contact_shadow, double decimate_grid,
                         const std::string& asset_dir, double asset_scale,
-                        bool runtime_static)
+                        bool runtime_static, bool tint)
     {
         mesh_runtime_static_ = runtime_static;
+        mesh_tint_ = tint;
         mesh_asset_dir_ = asset_dir;
         mesh_asset_scale_ = asset_scale;
         mesh_decimate_grid_ = decimate_grid;
@@ -196,6 +197,11 @@ private:
     /// to do nothing, while a UStaticMeshComponent gets engine-built bounds,
     /// tangents and shadow-cache behaviour.
     bool mesh_runtime_static_ = true;
+
+    /// Apply the URDF <material> colour through a dynamic material instance.
+    /// FALSE assigns the base material instance directly, exactly as the engine
+    /// BasicShapes primitives do - which are the only links that shade correctly.
+    bool mesh_tint_ = true;
 
     class UStaticMesh* buildStaticMeshFromData(const urdf::MeshData& mesh,
                                                const FString& key, double sx,

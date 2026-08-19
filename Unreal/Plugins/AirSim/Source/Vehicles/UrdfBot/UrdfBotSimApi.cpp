@@ -1089,7 +1089,8 @@ void UrdfBotSimApi::loadModelAndBackend()
                          vehicle_setting_->urdf_mesh_decimate_grid,
                          vehicle_setting_->urdf_mesh_asset_dir,
                          vehicle_setting_->urdf_mesh_asset_scale,
-                         vehicle_setting_->urdf_mesh_runtime_static);
+                         vehicle_setting_->urdf_mesh_runtime_static,
+                         vehicle_setting_->urdf_mesh_tint);
     UE_LOG(LogUrdfBot, Log,
            TEXT("mesh shading [%s]: cast_shadow=%d contact_shadow=%d inset_shadow=%d "
                 "two_sided_shadow=%d smooth_normals=%d flip_winding=%d base_material=%d "
