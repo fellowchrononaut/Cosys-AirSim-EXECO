@@ -126,6 +126,31 @@ struct FMirrorOptions {
     /// so the fix is to re-collect only the kinematic half, later, when every pawn exists.
     bool bKinematicOnly = false;
 
+    /// Mirror landscape terrain by reading its Chaos heightfield directly.
+    ///
+    /// ⚠ Terrain does NOT arrive through any of the generic paths.
+    /// `ULandscapeHeightfieldCollisionComponent` does not implement
+    /// `IInterface_CollisionDataProvider` — the interface appears nowhere in UE 5.6's whole
+    /// Landscape module — and it carries no `AggGeom`. So a landscape looks to the generic
+    /// extractors exactly like a component with no collision, in every map, and the robot is
+    /// handed a world with buildings and props but no ground. That reads at runtime as "the
+    /// mirror does not work", when in fact everything except the thing you stand on mirrored.
+    bool bIncludeLandscape = true;
+
+    /// Mirror EVERY instance of an instanced/foliage mesh component, not just the base asset.
+    ///
+    /// ⚠ Off, an `InstancedStaticMeshComponent` is mirrored by the generic path as ONE body at
+    /// the component's own transform — which for foliage is the InstancedFoliageActor's origin.
+    /// That is worse than skipping it: a phantom tree at the map origin and no collision on any
+    /// of the real ones. Modern maps put most of their solid clutter behind ISM/HISM/PCG, so
+    /// this is the difference between mirroring a level and mirroring its skeleton.
+    bool bIncludeInstancedMeshes = true;
+
+    /// Level-wide ceiling on mirrored instances. A dense foliage map can hold hundreds of
+    /// thousands; each one costs a body plus a copy of its geometry. Hitting the cap is reported
+    /// loudly rather than silently truncating the world.
+    int32 MaxInstances = 50000;
+
     double DefaultFriction = 0.7;
     double DefaultRestitution = 0.0;
 };
@@ -142,6 +167,17 @@ struct FMirrorStats {
     int32 ComponentsKinematic = 0;
     int32 ComponentsVehicle = 0;
     int32 ComponentsSkippedNotBlocking = 0;
+
+    /// Terrain, counted separately from everything else. A mirror can be "357 components, 7.2 M
+    /// triangles" and still contain no ground at all, so the ground gets its own line.
+    int32 LandscapeComponentsMirrored = 0;
+    int32 LandscapeComponentsSkipped = 0;
+
+    /// Instanced/foliage geometry, likewise counted apart: "1 component mirrored" and "1 component
+    /// mirrored, 4 812 instances" are wildly different worlds and used to print identically.
+    int32 InstancedComponents = 0;
+    int32 InstancesMirrored = 0;
+    int32 InstancesSkippedOverBudget = 0;
 
     /// The strict pass found nothing and the relaxed pass ran. The mirror is usable, but the
     /// level's collision channels are not what this code assumed, which is worth fixing properly.

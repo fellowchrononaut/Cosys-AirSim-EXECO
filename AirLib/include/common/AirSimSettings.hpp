@@ -503,6 +503,50 @@ namespace airlib
             /// colour. This remains available as a rendering diagnostic; normal operation uses MIDs.
             bool urdf_mesh_tint = true;
 
+            /// Force the URDF <material> to win over the colours a mesh file declares for itself.
+            ///
+            /// ⚠ DEFAULTS FALSE, and the default is the whole point. A .dae carries one material
+            /// per submesh while a URDF <material> is a single flat colour for an entire link, so
+            /// letting the URDF win throws away every colour but one. It is also usually not an
+            /// authored value: the Unitree Go2's URDF declares rgba "1 1 1 1" seventeen times and
+            /// the AgileX Scout's declares no <material> at all, while their .dae files hold the
+            /// real pale-shell-and-matte-black and white-red-yellow liveries.
+            ///
+            /// Set TRUE to hand-author a robot's appearance from the URDF without editing meshes —
+            /// the interim fix that was available before mesh materials were read at all. A mesh
+            /// section whose own material is absent falls back to the URDF colour either way, so
+            /// this only decides the CONFLICT.
+            bool urdf_mesh_material_override = false;
+
+            /// Roughness for every generated URDF visual. 1.0 is fully matte.
+            ///
+            /// ⚠ It is the ONLY shading lever the base material gives us. Enumerating
+            /// BasicShapeMaterial_Inst's parameters shows exactly two — Color and Roughness. There
+            /// is no Metallic and no Specular, and setting them is a silent no-op.
+            ///
+            /// 1.0 is the faithful default: neither a URDF <material> nor a Collada <lambert>
+            /// describes gloss, so treating a diffuse colour as a matte dielectric invents nothing.
+            /// Lower it to give a robot specular definition — but ⚠ a DARK colour on a glossy
+            /// surface renders very nearly black, lit only by specular rims that shift with view
+            /// angle. That appearance is what sent an earlier investigation through normals,
+            /// winding, shadows, VSM and Lumen before anyone looked at the material.
+            double urdf_mesh_roughness = 1.0;
+
+            /// Treat declared mesh/URDF colours as sRGB and linearise them before shading.
+            ///
+            /// ⚠ DEFAULTS FALSE, which is the faithful reading: Collada's profile_COMMON <color>
+            /// is specified linear, Blender (which exported our .dae files) stores and writes
+            /// linear, and Unreal's FLinearColor is linear — so the numbers pass through untouched.
+            ///
+            /// It exists because the consequence is easy to mistake for a bug. A linear 0.672
+            /// displays at roughly sRGB 214/255, so the Unitree Go2's grey shell — 0.672 0.692
+            /// 0.774 over most of its surface, which the robot's own MuJoCo model also calls
+            /// "gray" — reads as off-white on screen. That is correct, not washed out. Set TRUE to
+            /// see what the same numbers look like read as sRGB (midtones darken by roughly a
+            /// quarter; blacks and whites barely move) and settle the question by looking rather
+            /// than by arguing about a spec.
+            bool urdf_mesh_srgb_colors = false;
+
             /// Build real UStaticMeshes at runtime for <visual><mesh> links instead of using
             /// UProceduralMeshComponent.
             ///
@@ -794,6 +838,28 @@ namespace airlib
             /// ⚠ One-directional: they push this robot, this robot never pushes them through Box3D.
             /// The reverse coupling comes free through Unreal collision, and is just as crude.
             bool urdf_mirror_other_vehicles = false;
+
+            /// Mirror landscape terrain by reading its Chaos heightfield.
+            ///
+            /// ⚠ On by default because OFF is what the code used to do implicitly, and it was
+            /// never a choice anyone made. A landscape exposes no tri-mesh provider and no simple
+            /// collision, so it silently produced nothing; a map's buildings and props mirrored
+            /// perfectly while the ground they stand on did not exist, which is indistinguishable
+            /// from "the mirror is broken" and was worked around with a flat scaffolding plane.
+            bool urdf_mirror_landscape = true;
+
+            /// Mirror every instance of an instanced/foliage mesh component.
+            ///
+            /// ⚠ Also on by default, and also correcting a silent wrong answer rather than adding
+            /// a feature: an ISM/HISM previously mirrored as ONE body at the component's own
+            /// transform — for foliage, the InstancedFoliageActor's origin. A phantom collider at
+            /// the map origin, and nothing solid where the trees actually are.
+            bool urdf_mirror_instanced_meshes = true;
+
+            /// Level-wide ceiling on mirrored instances. Dense foliage maps hold hundreds of
+            /// thousands and each costs a body plus a copy of its geometry. Hitting the ceiling is
+            /// reported in the load-time mirror report, never silently.
+            int urdf_mirror_max_instances = 50000;
 
             /// If non-empty, mirror only actors carrying one of these tags.
             ///
@@ -1560,6 +1626,12 @@ namespace airlib
                     settings_json.getBool("UrdfMeshRuntimeStatic", false);
                 vehicle_setting->urdf_mesh_tint =
                     settings_json.getBool("UrdfMeshTint", true);
+                vehicle_setting->urdf_mesh_material_override =
+                    settings_json.getBool("UrdfMeshMaterialOverride", false);
+                vehicle_setting->urdf_mesh_roughness =
+                    settings_json.getDouble("UrdfMeshRoughness", 1.0);
+                vehicle_setting->urdf_mesh_srgb_colors =
+                    settings_json.getBool("UrdfMeshSrgbColors", false);
                 vehicle_setting->urdf_static_world_max_triangles =
                     settings_json.getInt("UrdfStaticWorldMaxTriangles", 20000);
 
@@ -1604,6 +1676,12 @@ namespace airlib
                     settings_json.getBool("UrdfMirrorMovable", false);
                 vehicle_setting->urdf_mirror_other_vehicles =
                     settings_json.getBool("UrdfMirrorOtherVehicles", false);
+                vehicle_setting->urdf_mirror_landscape =
+                    settings_json.getBool("UrdfMirrorLandscape", true);
+                vehicle_setting->urdf_mirror_instanced_meshes =
+                    settings_json.getBool("UrdfMirrorInstancedMeshes", true);
+                vehicle_setting->urdf_mirror_max_instances =
+                    settings_json.getInt("UrdfMirrorMaxInstances", 50000);
                 settings_json.getStringArray("UrdfWorldGeometryTags",
                                              vehicle_setting->urdf_world_geometry_tags);
 

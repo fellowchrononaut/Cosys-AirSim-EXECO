@@ -1,8 +1,12 @@
 #include "UrdfWorldGeometry.h"
 
+#include "Chaos/HeightField.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "LandscapeDataAccess.h"
+#include "LandscapeHeightfieldCollisionComponent.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
@@ -14,6 +18,9 @@
 #include "PhysicsEngine/ConvexElem.h"
 
 #include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 DEFINE_LOG_CATEGORY(LogUrdfBot);
 
@@ -184,6 +191,187 @@ int32 ExtractKinematicShapes(UPrimitiveComponent* Prim, const FVector& Scale, fl
     return OutShapes.Num() - Before;
 }
 
+/// Terrain, read straight out of Chaos.
+///
+/// ⚠ Landscape is INVISIBLE to every other extractor in this file, and always has been.
+/// `ULandscapeHeightfieldCollisionComponent` implements no `IInterface_CollisionDataProvider`
+/// (grep the whole UE 5.6 Landscape module: the interface is not mentioned once) and owns no
+/// `AggGeom`, so `ExtractComplexTriMesh` and `ExtractSimpleCollision` both come back empty and it
+/// lands in the "blocks the channel but yielded no geometry" bucket. The visible `LandscapeComponent`
+/// sitting beside it is the RENDER component and is `NoCollision` by design in every map, so the
+/// rejection log reads as though the level author disabled terrain collision. Neither reading is
+/// true: the terrain is solid in Unreal and was simply never extracted.
+///
+/// The layout below is the engine's own, from `ExportChaosHeightField` in
+/// RecastNavMeshGenerator.cpp — the navmesh builder faces exactly this problem and solves it by
+/// walking the Chaos heightfield directly. Copying it means the robot drives on the same surface
+/// Chaos collides against, holes and all, rather than on a resampled approximation of it.
+///
+/// Points come out already in WORLD space, so the emitted body carries an identity transform.
+bool ExtractLandscapeHeightfield(UPrimitiveComponent* Prim, float WorldToMeters,
+                                 urdf::StaticBody& OutBody)
+{
+    ULandscapeHeightfieldCollisionComponent* HFC =
+        Cast<ULandscapeHeightfieldCollisionComponent>(Prim);
+    if (HFC == nullptr) return false;
+    if (!HFC->HeightfieldRef.IsValid() || !HFC->HeightfieldRef->HeightfieldGeometry) return false;
+
+    // The full-resolution geometry, not HeightfieldSimpleGeometry. The simple one is a decimated
+    // proxy the engine keeps for cheap queries; a rover's wheels are exactly the scale at which
+    // that decimation shows up as the ground being in the wrong place.
+    const Chaos::FHeightField* HF = HFC->HeightfieldRef->HeightfieldGeometry.GetReference();
+    const int32 NumRows = HF->GetNumRows();
+    const int32 NumCols = HF->GetNumCols();
+    if (NumRows < 2 || NumCols < 2) return false;
+
+    // Samples are stored as bare grid indices and LANDSCAPE_ZSCALE height units; both scales live
+    // on the transform rather than in the data. Engine convention, and it is why reading
+    // CollisionHeightData by hand gets terrain that is 128x too tall.
+    FTransform HFToW = HFC->GetComponentTransform();
+    HFToW.MultiplyScale3D(FVector(HFC->CollisionScale, HFC->CollisionScale, LANDSCAPE_ZSCALE));
+
+    urdf::StaticShape Shape;
+    Shape.kind = urdf::StaticShapeKind::Mesh;
+    Shape.points.reserve(static_cast<size_t>(NumRows) * static_cast<size_t>(NumCols));
+    for (int32 Y = 0; Y < NumRows; ++Y) {
+        for (int32 X = 0; X < NumCols; ++X) {
+            const FVector W = HFToW.TransformPosition(
+                FVector(static_cast<double>(X), static_cast<double>(Y),
+                        static_cast<double>(HF->GetHeight(Y * NumCols + X))));
+            Shape.points.push_back(urdf::Vec3{ static_cast<double>(W.X) / WorldToMeters,
+                                               static_cast<double>(-W.Y) / WorldToMeters,
+                                               static_cast<double>(W.Z) / WorldToMeters });
+        }
+    }
+
+    // The engine flips the quad diagonal for a negative-determinant landscape scale; the Y mirror
+    // applied above is the same handedness change the rest of this file relies on, so the two
+    // cancel exactly as they do in ShouldReverseWinding.
+    const bool bMirrored = (HFToW.GetDeterminant() < 0.0);
+    Shape.indices.reserve(static_cast<size_t>(NumRows - 1) * static_cast<size_t>(NumCols - 1) * 6);
+    for (int32 Y = 0; Y < NumRows - 1; ++Y) {
+        for (int32 X = 0; X < NumCols - 1; ++X) {
+            // A painted hole is a hole in the solver too, or a robot walks on air over a cave mouth.
+            if (HF->IsHole(X, Y)) continue;
+
+            const int32 I0 = Y * NumCols + X;
+            int32 I1 = I0 + 1;
+            int32 I2 = I0 + NumCols;
+            const int32 I3 = I2 + 1;
+            if (bMirrored) Swap(I1, I2);
+
+            Shape.indices.push_back(I0);
+            Shape.indices.push_back(I3);
+            Shape.indices.push_back(I1);
+            Shape.indices.push_back(I0);
+            Shape.indices.push_back(I2);
+            Shape.indices.push_back(I3);
+        }
+    }
+    if (Shape.indices.empty()) return false;  // an entirely holed-out component is not geometry
+
+    OutBody.name = TCHAR_TO_UTF8(*Prim->GetPathName());
+    OutBody.position = urdf::Vec3{ 0.0, 0.0, 0.0 };
+    OutBody.orientation = urdf::Quat{ 0.0, 0.0, 0.0, 1.0 };
+    OutBody.shapes.push_back(std::move(Shape));
+    return true;
+}
+
+/// One body per INSTANCE of an instanced/foliage mesh component.
+///
+/// ⚠ Without this, an ISM/HISM is mirrored by the generic path as a single body at the component's
+/// own transform. For foliage that transform is the InstancedFoliageActor's, which sits at the map
+/// origin — so the level gains one phantom tree at (0,0,0) and loses collision on every real one.
+/// The failure is silent and looks like a physics bug: the robot drives through a visible forest
+/// and then trips over nothing in an empty field.
+///
+/// The base geometry is extracted ONCE at unit scale and the per-instance scale is applied to the
+/// resulting points. That works because the URDF conversion is a Y sign flip, which commutes with
+/// a diagonal scale — and it matters, because `GetPhysicsTriMeshData` is far too expensive to call
+/// once per instance on a map with thousands of them.
+int32 ExtractInstancedBodies(UInstancedStaticMeshComponent* ISM, float WorldToMeters,
+                             const FMirrorOptions& Options, int32 InstanceBudget,
+                             std::vector<urdf::StaticBody>& OutBodies, int32& OutOverBudget)
+{
+    const int32 Count = ISM->GetInstanceCount();
+    if (Count <= 0) return 0;
+
+    // ⚠ Instances prefer SIMPLE collision, which is the OPPOSITE of the non-instanced path above.
+    // That is not an inconsistency, it is Unreal's own rule: an ISM instance collides against the
+    // base asset's simple primitives unless the mesh is authored UseComplexAsSimple. Taking the
+    // tri-mesh for every instance would also make the mirror's cost scale as instances x triangles
+    // — a few thousand foliage instances of a 5 k-triangle bush is tens of millions of triangles to
+    // cook, which freezes the editor at load and is the reason to get this right rather than to be
+    // uniformly "accurate".
+    UBodySetup* Setup = ISM->GetBodySetup();
+    const bool bComplexAsSimple =
+        Setup != nullptr && Setup->CollisionTraceFlag == CTF_UseComplexAsSimple;
+
+    TArray<urdf::StaticShape> Base;
+    bool bGot = false;
+    if (!bComplexAsSimple && Options.Source != ECollisionSource::Complex)
+        bGot = ExtractSimpleCollision(ISM, FVector::OneVector, WorldToMeters, Base) > 0;
+    if (!bGot && Options.Source != ECollisionSource::Simple)
+        bGot = ExtractComplexTriMesh(ISM, FVector::OneVector, WorldToMeters, Base);
+    if (!bGot || Base.Num() == 0) return 0;
+
+    int32 Emitted = 0;
+    for (int32 i = 0; i < Count; ++i) {
+        if (Emitted >= InstanceBudget) {
+            OutOverBudget += (Count - i);
+            break;
+        }
+
+        FTransform InstTM;
+        if (!ISM->GetInstanceTransform(i, InstTM, /*bWorldSpace=*/true)) continue;
+
+        const FVector S = InstTM.GetScale3D();
+        const bool bReverse = ShouldReverseWinding(S);
+
+        urdf::StaticBody Body;
+        Body.name = TCHAR_TO_UTF8(*ISM->GetPathName()) + std::string("#") + std::to_string(i);
+        Body.friction = Options.DefaultFriction;
+        Body.restitution = Options.DefaultRestitution;
+
+        const FVector T = InstTM.GetTranslation();
+        Body.position = urdf::Vec3{ static_cast<double>(T.X) / WorldToMeters,
+                                    static_cast<double>(-T.Y) / WorldToMeters,
+                                    static_cast<double>(T.Z) / WorldToMeters };
+        const FQuat Q = InstTM.GetRotation();
+        Body.orientation = urdf::Quat{ -Q.X, Q.Y, -Q.Z, Q.W };
+
+        for (const urdf::StaticShape& Src : Base) {
+            urdf::StaticShape Shape = Src;
+            for (urdf::Vec3& P : Shape.points) {
+                P.x *= static_cast<double>(S.X);
+                P.y *= static_cast<double>(S.Y);
+                P.z *= static_cast<double>(S.Z);
+            }
+            // Sphere/capsule carry their extent separately from the point list.
+            if (Shape.kind == urdf::StaticShapeKind::Sphere ||
+                Shape.kind == urdf::StaticShapeKind::Capsule) {
+                Shape.radius *= static_cast<double>(S.GetAbsMin());
+                auto ScalePt = [&S](urdf::Vec3& P) {
+                    P.x *= static_cast<double>(S.X);
+                    P.y *= static_cast<double>(S.Y);
+                    P.z *= static_cast<double>(S.Z);
+                };
+                ScalePt(Shape.center_a);
+                ScalePt(Shape.center_b);
+            }
+            if (bReverse) {
+                for (size_t t = 0; t + 2 < Shape.indices.size(); t += 3)
+                    std::swap(Shape.indices[t + 1], Shape.indices[t + 2]);
+            }
+            Body.shapes.push_back(std::move(Shape));
+        }
+
+        OutBodies.push_back(std::move(Body));
+        ++Emitted;
+    }
+    return Emitted;
+}
+
 bool ActorPassesTagFilter(const AActor* Actor, const FMirrorOptions& Options)
 {
     for (const FName& Tag : Options.ExcludedTags)
@@ -219,6 +407,10 @@ FString FMirrorStats::Report() const
     S += TEXT("  components mirrored      : ") + FString::FromInt(ComponentsMirrored) + TEXT("\n");
     S += TEXT("  kinematic (tracked)      : ") + FString::FromInt(ComponentsKinematic)
        + TEXT("  of which vehicles: ") + FString::FromInt(ComponentsVehicle) + TEXT("\n");
+    S += TEXT("  landscape components     : ") + FString::FromInt(LandscapeComponentsMirrored)
+       + TEXT("  skipped: ") + FString::FromInt(LandscapeComponentsSkipped) + TEXT("\n");
+    S += TEXT("  instanced components     : ") + FString::FromInt(InstancedComponents)
+       + TEXT("  instances mirrored: ") + FString::FromInt(InstancesMirrored) + TEXT("\n");
     S += TEXT("  shapes                   : ") + FString::FromInt(Shapes) + TEXT("\n");
     S += TEXT("  triangles                : ") + FString::FromInt(static_cast<int32>(Triangles)) + TEXT("\n");
     S += TEXT("  skipped, not blocking    : ") + FString::FromInt(ComponentsSkippedNotBlocking) + TEXT("\n");
@@ -246,6 +438,17 @@ FString FMirrorStats::Report() const
     }
     if (ComponentsMirrored == 0 && ComponentsKinematic == 0) {
         S += TEXT("  ! NOTHING was mirrored. The robot has no world to collide with.\n");
+    }
+    if (LandscapeComponentsMirrored == 0 && LandscapeComponentsSkipped > 0) {
+        S += TEXT("  ! a landscape exists but NONE of it mirrored - the terrain is not solid to\n");
+        S += TEXT("    the solver. Props will still collide, which is what makes this look like a\n");
+        S += TEXT("    working mirror right up until the robot falls through the ground.\n");
+    }
+    if (InstancesSkippedOverBudget > 0) {
+        S += FString::Printf(
+            TEXT("  ! %d instances were dropped at the UrdfMirrorMaxInstances ceiling. Those\n")
+            TEXT("    objects are visible and NOT solid. Raise the ceiling or tag them out.\n"),
+            InstancesSkippedOverBudget);
     }
     if (RejectionSamples.Num() > 0) {
         S += TEXT("  why components were rejected (sampled):\n");
@@ -406,6 +609,70 @@ void MirrorPass(UWorld* World, float WorldToMeters, const FMirrorOptions& Option
             // mirror already owns. Re-emitting it here would give the robot a second, duplicate
             // copy of the level.
             if (Options.bKinematicOnly) continue;
+
+            // --- terrain ----------------------------------------------------------------------
+            //
+            // Tried BEFORE the generic extractors, not after, because the generic ones do not fail
+            // loudly on a landscape - they return "no geometry" and the component is filed under a
+            // rejection reason that is true of the API call and false of the level.
+            if (Options.bIncludeLandscape && Prim->IsA<ULandscapeHeightfieldCollisionComponent>()) {
+                urdf::StaticBody LandBody;
+                LandBody.friction = Options.DefaultFriction;
+                LandBody.restitution = Options.DefaultRestitution;
+                if (ExtractLandscapeHeightfield(Prim, WorldToMeters, LandBody)) {
+                    Out->bodies.push_back(std::move(LandBody));
+                    ++OutStats.ComponentsMirrored;
+                    ++OutStats.LandscapeComponentsMirrored;
+                }
+                else {
+                    ++OutStats.LandscapeComponentsSkipped;
+                    ++OutStats.ComponentsNoCollisionData;
+                    if (OutStats.RejectionSamples.Num() < kMaxRejectionSamples) {
+                        OutStats.RejectionSamples.Add(FString::Printf(
+                            TEXT("%s [%s]: landscape collision present but its Chaos heightfield ")
+                            TEXT("is not built - the terrain will have NO collision"),
+                            *GetNameSafe(Actor), *Prim->GetClass()->GetName()));
+                    }
+                }
+                continue;
+            }
+
+            // --- instanced / foliage geometry -------------------------------------------------
+            //
+            // Also before the generic path, and for a worse reason: the generic path SUCCEEDS on an
+            // ISM component. It reads the base asset's collision and emits one body at the
+            // component's transform, which is a plausible-looking wrong answer - a single collider
+            // at the foliage actor's origin standing in for every instance in the map.
+            if (UInstancedStaticMeshComponent* ISM = Cast<UInstancedStaticMeshComponent>(Prim)) {
+                if (!Options.bIncludeInstancedMeshes) {
+                    ++OutStats.ComponentsSkippedNotBlocking;
+                    continue;
+                }
+                ++OutStats.InstancedComponents;
+
+                std::vector<urdf::StaticBody> InstanceBodies;
+                const int32 Budget = FMath::Max(0, Options.MaxInstances - OutStats.InstancesMirrored);
+                const int32 Made = ExtractInstancedBodies(ISM, WorldToMeters, Options, Budget,
+                                                          InstanceBodies,
+                                                          OutStats.InstancesSkippedOverBudget);
+                if (Made == 0) {
+                    ++OutStats.ComponentsNoCollisionData;
+                    if (OutStats.RejectionSamples.Num() < kMaxRejectionSamples) {
+                        OutStats.RejectionSamples.Add(FString::Printf(
+                            TEXT("%s [%s]: %d instances, but the base mesh yielded no collision ")
+                            TEXT("geometry"),
+                            *GetNameSafe(Actor), *Prim->GetClass()->GetName(),
+                            ISM->GetInstanceCount()));
+                    }
+                    continue;
+                }
+
+                for (urdf::StaticBody& B : InstanceBodies)
+                    Out->bodies.push_back(std::move(B));
+                OutStats.InstancesMirrored += Made;
+                ++OutStats.ComponentsMirrored;
+                continue;
+            }
 
             TArray<urdf::StaticShape> Shapes;
             bool bGot = false;

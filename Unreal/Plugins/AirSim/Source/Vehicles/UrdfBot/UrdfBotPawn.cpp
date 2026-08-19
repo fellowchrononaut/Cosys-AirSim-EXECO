@@ -244,6 +244,145 @@ void AUrdfBotPawn::ensureMeshMaterial()
     UE_LOG(LogUrdfBot, Log, TEXT("mesh base material: %s"), *GetNameSafe(mesh_material_));
 }
 
+void AUrdfBotPawn::logMaterialDiagnosticsOnce(UMaterialInterface* assigned,
+                                              UPrimitiveComponent* component)
+{
+    UMaterialInstanceDynamic* mid = Cast<UMaterialInstanceDynamic>(assigned);
+    if (mid == nullptr) return;
+
+    // ⚠ ENUMERATE THE PARAMETERS. A MID silently ignores a parameter the material does not expose,
+    // so SetVectorParameterValue("Color", ...) on a material whose parameter is named something
+    // else is a no-op that looks exactly like a lighting or normals bug.
+    if (!logged_material_params_) {
+        logged_material_params_ = true;
+        TArray<FMaterialParameterInfo> infos;
+        TArray<FGuid> guids;
+
+        mid->GetAllVectorParameterInfo(infos, guids);
+        FString names;
+        for (const FMaterialParameterInfo& i : infos)
+            names += (names.IsEmpty() ? TEXT("") : TEXT(", ")) + i.Name.ToString();
+        UE_LOG(LogUrdfBot, Log, TEXT("material VECTOR params: [%s]"), *names);
+
+        infos.Reset(); guids.Reset();
+        mid->GetAllScalarParameterInfo(infos, guids);
+        names.Empty();
+        for (const FMaterialParameterInfo& i : infos)
+            names += (names.IsEmpty() ? TEXT("") : TEXT(", ")) + i.Name.ToString();
+        UE_LOG(LogUrdfBot, Log, TEXT("material SCALAR params: [%s]"), *names);
+    }
+
+    // ⚠ Read the value BACK. Setting a parameter always "succeeds"; only a read-back shows whether
+    // the material actually holds it.
+    //
+    // ⚠ And this read-back once LIED: GetScalarParameterValue reported "Metallic exists=1 (0.00)"
+    // while the enumeration above proves Metallic is not a parameter of this material at all.
+    // BasicShapeMaterial_Inst exposes exactly two — Color and Roughness — so Metallic and Specular
+    // were silent no-ops, and Roughness is the only shading lever there is.
+    if (!logged_material_readback_) {
+        logged_material_readback_ = true;
+        FLinearColor got_colour(ForceInit);
+        const bool has_colour =
+            mid->GetVectorParameterValue(FMaterialParameterInfo(TEXT("Color")), got_colour);
+        FLinearColor got_base(ForceInit);
+        const bool has_base =
+            mid->GetVectorParameterValue(FMaterialParameterInfo(TEXT("BaseColor")), got_base);
+        float got_metallic = -1.0f;
+        const bool has_metallic =
+            mid->GetScalarParameterValue(FMaterialParameterInfo(TEXT("Metallic")), got_metallic);
+
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("Color exists=%d (%.3f %.3f %.3f)  BaseColor exists=%d (%.3f %.3f %.3f)  "
+                    "Metallic exists=%d (%.2f)"),
+               has_colour ? 1 : 0, got_colour.R, got_colour.G, got_colour.B,
+               has_base ? 1 : 0, got_base.R, got_base.G, got_base.B,
+               has_metallic ? 1 : 0, got_metallic);
+
+        if (!has_colour)
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("The base material has no 'Color' parameter, so link colours cannot be "
+                        "applied through it and every link renders at the material's own default."));
+    }
+
+    if (!logged_param_once_ && component != nullptr) {
+        logged_param_once_ = true;
+        UE_LOG(LogUrdfBot, Log, TEXT("component material [0] is now '%s'"),
+               *GetNameSafe(component->GetMaterial(0)));
+    }
+}
+
+UMaterialInterface* AUrdfBotPawn::resolveSectionMaterial(const urdf::Material& mesh_material,
+                                                        const urdf::Material& urdf_material)
+{
+    ensureMeshMaterial();
+    if (mesh_material_ == nullptr) return nullptr;
+    if (!mesh_tint_) return mesh_material_;   // diagnostic escape hatch: no MIDs at all
+
+    // ⚠ PRECEDENCE LIVES HERE AND NOWHERE ELSE. The procedural and runtime-static paths must not
+    // each decide this; they diverged once before over the world_to_meters factor and the symptom
+    // was a robot that looked fine on one setting and invisible on the other.
+    //
+    // The mesh's own material wins by default because it is per-SUBMESH while a URDF <material> is
+    // one flat colour for a whole link — so deferring to the URDF cannot express more than one of
+    // the colours a .dae declares, and on our two mesh robots what it expresses is wrong anyway:
+    // the Go2's URDF says rgba "1 1 1 1" seventeen times for a robot that is mostly matte black,
+    // and the Scout's declares no <material> at all.
+    //
+    // Either way a section the mesh left unpainted falls back to the URDF colour, so this decides
+    // only the conflict. UrdfMeshMaterialOverride inverts it for hand-authoring from the URDF.
+    const urdf::Material* chosen = nullptr;
+    if (mesh_material_override_)
+        chosen = urdf_material.present ? &urdf_material
+                                       : (mesh_material.present ? &mesh_material : nullptr);
+    else
+        chosen = mesh_material.present ? &mesh_material
+                                       : (urdf_material.present ? &urdf_material : nullptr);
+
+    // Nothing declared a colour: keep the shared parent rather than inventing a grey MID.
+    if (chosen == nullptr) return mesh_material_;
+
+    // ⚠ COLOUR SPACE, and why the default passes the numbers through untouched. Collada's
+    // profile_COMMON <color> is specified LINEAR, Blender (which exported our .dae files) stores
+    // and writes linear, and FLinearColor is linear — so no conversion is the faithful reading.
+    //
+    // The consequence is worth knowing before it gets reported as a bug: a linear 0.672 displays at
+    // roughly sRGB 214/255, so the Go2's grey shell — 0.672 0.692 0.774 across most of its surface,
+    // which that robot's own MuJoCo model also names "gray" — reads as off-white. Correct, not
+    // washed out. UrdfMeshSrgbColors exists so the alternative can be SEEN in one run rather than
+    // argued from a spec.
+    auto channel = [this](double v) {
+        if (!mesh_srgb_colors_) return static_cast<float>(v);
+        const float c = static_cast<float>(FMath::Clamp(v, 0.0, 1.0));
+        return c <= 0.04045f ? c / 12.92f : FMath::Pow((c + 0.055f) / 1.055f, 2.4f);
+    };
+    const FLinearColor tint(channel(chosen->r), channel(chosen->g), channel(chosen->b),
+                            static_cast<float>(chosen->a));
+
+    // ⚠ Key the cache on the FINAL tint, not the declared one. Keying on the source colour would
+    // make the cache silently wrong the moment a second setting changed what a colour resolves to.
+    auto to8 = [](float v) {
+        return static_cast<uint32>(FMath::Clamp(FMath::RoundToInt(v * 255.0f), 0, 255));
+    };
+    const uint32 key = (to8(tint.R) << 24) | (to8(tint.G) << 16) | (to8(tint.B) << 8) | to8(tint.A);
+    if (UMaterialInstanceDynamic** found = mid_cache_.Find(key)) return *found;
+
+    UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this);
+    if (mid == nullptr) return mesh_material_;
+
+    // This parent material's vector parameter is named Color; enumerating it is what settled that,
+    // and the enumeration still runs once in attachMeshGeometry.
+    mid->SetVectorParameterValue(TEXT("Color"), tint);
+    // ⚠ Roughness is the ONLY other parameter BasicShapeMaterial_Inst exposes — no Metallic, no
+    // Specular; setting those is a silent no-op. 1.0 (the default) is fully matte, the faithful
+    // reading of a diffuse colour: neither a URDF <material> nor a Collada <lambert> describes
+    // gloss. Lowering it adds specular definition, at the risk recorded on the setting.
+    mid->SetScalarParameterValue(TEXT("Roughness"),
+                                 static_cast<float>(FMath::Clamp(mesh_roughness_, 0.0, 1.0)));
+
+    mid_cache_.Add(key, mid);
+    return mid;
+}
+
 UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
                                                   const FString& key, double sx, double sy,
                                                   double sz)
@@ -273,8 +412,30 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
     FStaticMeshAttributes attrs(desc);
     attrs.Register();
 
-    const FPolygonGroupID group = desc.CreatePolygonGroup();
-    attrs.GetPolygonGroupMaterialSlotNames()[group] = FName(TEXT("Default"));
+    // ⚠ ONE POLYGON GROUP PER MESH SECTION, and the slot names below must match these exactly.
+    // Slots are named by INDEX, not by the material's own name: Collada material names are
+    // arbitrary UTF-8 — the Go2's are Chinese — and an FName round-trip through them is a needless
+    // way to lose the mapping the renderer depends on.
+    const std::vector<urdf::MeshSection> sections = mesh.drawSections();
+    TArray<FPolygonGroupID> groups;
+    groups.Reserve(static_cast<int32>(sections.size()));
+    for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si) {
+        const FPolygonGroupID group = desc.CreatePolygonGroup();
+        attrs.GetPolygonGroupMaterialSlotNames()[group] =
+            FName(*FString::Printf(TEXT("Section%d"), si));
+        groups.Add(group);
+    }
+
+    // Triangle index -> the group it belongs to. Sections partition the soup in order (asserted by
+    // the headless suite), so this is a walk, not a search.
+    TArray<int32> triangle_group;
+    triangle_group.Init(0, static_cast<int32>(mesh.vertices.size() / 3));
+    for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si)
+        for (size_t t = sections[si].first_triangle;
+             t < sections[si].first_triangle + sections[si].triangle_count &&
+             t < mesh.vertices.size() / 3;
+             ++t)
+            triangle_group[static_cast<int32>(t)] = si;
 
     TVertexAttributesRef<FVector3f> positions = attrs.GetVertexPositions();
     TVertexInstanceAttributesRef<FVector3f> normals = attrs.GetVertexInstanceNormals();
@@ -319,7 +480,8 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
         const FVector3f n = FVector3f::CrossProduct(e2, e1).GetSafeNormal();
         for (int32 k = 0; k < 3; ++k) normals[inst[k]] = n;
 
-        desc.CreatePolygon(group, TArray<FVertexInstanceID>({ inst[0], inst[1], inst[2] }));
+        desc.CreatePolygon(groups[triangle_group[t]],
+                           TArray<FVertexInstanceID>({ inst[0], inst[1], inst[2] }));
     }
 
     UStaticMesh* built = NewObject<UStaticMesh>(this);
@@ -328,11 +490,16 @@ UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
     // slots BY NAME; an unnamed FStaticMaterial against a group named "Default" leaves the section
     // with no valid material index, and the mesh builds successfully and renders NOTHING. That is
     // exactly how this first appeared — geometry present, bounds correct, invisible.
-    FStaticMaterial slot;
-    slot.MaterialSlotName = FName(TEXT("Default"));
-    slot.ImportedMaterialSlotName = FName(TEXT("Default"));
-    slot.MaterialInterface = mesh_material_;
-    built->GetStaticMaterials().Add(slot);
+    for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si) {
+        FStaticMaterial slot;
+        slot.MaterialSlotName = FName(*FString::Printf(TEXT("Section%d"), si));
+        slot.ImportedMaterialSlotName = slot.MaterialSlotName;
+        // ⚠ The BUILT MESH is cached per (file, scale) and shared between links, so its slots carry
+        // the shared parent only. The per-section colour is applied on the COMPONENT, where two
+        // links referencing one .dae can still be tinted differently.
+        slot.MaterialInterface = mesh_material_;
+        built->GetStaticMaterials().Add(slot);
+    }
 
     UStaticMesh::FBuildMeshDescriptionsParams params;
     // ⚠ Collision is built separately from the URDF's own <collision>, so this must NOT cook
@@ -412,24 +579,12 @@ bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
     c->SetCollisionEnabled(collidable ? ECollisionEnabled::QueryOnly
                                       : ECollisionEnabled::NoCollision);
 
-    // Same tint the procedural path applies — the material was measured to be correct, so this
-    // path must not diverge from it.
-    const bool apply_urdf_tint = mesh_tint_ && material.present;
-    if (mesh_material_ != nullptr && !apply_urdf_tint) {
-        // No declared URDF material (or tinting explicitly disabled): keep the shared parent.
-        c->SetMaterial(0, mesh_material_);
-    }
-    else if (mesh_material_ != nullptr) {
-        if (UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this)) {
-            const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
-                                    static_cast<float>(material.b), static_cast<float>(material.a));
-            mid->SetVectorParameterValue(TEXT("Color"), tint);
-            // BasicShapeMaterial_Inst exposes Color and Roughness. Keep generated URDF visuals
-            // matte and use the same policy in both the procedural and runtime-static paths.
-            mid->SetScalarParameterValue(TEXT("Roughness"), 1.0f);
-            c->SetMaterial(0, mid);
-        }
-    }
+    // One material per section, through the shared resolver — the same precedence and the same MID
+    // cache the procedural path uses, so the two cannot drift apart.
+    const std::vector<urdf::MeshSection> sections = data.drawSections();
+    for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si)
+        if (UMaterialInterface* m = resolveSectionMaterial(sections[si].material, material))
+            c->SetMaterial(si, m);
     c->RegisterComponent();
     applySegmentationId(c, segmentation_id_);
     return true;
@@ -578,6 +733,11 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     // (rover4 renders correctly) differed from ExoMy in BOTH component type and triangle count, so
     // it could not distinguish "procedural meshes are the problem" from "dense meshes are the
     // problem". Holding the component type fixed and varying only density decides it.
+    // ⚠ DECIMATION MUST BE SECTION-AWARE. It drops triangles, so a section's range into the vertex
+    // array is invalid the moment it runs — and the failure is not a crash but a SMEAR: every
+    // section after the first is painted with a neighbour's colour, which reads as a parser bug and
+    // is not one. Decimate each run separately and rebuild the ranges from what survived.
+    std::vector<urdf::MeshSection> sections = mesh.drawSections();
     std::vector<urdf::Vec3> decimated;
     const std::vector<urdf::Vec3>* verts = &mesh.vertices;
     if (mesh_decimate_grid_ > 0.0) {
@@ -590,24 +750,42 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
                    (static_cast<uint64_t>(y & 0x1FFFFF) << 21) ^
                     static_cast<uint64_t>(z & 0x1FFFFF);
         };
+        // ⚠ ONE representative map across ALL sections, not one per section. Two materials meeting
+        // at a seam share vertices there, and giving each run its own map would snap them to
+        // different representatives and crack the model open along every colour boundary.
         std::unordered_map<uint64_t, urdf::Vec3> rep;
         rep.reserve(mesh.vertices.size());
         decimated.reserve(mesh.vertices.size());
 
-        for (size_t t = 0; t + 2 < mesh.vertices.size(); t += 3) {
-            const uint64_t c0 = cell(mesh.vertices[t]);
-            const uint64_t c1 = cell(mesh.vertices[t + 1]);
-            const uint64_t c2 = cell(mesh.vertices[t + 2]);
-            // Two corners in one cell means the triangle has collapsed to a line: drop it.
-            if (c0 == c1 || c1 == c2 || c0 == c2) continue;
-            decimated.push_back(rep.emplace(c0, mesh.vertices[t]).first->second);
-            decimated.push_back(rep.emplace(c1, mesh.vertices[t + 1]).first->second);
-            decimated.push_back(rep.emplace(c2, mesh.vertices[t + 2]).first->second);
+        std::vector<urdf::MeshSection> kept;
+        kept.reserve(sections.size());
+        for (const urdf::MeshSection& sec : sections) {
+            const size_t out_start = decimated.size() / 3;
+            const size_t last = sec.first_triangle + sec.triangle_count;
+            for (size_t tri = sec.first_triangle; tri < last && tri * 3 + 2 < mesh.vertices.size();
+                 ++tri) {
+                const size_t t = tri * 3;
+                const uint64_t c0 = cell(mesh.vertices[t]);
+                const uint64_t c1 = cell(mesh.vertices[t + 1]);
+                const uint64_t c2 = cell(mesh.vertices[t + 2]);
+                // Two corners in one cell means the triangle has collapsed to a line: drop it.
+                if (c0 == c1 || c1 == c2 || c0 == c2) continue;
+                decimated.push_back(rep.emplace(c0, mesh.vertices[t]).first->second);
+                decimated.push_back(rep.emplace(c1, mesh.vertices[t + 1]).first->second);
+                decimated.push_back(rep.emplace(c2, mesh.vertices[t + 2]).first->second);
+            }
+            urdf::MeshSection ns = sec;
+            ns.first_triangle = out_start;
+            ns.triangle_count = decimated.size() / 3 - out_start;
+            // A run that decimated away entirely is dropped rather than kept empty: an empty
+            // procedural section is a draw call for nothing.
+            if (ns.triangle_count > 0) kept.push_back(ns);
         }
         if (decimated.size() >= 3) {
             mesh_triangles_before_ += static_cast<int64>(mesh.vertices.size() / 3);
             mesh_triangles_after_ += static_cast<int64>(decimated.size() / 3);
             verts = &decimated;
+            sections = std::move(kept);
         }
     }
 
@@ -746,8 +924,42 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     // R2, in its most complete form. So it stays on by default and is a deliberate trade, not a
     // silent optimisation.
     const double t_section = FPlatformTime::Seconds();
-    c->CreateMeshSection(0, positions, indices, normals, uvs, colors, tangents_out,
-                         /*bCreateCollision=*/collidable);
+    if (sections.size() <= 1) {
+        // ⚠ The single-section case keeps the arrays it already built and copies nothing. Every STL
+        // robot — ExoMy is 23 links of them — takes this branch, so the cost of materials on the
+        // robots that have none is exactly zero.
+        c->CreateMeshSection(0, positions, indices, normals, uvs, colors, tangents_out,
+                             /*bCreateCollision=*/collidable);
+    }
+    else {
+        // ⚠ CreateMeshSection wants SECTION-LOCAL indices, so each run is sliced out and rebased.
+        // Handing it the global arrays with a global index range draws the whole mesh N times.
+        TArray<FVector> sec_positions;
+        TArray<int32> sec_indices;
+        TArray<FVector> sec_normals;
+        TArray<FProcMeshTangent> sec_tangents;
+        for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si) {
+            const int32 first = static_cast<int32>(sections[si].first_triangle) * 3;
+            const int32 count = static_cast<int32>(sections[si].triangle_count) * 3;
+            if (first < 0 || count <= 0 || first + count > vertex_count) continue;
+
+            sec_positions.Reset(count);
+            sec_indices.Reset(count);
+            sec_normals.Reset(count);
+            sec_tangents.Reset(count);
+            for (int32 k = 0; k < count; ++k) {
+                sec_positions.Add(positions[first + k]);
+                sec_normals.Add(normals[first + k]);
+                sec_tangents.Add(tangents_out[first + k]);
+                sec_indices.Add(indices[first + k] - first);
+            }
+            // ⚠ bCreateCollision is PER SECTION, so a five-material mesh cooks five tri-meshes
+            // instead of one. Collision cooking already dominates spawn time on a mesh-heavy robot
+            // (that is why UrdfVisualCollision exists), and this multiplies it by the section count.
+            c->CreateMeshSection(si, sec_positions, sec_indices, sec_normals, uvs, colors,
+                                 sec_tangents, /*bCreateCollision=*/collidable);
+        }
+    }
     mesh_section_seconds_ += FPlatformTime::Seconds() - t_section;
     mesh_triangle_total_ += static_cast<int64>(vertex_count / 3);
 
@@ -796,132 +1008,39 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
         UE_LOG(LogUrdfBot, Log, TEXT("mesh base material: %s"), *GetNameSafe(mesh_material_));
     }
 
-    // UrdfMeshTint is a diagnostic/compatibility escape hatch. When enabled, a generated visual
-    // that declares a URDF material gets a component-specific MID. Visuals with no declared URDF
-    // material keep the shared parent instead of receiving an invented grey MID. A MID keeps its
-    // parent's compiled static permutation; Color and Roughness below are uniform overrides.
-    const bool apply_urdf_tint = mesh_tint_ && material.present;
-    if (mesh_material_ != nullptr && !apply_urdf_tint) {
-        c->SetMaterial(0, mesh_material_);
+    // One material per mesh section, through the shared resolver so this path and the runtime-static
+    // one cannot disagree about precedence or about which colour wins.
+    //
+    // ⚠ Set the override BEFORE registration so the first scene proxy is built with it. SetMaterial
+    // retains it in OverrideMaterials; no explicit render-state dirty call is needed here.
+    for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si) {
+        UMaterialInterface* m = resolveSectionMaterial(sections[si].material, material);
+        if (m == nullptr) continue;
+        c->SetMaterial(si, m);
+        logMaterialDiagnosticsOnce(m, c);
     }
-    else if (mesh_material_ != nullptr) {
-        UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this);
-        if (mid) {
-            // ⚠ ENUMERATE THE PARAMETERS ONCE. A MID silently ignores a parameter the material does
-            // not expose, so SetVectorParameterValue("Color", ...) on a material whose parameter is
-            // named something else is a no-op that looks exactly like a lighting or normals bug.
-            // Three fixes were proposed for the "shadowy robot" without anyone establishing that
-            // the tint reaches the shader at all. This settles it.
-            if (!logged_material_params_) {
-                logged_material_params_ = true;
-                TArray<FMaterialParameterInfo> infos;
-                TArray<FGuid> guids;
 
-                mid->GetAllVectorParameterInfo(infos, guids);
-                FString names;
-                for (const FMaterialParameterInfo& i : infos)
-                    names += (names.IsEmpty() ? TEXT("") : TEXT(", ")) + i.Name.ToString();
-                UE_LOG(LogUrdfBot, Log, TEXT("material VECTOR params: [%s]"), *names);
-
-                infos.Reset(); guids.Reset();
-                mid->GetAllScalarParameterInfo(infos, guids);
-                names.Empty();
-                for (const FMaterialParameterInfo& i : infos)
-                    names += (names.IsEmpty() ? TEXT("") : TEXT(", ")) + i.Name.ToString();
-                UE_LOG(LogUrdfBot, Log, TEXT("material SCALAR params: [%s]"), *names);
-            }
-            const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
-                                    static_cast<float>(material.b), static_cast<float>(material.a));
-            // This parent material's vector parameter is named Color.
-            mid->SetVectorParameterValue(TEXT("Color"), tint);
-
-            // ⚠ SET THE SHADING PARAMETERS, do not inherit them. Only the colour was being
-            // overridden, so the robot took whatever Metallic/Roughness BasicShapeMaterial_Inst
-            // happens to carry — and a DARK base colour on a METALLIC surface renders very nearly
-            // black, lit only by specular highlights. That is the "shadowy robot" look: ExoMy
-            // authors 12 links at rgba 0.298 and 2 at 0.102, which should read as clear greys and
-            // instead read as black with shiny rims.
-            //
-            // A URDF <material> describes a diffuse colour and nothing else — there is no notion of
-            // metalness in the format — so treating it as a matte dielectric is the faithful
-            // reading, not a stylistic choice.
-            // ⚠ ROUGHNESS IS THE ONLY LEVER THIS MATERIAL GIVES US. Enumerating the parameters shows
-            // BasicShapeMaterial_Inst exposes exactly two: Color and Roughness. There is NO Metallic
-            // and no Specular, so setting them was a silent no-op — a MID discards any parameter the
-            // material does not expose, and does so without complaint.
-            //
-            // ⚠ And the read-back diagnostic LIED about it: GetScalarParameterValue reported
-            // "Metallic exists=1 (0.00)" while the enumeration proves it is not a parameter. The
-            // enumeration is the trustworthy one. Two of my own measurements disagreed and I
-            // believed the wrong one.
-            //
-            // 1.0 is fully matte. A dark Color on a glossy surface reads as near-black with bright
-            // specular rims that pick up nearby lights and shift with view angle — which is exactly
-            // the "shiny, tinted, dark up close" appearance that sent this investigation through
-            // normals, winding, shadows, VSM and Lumen before anyone looked at what the material
-            // actually exposes.
-            mid->SetScalarParameterValue(TEXT("Roughness"), 1.0f);
-
-            // ⚠ Read the value BACK. Setting a parameter always "succeeds"; only a read-back shows
-            // whether the material actually holds it.
-            if (!logged_material_readback_) {
-                logged_material_readback_ = true;
-                FLinearColor got_colour(ForceInit);
-                const bool has_colour = mid->GetVectorParameterValue(
-                    FMaterialParameterInfo(TEXT("Color")), got_colour);
-                FLinearColor got_base(ForceInit);
-                const bool has_base = mid->GetVectorParameterValue(
-                    FMaterialParameterInfo(TEXT("BaseColor")), got_base);
-                float got_metallic = -1.0f;
-                const bool has_metallic = mid->GetScalarParameterValue(
-                    FMaterialParameterInfo(TEXT("Metallic")), got_metallic);
-
-                UE_LOG(LogUrdfBot, Log,
-                       TEXT("tint requested (%.3f %.3f %.3f)  ->  Color exists=%d (%.3f %.3f %.3f)  "
-                            "BaseColor exists=%d (%.3f %.3f %.3f)  Metallic exists=%d (%.2f)"),
-                       tint.R, tint.G, tint.B,
-                       has_colour ? 1 : 0, got_colour.R, got_colour.G, got_colour.B,
-                       has_base ? 1 : 0, got_base.R, got_base.G, got_base.B,
-                       has_metallic ? 1 : 0, got_metallic);
-            }
-
-            // Set the override before registration so the first scene proxy is built with the MID.
-            // SetMaterial retains it in OverrideMaterials; no explicit render-state dirty call is
-            // needed here.
-            c->SetMaterial(0, mid);
-
-            // Ask the MID what it actually took. GetVectorParameterValue returns false when the
-            // parameter does not exist on the material, which is the one thing that distinguishes
-            // "the tint was ignored" from "the tint was applied and something else is dark".
-            if (!logged_param_once_) {
-                logged_param_once_ = true;
-                FLinearColor read_back(ForceInit);
-                const bool has_color =
-                    mid->GetVectorParameterValue(FMaterialParameterInfo(TEXT("Color")), read_back);
-                UE_LOG(LogUrdfBot, Log,
-                       TEXT("material param check: Color exists=%d, reads back (%.3f, %.3f, %.3f); "
-                            "component material is now '%s'"),
-                       has_color ? 1 : 0, read_back.R, read_back.G, read_back.B,
-                       *GetNameSafe(c->GetMaterial(0)));
-                if (!has_color) {
-                    UE_LOG(LogUrdfBot, Warning,
-                           TEXT("The base material has no 'Color' parameter, so link colours cannot "
-                                "be applied through it and every link renders at the material's own "
-                                "default."));
-                }
-            }
-
-            // Logged so a robot that looks wrongly dark can be checked against what its URDF
-            // actually says. ExoMy's materials are ~0.298 grey, so a dark rover in shadow is the
-            // file being faithful rather than the renderer failing.
-            // At Log, not Verbose. The previous revision used Verbose, which is off by default, so
-            // the one line that would have shown the colours never appeared — the instrumentation
-            // was written and then not readable, which is the same failure as not writing it.
-            UE_LOG(LogUrdfBot, Log,
-                   TEXT("visual '%s': rgba(%.3f, %.3f, %.3f, %.3f)%s"), *name.ToString(),
-                   material.r, material.g, material.b, material.a,
-                   material.present ? TEXT("") : TEXT(" [no <material> in URDF - default grey]"));
+    // ⚠ Log what each section RESOLVED TO, not what the URDF said. The two now differ by design,
+    // and the whole reason this robot rendered white was that nobody could see the difference:
+    // ExoMy's URDF colours are real, the Go2's are seventeen copies of "1 1 1 1", and the Scout has
+    // none at all while both carry real liveries inside their .dae files.
+    // At Log, not Verbose — Verbose is off by default, and instrumentation that is not readable is
+    // the same as instrumentation that was never written.
+    {
+        FString detail;
+        for (int32 si = 0; si < static_cast<int32>(sections.size()); ++si) {
+            const urdf::Material& mm = sections[si].material;
+            const bool from_mesh = mm.present && !mesh_material_override_;
+            const urdf::Material& used = (from_mesh || !material.present) ? mm : material;
+            detail += FString::Printf(TEXT("%s[%d] %s rgba(%.3f %.3f %.3f) x%llu tris"),
+                                      si == 0 ? TEXT("") : TEXT("; "), si,
+                                      used.present ? (from_mesh ? TEXT("mesh") : TEXT("urdf"))
+                                                   : TEXT("none"),
+                                      used.r, used.g, used.b,
+                                      static_cast<unsigned long long>(sections[si].triangle_count));
         }
+        UE_LOG(LogUrdfBot, Log, TEXT("visual '%s': %d section(s)  %s"), *name.ToString(),
+               static_cast<int32>(sections.size()), *detail);
     }
 
     // Same contract as the primitive path: Unreal physics OFF (Box3D owns this link's motion),

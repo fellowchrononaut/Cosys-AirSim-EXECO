@@ -69,10 +69,14 @@ public:
                         bool base_material, bool inset_shadow, bool two_sided_shadow,
                         bool contact_shadow, double decimate_grid,
                         const std::string& asset_dir, double asset_scale,
-                        bool runtime_static, bool tint)
+                        bool runtime_static, bool tint, bool material_override,
+                        double roughness, bool srgb_colors)
     {
+        mesh_roughness_ = roughness;
+        mesh_srgb_colors_ = srgb_colors;
         mesh_runtime_static_ = runtime_static;
         mesh_tint_ = tint;
+        mesh_material_override_ = material_override;
         mesh_asset_dir_ = asset_dir;
         mesh_asset_scale_ = asset_scale;
         mesh_decimate_grid_ = decimate_grid;
@@ -201,6 +205,43 @@ private:
     /// Apply inline URDF <material><color> values through one MID per generated mesh visual.
     /// FALSE assigns the shared base material directly and is retained as a diagnostic escape hatch.
     bool mesh_tint_ = true;
+
+    /// Let the URDF <material> win over the colours a mesh file declares for itself.
+    /// See AirSimSettings::urdf_mesh_material_override for why this defaults FALSE.
+    bool mesh_material_override_ = false;
+
+    /// Roughness for every generated visual; 1.0 is fully matte. The only shading parameter the
+    /// base material exposes — see AirSimSettings::urdf_mesh_roughness.
+    double mesh_roughness_ = 1.0;
+
+    /// Read declared colours as sRGB rather than linear. Default false; see
+    /// AirSimSettings::urdf_mesh_srgb_colors for why the faithful reading is linear.
+    bool mesh_srgb_colors_ = false;
+
+    /// MIDs keyed by quantised RGBA, shared across every link and every section that wants that
+    /// colour.
+    ///
+    /// ⚠ Not an optimisation this time either. Once a mesh contributes one section per material,
+    /// a per-section MID means the Go2 builds four legs x three meshes x two materials = 24 MIDs
+    /// for two distinct colours, and each is a separate uniform buffer the renderer must track.
+    UPROPERTY()
+    TMap<uint32, UMaterialInstanceDynamic*> mid_cache_;
+
+    /// The material a section should be drawn with, applying the mesh-vs-URDF precedence and the
+    /// MID cache. Returns the shared base material when nothing declared a colour, and nullptr only
+    /// if the base material itself could not be resolved.
+    UMaterialInterface* resolveSectionMaterial(const urdf::Material& mesh_material,
+                                               const urdf::Material& urdf_material);
+
+    /// Report ONCE, for the whole robot, what the base material actually exposes and what a MID
+    /// built from it actually holds. Kept as a method so per-section assignment does not carry it.
+    ///
+    /// ⚠ Do not delete this because it looks like leftover debugging. Three separate fixes were
+    /// proposed for a "shadowy robot" before anyone established that the tint reached the shader at
+    /// all, and a read-back diagnostic once contradicted the parameter enumeration — the
+    /// enumeration was the truthful one.
+    void logMaterialDiagnosticsOnce(class UMaterialInterface* assigned,
+                                    class UPrimitiveComponent* component);
 
     class UStaticMesh* buildStaticMeshFromData(const urdf::MeshData& mesh,
                                                const FString& key, double sx,

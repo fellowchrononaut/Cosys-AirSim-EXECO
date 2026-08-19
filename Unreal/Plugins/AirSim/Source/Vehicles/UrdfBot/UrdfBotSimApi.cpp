@@ -564,6 +564,9 @@ void UrdfBotSimApi::loadModelAndBackend()
         UrdfWorldGeometry::FMirrorOptions mirror_opts;
         mirror_opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
         mirror_opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
+        mirror_opts.bIncludeLandscape = vehicle_setting_->urdf_mirror_landscape;
+        mirror_opts.bIncludeInstancedMeshes = vehicle_setting_->urdf_mirror_instanced_meshes;
+        mirror_opts.MaxInstances = vehicle_setting_->urdf_mirror_max_instances;
         for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
             mirror_opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
 
@@ -871,6 +874,75 @@ void UrdfBotSimApi::loadModelAndBackend()
         const b3urdf::Box3DRobot& robot =
             static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->robot();
 
+        // ⚠ WHAT THE LEVEL BECAME IN BOX3D, which until now was never reported at all. The
+        // mirror's own report says how many components it read; it says nothing about whether
+        // b3CreateMesh accepted any of them. Between those two numbers sits a failure that looks
+        // exactly like working software: the load log proudly prints "357 bodies, 7.2 M triangles"
+        // and the robot drives through every one of them. Box3DStaticGeometry has counted this
+        // since it was written - the header even says the rejects are "reported, never swallowed" -
+        // and nothing ever printed them.
+        if (const b3urdf::Box3DStaticGeometry* geom = robot.staticGeometry()) {
+            UE_LOG(LogUrdfBot, Log,
+                   TEXT("Box3D static cook [%s]: %d tri-meshes cooked, %d shapes REJECTED, "
+                        "%d triangles, %.1f ms"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()),
+                   static_cast<int32>(geom->cookedMeshCount()),
+                   static_cast<int32>(geom->rejectedShapeCount()),
+                   static_cast<int32>(geom->triangleCount()), geom->cookMilliseconds());
+
+            if (geom->rejectedShapeCount() > 0) {
+                UAirBlueprintLib::LogMessageString(
+                    "UrdfBot WARNING: level shapes rejected by Box3D ",
+                    Utils::stringf("%d of the mirrored shapes did not cook. Those objects are "
+                                   "visible and NOT solid.",
+                                   static_cast<int>(geom->rejectedShapeCount())),
+                    LogDebugLevel::Failure);
+            }
+
+            // ⚠ THE SCAFFOLDING FLOOR IS OPAQUE TO EVERYTHING UNDER IT. The slab is 100 x 100 m
+            // and 1 m thick, so an explicit UrdfGroundPlaneZ set above the real terrain does not
+            // merely add a floor - it ENTOMBS every mirrored prop whose top is below it. A bench
+            // is ~0.45 m tall; a floor at 0.70 m swallows it whole, and the robot drives through
+            // benches that mirrored, cooked and attached perfectly. Counted rather than reasoned
+            // about, because "the mirror worked" and "the robot collides" are different claims.
+            if (opts.add_ground_plane && static_world_) {
+                const auto rotate = [](const urdf::Quat& q, const urdf::Vec3& p) {
+                    const double x = q.x, y = q.y, z = q.z, w = q.w;
+                    return urdf::Vec3{
+                        p.x*(1-2*(y*y+z*z)) + p.y*(2*(x*y-w*z))   + p.z*(2*(x*z+w*y)),
+                        p.x*(2*(x*y+w*z))   + p.y*(1-2*(x*x+z*z)) + p.z*(2*(y*z-w*x)),
+                        p.x*(2*(x*z-w*y))   + p.y*(2*(y*z+w*x))   + p.z*(1-2*(x*x+y*y)) };
+                };
+                int32 buried = 0;
+                std::string first;
+                for (const urdf::StaticBody& b : static_world_->bodies) {
+                    double top = -1e30;
+                    for (const urdf::StaticShape& sh : b.shapes)
+                        for (const urdf::Vec3& pt : sh.points)
+                            top = std::max(top, b.position.z + rotate(b.orientation, pt).z);
+                    if (top > -1e29 && top < opts.ground_plane_z) {
+                        ++buried;
+                        if (first.empty()) first = b.name;
+                    }
+                }
+                if (buried > 0) {
+                    UAirBlueprintLib::LogMessageString(
+                        "UrdfBot WARNING: props buried under the scaffolding floor ",
+                        Utils::stringf("%d mirrored bodies lie ENTIRELY below the %.2f m plane and "
+                                       "can never be touched (e.g. %s). Lower the plane, or drop "
+                                       "UrdfGroundPlaneZ once the terrain itself mirrors.",
+                                       buried, opts.ground_plane_z, first.c_str()),
+                        LogDebugLevel::Failure);
+                    UE_LOG(LogUrdfBot, Warning,
+                           TEXT("scaffolding floor at z=%.3f m buries %d of %d mirrored bodies "
+                                "(first: %s)"),
+                           opts.ground_plane_z, buried,
+                           static_cast<int32>(static_world_->bodies.size()),
+                           UTF8_TO_TCHAR(first.c_str()));
+                }
+            }
+        }
+
         for (const auto& r : robot.hullBudgetReductions()) {
             // Box3D's hull builder has a hard 255-half-edge ceiling that no vertex budget can
             // predict, so the budget is walked down until one is accepted. A coarser hull is a
@@ -1118,11 +1190,14 @@ void UrdfBotSimApi::loadModelAndBackend()
                          vehicle_setting_->urdf_mesh_asset_dir,
                          vehicle_setting_->urdf_mesh_asset_scale,
                          vehicle_setting_->urdf_mesh_runtime_static,
-                         vehicle_setting_->urdf_mesh_tint);
+                         vehicle_setting_->urdf_mesh_tint,
+                         vehicle_setting_->urdf_mesh_material_override,
+                         vehicle_setting_->urdf_mesh_roughness,
+                         vehicle_setting_->urdf_mesh_srgb_colors);
     UE_LOG(LogUrdfBot, Log,
            TEXT("mesh shading [%s]: cast_shadow=%d contact_shadow=%d inset_shadow=%d "
                 "two_sided_shadow=%d smooth_normals=%d flip_winding=%d base_material=%d "
-                "runtime_static=%d tint=%d"),
+                "runtime_static=%d tint=%d material_override=%d roughness=%.2f srgb=%d"),
            UTF8_TO_TCHAR(getVehicleName().c_str()),
            vehicle_setting_->urdf_mesh_cast_shadow ? 1 : 0,
            vehicle_setting_->urdf_mesh_contact_shadow ? 1 : 0,
@@ -1132,7 +1207,10 @@ void UrdfBotSimApi::loadModelAndBackend()
            vehicle_setting_->urdf_mesh_flip_winding ? 1 : 0,
            vehicle_setting_->urdf_mesh_base_material ? 1 : 0,
            vehicle_setting_->urdf_mesh_runtime_static ? 1 : 0,
-           vehicle_setting_->urdf_mesh_tint ? 1 : 0);
+           vehicle_setting_->urdf_mesh_tint ? 1 : 0,
+           vehicle_setting_->urdf_mesh_material_override ? 1 : 0,
+           vehicle_setting_->urdf_mesh_roughness,
+           vehicle_setting_->urdf_mesh_srgb_colors ? 1 : 0);
     pawn->buildFromModel(model_, dirOf(urdf_path), vehicle_setting_->urdf_mesh_search_paths);
 
     // Settled below, AFTER the render buffers exist — see settleAndPublish().
