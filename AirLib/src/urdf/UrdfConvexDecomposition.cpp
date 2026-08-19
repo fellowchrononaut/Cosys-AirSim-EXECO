@@ -117,6 +117,57 @@ DecompositionResult singleHull(const std::vector<Vec3>& vertices, std::string no
 
 } // namespace
 
+bool hasHullableVolume(const std::vector<Vec3>& pts, double eps)
+{
+    if (pts.size() < 4) return false;
+
+    auto d2 = [](const Vec3& a, const Vec3& b) {
+        const double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
+
+    // 1. a segment: the point furthest from the first
+    size_t i1 = 0;
+    double best = 0;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        const double d = d2(pts[0], pts[i]);
+        if (d > best) { best = d; i1 = i; }
+    }
+    if (best < eps * eps) return false;
+
+    const Vec3 a = pts[0], b = pts[i1];
+    const double ex = b.x - a.x, ey = b.y - a.y, ez = b.z - a.z;
+    const double seg = std::sqrt(ex * ex + ey * ey + ez * ez);
+    if (seg <= 0) return false;
+
+    // 2. a triangle: the point furthest off that segment
+    size_t i2 = 0;
+    best = 0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const double vx = pts[i].x - a.x, vy = pts[i].y - a.y, vz = pts[i].z - a.z;
+        const double cx = ey * vz - ez * vy, cy = ez * vx - ex * vz, cz = ex * vy - ey * vx;
+        const double area2 = cx * cx + cy * cy + cz * cz;
+        if (area2 > best) { best = area2; i2 = i; }
+    }
+    if (std::sqrt(best) / seg < eps) return false;
+
+    // 3. a tetrahedron: the point furthest off that triangle's plane
+    const Vec3 c = pts[i2];
+    const double ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+    const double wx = c.x - a.x, wy = c.y - a.y, wz = c.z - a.z;
+    double nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    const double nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (nlen <= 0) return false;
+    nx /= nlen; ny /= nlen; nz /= nlen;
+
+    double thickness = 0;
+    for (const Vec3& p : pts) {
+        const double d = std::fabs((p.x - a.x) * nx + (p.y - a.y) * ny + (p.z - a.z) * nz);
+        if (d > thickness) thickness = d;
+    }
+    return thickness >= eps;
+}
+
 uint64_t decompositionCacheKey(const std::vector<Vec3>& vertices, const std::vector<int>& indices,
                                const DecompositionOptions& opts)
 {
@@ -136,6 +187,7 @@ uint64_t decompositionCacheKey(const std::vector<Vec3>& vertices, const std::vec
     const long long t = quantise(opts.threshold);
     hashBytes(h, &t, sizeof(t));
     hashBytes(h, &opts.max_hulls, sizeof(opts.max_hulls));
+    hashBytes(h, &opts.max_part_vertices, sizeof(opts.max_part_vertices));
     return h;
 }
 
@@ -178,6 +230,10 @@ DecompositionResult decomposeConvex(const std::vector<Vec3>& vertices,
     // CoACD_run takes plain pointers and counts. There is nothing left to disagree about, and the
     // cost is the flat parameter list below. MuJoCo raised no such question only because its whole
     // public API is C.
+    // ⚠ AFTER the cache lookup, deliberately. A cache hit does no work, so announcing it would
+    // make a 65 ms load flicker seventeen progress frames for nothing.
+    if (opts.progress) opts.progress(std::to_string(indices.size() / 3) + " triangles");
+
     std::vector<double> verts(vertices.size() * 3);
     for (size_t i = 0; i < vertices.size(); ++i) {
         verts[3 * i + 0] = vertices[i].x;
@@ -203,7 +259,12 @@ DecompositionResult decomposeConvex(const std::vector<Vec3>& vertices,
         out = CoACD_run(in, opts.threshold, opts.max_hulls, preprocess_auto,
                         /*prep_resolution=*/50, /*sample_resolution=*/2000, /*mcts_nodes=*/20,
                         /*mcts_iteration=*/150, /*mcts_max_depth=*/3, /*pca=*/false,
-                        /*merge=*/true, /*decimate=*/false, /*max_ch_vertex=*/256,
+                        // ⚠ decimate MUST be true or max_ch_vertex is IGNORED. Measured: with
+                        // decimate=false and a cap of 64, CoACD returned parts of 390 and 573
+                        // vertices. The cap is not a hint that is approximated when convenient —
+                        // it is simply not consulted unless decimation is on, which made the
+                        // crash fix it was added for completely inert.
+                        /*merge=*/true, /*decimate=*/true, opts.max_part_vertices,
                         /*extrude=*/false, /*extrude_margin=*/0.01, apx_ch, /*seed=*/0u,
                         /*real_metric=*/false);
     }

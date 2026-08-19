@@ -13,6 +13,7 @@
 #include "common/ClockFactory.hpp"
 #include "urdf/UrdfCollisionSynthesis.hpp"
 #include "urdf/UrdfParser.hpp"
+#include "urdf/UrdfStaticWorld.hpp"
 
 #if WITH_BOX3D_BINDING
 #include "urdf/backends/Box3DUrdfBackend.hpp"
@@ -23,8 +24,14 @@
 #endif
 
 #include "HAL/PlatformFileManager.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/ScopedSlowTask.h"
 
 #include <algorithm>
+#include <chrono>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -411,28 +418,85 @@ void UrdfBotSimApi::loadModelAndBackend()
     // --- convex decomposition -----------------------------------------------------------------
     // Shared by both backends. Without CoACD in the build this is a no-op that yields one part per
     // mesh, i.e. exactly the behaviour that existed before, so nothing here needs a guard.
+    {
+        const std::string mode = Utils::toLower(vehicle_setting_->urdf_static_mesh_mode);
+        opts.static_mesh_mode =
+            (mode == "whole") ? urdf::BackendOptions::StaticMeshMode::Whole
+          : (mode == "split") ? urdf::BackendOptions::StaticMeshMode::Split
+                              : urdf::BackendOptions::StaticMeshMode::Auto;
+    }
+    opts.static_world_radius = vehicle_setting_->urdf_static_world_radius;
+    opts.static_world_max_triangles = vehicle_setting_->urdf_static_world_max_triangles;
     opts.decomposition.enabled = vehicle_setting_->urdf_convex_decomposition;
     opts.decomposition.threshold = vehicle_setting_->urdf_convex_decomposition_threshold;
     opts.decomposition.max_hulls = vehicle_setting_->urdf_convex_decomposition_max_hulls;
     opts.decomposition.cache_dir = vehicle_setting_->urdf_convex_decomposition_cache_dir;
 
-    // ⚠ Default the cache NEXT TO THE URDF rather than to a global directory, so a robot carries
-    // its own cook and copying the model copies the cook with it. Left empty the cache is off, and
-    // off is not a viable default: the Go2 hip alone takes 20-30 s to decompose.
-    if (opts.decomposition.enabled && opts.decomposition.cache_dir.empty())
-        opts.decomposition.cache_dir = dirOf(urdf_path) + "/.convex_cache";
+    // ⚠ Default the cache INSIDE THE PLUGIN, so a cook survives being moved to another project.
+    //
+    // The obvious place is next to the URDF, and it was the first thing tried — but a URDF often
+    // lives in a read-only reference clone or a shared model directory, and the cook then belongs
+    // to the model rather than to the simulator that produced it. Under the plugin, copying
+    // Plugins/AirSim into a new project carries every cooked decomposition with it and the first
+    // load there is instant instead of 312 s.
+    //
+    // The fallbacks are ordered by how much we trust them to be writable, and each is announced,
+    // because a silently-disabled cache looks exactly like a slow simulator:
+    //   1. UrdfConvexDecompositionCacheDir, if set   — the operator's explicit choice
+    //   2. <plugin>/Saved/ConvexCache                — travels with the plugin
+    //   3. <project>/Saved/ConvexCache               — plugin dir read-only (packaged builds)
+    //   4. next to the URDF                          — last resort
+    if (opts.decomposition.enabled && opts.decomposition.cache_dir.empty()) {
+        TArray<FString> candidates;
+        if (const TSharedPtr<IPlugin> plugin = IPluginManager::Get().FindPlugin(TEXT("AirSim")))
+            candidates.Add(FPaths::Combine(plugin->GetBaseDir(), TEXT("Saved"), TEXT("ConvexCache")));
+        candidates.Add(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("ConvexCache")));
+        candidates.Add(UTF8_TO_TCHAR((dirOf(urdf_path) + "/.convex_cache").c_str()));
 
-    if (!opts.decomposition.cache_dir.empty()) {
-        // Created here rather than in the service: AirLib has no filesystem helper of its own, and
-        // a service that silently does not cache because a directory is missing is the failure
-        // this whole arrangement exists to avoid.
         IPlatformFile& pf = FPlatformFileManager::Get().GetPlatformFile();
-        const FString dir = UTF8_TO_TCHAR(opts.decomposition.cache_dir.c_str());
-        if (!pf.DirectoryExists(*dir) && !pf.CreateDirectoryTree(*dir)) {
+        for (const FString& dir : candidates) {
+            if (!pf.DirectoryExists(*dir) && !pf.CreateDirectoryTree(*dir)) continue;
+
+            // Existing is not the same as writable — a plugin copied from a read-only medium, or
+            // a packaged build, can have a directory we cannot add to. Prove it with a real file
+            // rather than assume, because the alternative is discovering it 312 s into a load.
+            const FString probe = FPaths::Combine(dir, TEXT(".writable"));
+            if (!FFileHelper::SaveStringToFile(TEXT("x"), *probe)) continue;
+            pf.DeleteFile(*probe);
+
+            opts.decomposition.cache_dir = TCHAR_TO_UTF8(*dir);
+            break;
+        }
+    }
+
+    if (opts.decomposition.enabled && opts.decomposition.cache_dir.empty()) {
+        UE_LOG(LogUrdfBot, Warning,
+               TEXT("no writable convex-decomposition cache could be created for '%s' - EVERY load "
+                    "will re-cook from scratch, which is minutes for a mesh-heavy robot. Set "
+                    "UrdfConvexDecompositionCacheDir to somewhere writable."),
+               UTF8_TO_TCHAR(getVehicleName().c_str()));
+    }
+    else if (!opts.decomposition.cache_dir.empty()) {
+        UE_LOG(LogUrdfBot, Log, TEXT("convex-decomposition cache: %s"),
+               UTF8_TO_TCHAR(opts.decomposition.cache_dir.c_str()));
+
+        // ⚠ Flush BEFORE the cook, and say so loudly. Left on in a settings file this re-cooks on
+        // every single load, and the only symptom is a simulator that got mysteriously slow.
+        if (vehicle_setting_->urdf_convex_decomposition_flush_cache) {
+            const FString dir = UTF8_TO_TCHAR(opts.decomposition.cache_dir.c_str());
+            TArray<FString> stale;
+            IFileManager::Get().FindFiles(stale, *FPaths::Combine(dir, TEXT("*.cvx")), true, false);
+            for (const FString& f : stale)
+                IFileManager::Get().Delete(*FPaths::Combine(dir, f));
+
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot: convex cache FLUSHED ",
+                Utils::stringf("%d entries deleted - this load re-cooks from scratch. Turn "
+                               "UrdfConvexDecompositionFlushCache back off.", stale.Num()),
+                LogDebugLevel::Failure);
             UE_LOG(LogUrdfBot, Warning,
-                   TEXT("could not create the convex-decomposition cache at '%s' - every load will "
-                        "re-cook, which is minutes for a mesh-heavy robot"), *dir);
-            opts.decomposition.cache_dir.clear();
+                   TEXT("flushed %d cached decompositions from '%s' - re-cooking"), stale.Num(),
+                   *dir);
         }
     }
 
@@ -444,6 +508,41 @@ void UrdfBotSimApi::loadModelAndBackend()
     const FTransform spawn = getPawn()->GetActorTransform();
     opts.root_position = UrdfTransform::toUrdfVec(spawn.GetTranslation(), world_to_meters);
     opts.root_orientation = UrdfTransform::toUrdfQuat(spawn.GetRotation());
+
+    // --- sample the ground as a height grid ---------------------------------------------------
+    //
+    // ⚠ TRACES, NOT MIRRORED GEOMETRY, AND THAT IS THE WHOLE POINT. Unreal answers "what is the
+    // ground height here?" exactly, for landscape, static meshes and BSP alike, with no mirroring,
+    // no convex approximation and no dependence on how the level's ground happens to be modelled.
+    // Deriving a floor from mirrored geometry failed repeatedly on Blocks, whose ground is one
+    // 40 km mesh with a bounding box 442 m tall around a surface at z = 0.36.
+    //
+    // Only backends that ask for it get one; Box3D cooks the real triangles and needs nothing.
+    if (backend->needsScaffoldingGroundPlane() && vehicle_setting_->urdf_ground_plane_auto) {
+        urdf::BackendOptions::HeightField hf;
+        if (sampleGroundHeightField(opts.root_position,
+                                    vehicle_setting_->urdf_ground_sample_extent, hf)) {
+            opts.ground_height_field = hf;
+            height_field_centre_ = opts.root_position;
+            height_field_half_extent_ = vehicle_setting_->urdf_ground_sample_extent;
+            has_height_field_ = true;
+
+            // ⚠ Report it. Dropped during a refactor, and its absence made a working height field
+            // indistinguishable from a silent fallback to the flat plane.
+            double lo = hf.min_z, hi = hf.min_z;
+            for (float h : hf.heights) hi = std::max(hi, hf.min_z + static_cast<double>(h));
+            UE_LOG(LogUrdfBot, Log,
+                   TEXT("ground height field: %dx%d over %.0f m centred on (%.1f %.1f), "
+                        "elevation %.2f..%.2f m (relief %.2f m)"),
+                   hf.rows, hf.cols, 2.0 * hf.half_extent, hf.center_x, hf.center_y, lo, hi,
+                   hi - lo);
+        }
+        else {
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("ground height field: NO traces hit around the spawn - falling back to a "
+                        "flat plane"));
+        }
+    }
 
     // --- static world geometry ----------------------------------------------------------------
     // Mirrored once per level and shared by every robot: the shared_ptr's identity is what makes
@@ -500,14 +599,25 @@ void UrdfBotSimApi::loadModelAndBackend()
                    UTF8_TO_TCHAR(getVehicleName().c_str()),
                    UTF8_TO_TCHAR(backend->backendName()));
         }
+        else if (!backend->mirrorsKinematicBodies()) {
+            // Separate message from the one above, because it is a materially different gap: the
+            // level IS solid, other vehicles are not. Reported at load rather than discovered by
+            // driving through another robot.
+            UE_LOG(LogUrdfBot, Warning,
+                   TEXT("'%s': %s mirrors the static level but NOT other vehicles - it will pass "
+                        "through other robots as if they were not there"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()),
+                   UTF8_TO_TCHAR(backend->backendName()));
+        }
 
         // Kinematic bodies: registered per robot, because each robot owns its own b3World and gets
         // its own handles. The mirror itself is shared, so the self-exclusion has to happen here —
         // a robot that mirrored its own pawn would weld itself to an obstacle shaped like itself.
-        // ⚠ Skipped entirely for a backend that does not mirror. addKinematicBody returns -1
-        // there, so every handle would be dead and the "tracking N bodies" log would describe
-        // motion that cannot happen.
-        if (static_world_ && backend->mirrorsStaticWorld()) {
+        // ⚠ Keyed on mirrorsKinematicBodies, NOT mirrorsStaticWorld. MuJoCo now mirrors the level
+        // but still not the moving bodies; with the old single flag, switching static mirroring on
+        // would have silently re-enabled this and gone back to logging "+6 bodies ... now solid to
+        // this one" about handles that are all -1.
+        if (static_world_ && backend->mirrorsKinematicBodies()) {
             for (size_t i = 0; i < static_world_->kinematic.size(); ++i) {
                 UPrimitiveComponent* src =
                     (static_cast<int32>(i) < mirror.KinematicSources.Num())
@@ -541,13 +651,20 @@ void UrdfBotSimApi::loadModelAndBackend()
     // probe, and the free-fall warning.
     const bool have_static_world =
         static_world_ && !static_world_->bodies.empty() && backend->mirrorsStaticWorld();
+
+    // ⚠ A backend can mirror the level AND still need the traced floor. MuJoCo does: it skips the
+    // level's vast concave ground mesh, which it cannot represent, and stands on an exact plane
+    // instead. Box3D cooks the real ground triangles and must NOT get a second floor through the
+    // map. Suppressing the plane purely on "did the level mirror" conflated the two and left the
+    // MuJoCo robot with nothing to stand on.
+    const bool suppress_ground_plane = have_static_world && !backend->needsScaffoldingGroundPlane();
     // --- scaffolding floor: FALLBACK ONLY, now that the level is mirrored ----------------------
     //
     // ⚠ Suppressed whenever real geometry exists. A flat plane and a mirrored level are not
     // additive: the plane is infinite-ish (a 100 m slab) and would sit *through* the map, so a
     // rover driving down a ramp would stop dead in mid-air on an invisible floor. Two floors is a
     // worse failure than none, because none is obvious.
-    if (have_static_world) {
+    if (suppress_ground_plane) {
         if (vehicle_setting_->urdf_ground_plane_auto ||
             !std::isnan(vehicle_setting_->urdf_ground_plane_z)) {
             UAirBlueprintLib::LogMessageString(
@@ -590,7 +707,114 @@ void UrdfBotSimApi::loadModelAndBackend()
         opts.ground_plane_z = vehicle_setting_->urdf_ground_plane_z;
     }
 
+    // --- progress, because a cold cook freezes the editor for minutes -------------------------
+    //
+    // ⚠ This work is SYNCHRONOUS on the game thread. buildFromUrdf decomposes every <mesh>
+    // collision inline, and on ExoMy that measured 312 s cold — five minutes of a black,
+    // unresponsive editor with nothing on screen to say why. It looks exactly like a hang, and the
+    // reasonable response to a hang is to kill the process, which throws away the cook and
+    // guarantees it happens again next time.
+    //
+    // Counted up front rather than reported as a spinner: "4 of 17" tells you it is progressing
+    // AND roughly how much is left, which a spinner does not. Only mesh collisions are counted
+    // because only they decompose.
+    size_t mesh_collisions = 0;
+    for (const urdf::Link& l : model_.links)
+        for (const urdf::Collision& c : l.collisions)
+            if (c.geometry.type == urdf::GeometryType::Mesh) ++mesh_collisions;
+
+    // ⚠ Sized to BOTH long jobs. Robot mesh decomposition and static-world emission are separate
+    // stages with separate callbacks, and either can dominate: a Scout has 0 mesh collisions and
+    // 172 level bodies, ExoMy has 17 mesh collisions and the same level. Counting only one of them
+    // is how a five-minute load ended up with no dialog at all.
+    const int static_bodies =
+        static_cast<int>(static_world_ ? static_world_->bodies.size() : 0);
+    const int progress_total = static_cast<int>(mesh_collisions) + static_bodies;
+
+    TUniquePtr<FScopedSlowTask> cook_progress;
+    if (progress_total > 0) {
+        cook_progress = MakeUnique<FScopedSlowTask>(
+            static_cast<float>(progress_total),
+            FText::FromString(FString::Printf(
+                TEXT("%s: building collision geometry (%d robot meshes, %d level bodies)"),
+                UTF8_TO_TCHAR(getVehicleName().c_str()), static_cast<int32>(mesh_collisions),
+                static_bodies)));
+        // ⚠ bAllowInPIE MUST BE TRUE OR NOTHING IS EVER SHOWN, and its default is false. From
+        // Misc/SlowTask.h: "Whether to allow this dialog in PIE. If false, this dialog will not
+        // appear during PIE sessions." A urdfbot is built in ASimModeBase::BeginPlay, which is
+        // PIE — so the first version of this code asked for a dialog that was suppressed by
+        // design, and a 5-minute cook still looked like a hang.
+        //
+        // ⚠ Important, NOT the default visibility, AND THIS IS WHAT MAKES IT VISIBLE AT ALL.
+        //
+        // A urdfbot is built inside ASimModeBase::BeginPlay, which runs while PIE ALREADY HAS A
+        // SLOW TASK OPEN ("Starting PIE (Begin Play)"). Two consequences, both measured:
+        //   * MakeDialog below does nothing — it bails on `!GIsSlowTask` (SlowTask.cpp:235), since
+        //     a dialog already exists. Our scope is pushed on the stack but never becomes the
+        //     dialog.
+        //   * FeedbackContextEditor.cpp:193-210 always shows scope 0 — PIE's message — and then
+        //     scans the stack ONLY for scopes marked Important to add as secondary bars. A
+        //     Default-visibility scope is second-class and, nested under PIE, showed nothing: the
+        //     operator saw a dialog reading "Starting PIE (Begin Play)" for five minutes with no
+        //     hint that a convex decomposition was the thing taking the time.
+        //
+        // Important gets our message its own bar underneath PIE's. The engine warns if such a scope
+        // has an empty DefaultMessage; ours is the constructor argument above.
+        cook_progress->Visibility = ESlowTaskVisibility::Important;
+
+        // ⚠ IMMEDIATE, NOT MakeDialogDelayed, AND THE REASON IS NON-OBVIOUS. MakeDialogDelayed
+        // creates nothing — it only records a threshold. The dialog is built lazily inside
+        // EnterProgressFrame -> TickProgress -> MakeDialogIfNeeded (Core/Private/Misc/SlowTask.cpp),
+        // so it can only ever appear ON A PROGRESS CALL. We call that once per mesh, and the first
+        // call happens BEFORE any work, when elapsed time is still ~0 and below any threshold. The
+        // second call comes ~20 s later, after the first mesh is already cooked. Net effect with a
+        // 0.5 s threshold: the dialog is born one whole mesh late and the longest stall of the load
+        // — the first one — is the one with nothing on screen. Measured; the operator saw it
+        // "show for a bit".
+        //
+        // Creating it up front costs a dialog that appears and vanishes on a warm 65 ms load. That
+        // is the lesser evil, and in practice it does not survive long enough to paint.
+        //
+        // ⚠ bAllowInPIE MUST be true — see above; its default suppresses the dialog entirely here.
+        //
+        // ⚠ bShowCancelButton stays false. Cancelling mid-cook would leave the robot with some
+        // links decomposed and others as single hulls — a silently inconsistent collision model,
+        // which is worse than waiting.
+        cook_progress->MakeDialog(/*bShowCancelButton=*/false, /*bAllowInPIE=*/true);
+
+        // ⚠ Paint it BEFORE the first mesh, with zero work claimed. EnterProgressFrame is the only
+        // thing that pushes text and a redraw into the dialog, so without this the window exists
+        // but shows the default message until the first mesh has already finished — which is the
+        // exact 20-second blind spot this is all meant to remove.
+        cook_progress->EnterProgressFrame(
+            0.0f, FText::FromString(FString::Printf(
+                      TEXT("Preparing %d items..."), progress_total)));
+    }
+
+    // ⚠ Counted here rather than left to the bar's fill fraction. A fraction tells you how far
+    // along you are but not how much is left in units you can reason about; "mesh 4 of 17" does,
+    // and when each mesh is ~20 s that is the difference between waiting and force-quitting.
+    int32 cooked = 0;
+    opts.decomposition.progress = [&cook_progress, &cooked,
+                                   total = static_cast<int32>(mesh_collisions)](
+                                      const std::string& what) {
+        if (!cook_progress) return;
+        ++cooked;
+        cook_progress->EnterProgressFrame(
+            1.0f, FText::FromString(FString::Printf(
+                      TEXT("Convex decomposition %d/%d:  %s"), cooked, total,
+                      UTF8_TO_TCHAR(what.c_str()))));
+    };
+
+    opts.build_progress = [&cook_progress](const std::string& stage, int done, int total) {
+        if (!cook_progress) return;
+        cook_progress->EnterProgressFrame(
+            1.0f, FText::FromString(FString::Printf(TEXT("%s  %d/%d"),
+                                                    UTF8_TO_TCHAR(stage.c_str()), done, total)));
+    };
+
     backend->buildFromUrdf(model_, opts);
+    cook_progress.Reset();
     backend_ = std::move(backend);
 
     // Cross-check the realised mass against the file. A mismatch means links were merged, dropped
@@ -641,6 +865,14 @@ void UrdfBotSimApi::loadModelAndBackend()
                    UTF8_TO_TCHAR(d.link.c_str()), static_cast<int32>(d.parts), d.seconds,
                    d.from_cache ? TEXT(", from cache") : TEXT(""));
         }
+        if (robot.degenerateParts() > 0) {
+            // Normal in small numbers — CoACD emits slivers. Logged because it is also the count
+            // that used to reach b3CreateHull and take the editor down with SIGSEGV.
+            UE_LOG(LogUrdfBot, Log,
+                   TEXT("%d convex parts had no volume to hull and were dropped"),
+                   static_cast<int32>(robot.degenerateParts()));
+        }
+
         if (!robot.decompositionFallbacks().empty()) {
             std::string list;
             for (const auto& f : robot.decompositionFallbacks())
@@ -674,6 +906,125 @@ void UrdfBotSimApi::loadModelAndBackend()
     }
 
 #if WITH_MUJOCO_BINDING
+    // ⚠ REPORT WHAT THE LEVEL ACTUALLY BECAME. mirrorsStaticWorld() being true SUPPRESSES the
+    // scaffolding ground plane, so if these geoms silently fail to appear the robot is left with
+    // no world at all and falls forever — which is exactly what happened the first time this ran.
+    // The counters existed before this log did, which is why the failure was invisible.
+    if (!is_box3d) {
+        const urdf::MuJoCoUrdfBackend* mjw =
+            static_cast<const urdf::MuJoCoUrdfBackend*>(backend_.get());
+        const size_t emitted = mjw->staticGeomsEmitted();
+        const size_t dropped = mjw->staticShapesDropped();
+
+        double gmin[3], gmax[3];
+        mjw->staticGeomBounds(gmin, gmax);
+        const urdf::Vec3 spawn_m = opts.root_position;
+
+        // ⚠ Compiled count AND bounds AND the spawn, on one line, because the three failures look
+        // identical from the outside: nothing compiled, geometry compiled somewhere else, or
+        // geometry compiled correctly and the robot spawned outside it.
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo static world: %d spec geoms -> %d COMPILED world geoms, %d dropped "
+                    "(from %d mirrored shapes)"),
+               static_cast<int32>(emitted), static_cast<int32>(mjw->staticGeomsCompiled()),
+               static_cast<int32>(dropped),
+               static_cast<int32>(static_world_ ? static_world_->shapeCount() : 0));
+        if (mjw->staticWorstVertex() > 0) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: CORRUPT level geometry rejected ",
+                Utils::stringf("a mirrored shape contained a vertex %.0f m from the origin. Left "
+                               "in, it poisons every collision and ray query in the model.",
+                               mjw->staticWorstVertex()),
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Error,
+                   TEXT("rejected static geometry with a vertex %.1f m from the origin"),
+                   mjw->staticWorstVertex());
+        }
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo largest mirrored shape: %.1f m across, from '%s'"),
+               mjw->staticWorstSpan(), UTF8_TO_TCHAR(mjw->staticWorstSpanBody().c_str()));
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo static world: %d vast flat shapes converted to infinite planes"),
+               static_cast<int32>(mjw->staticPlanesEmitted()));
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo static world: %d shapes skipped as oversize (the level ground); "
+                    "ground represented by %s"),
+               static_cast<int32>(mjw->staticShapesOversize()),
+               mjw->usedHeightField() ? TEXT("a sampled HEIGHT FIELD")
+                                      : TEXT("a flat traced plane"));
+        // ⚠ Geom count is the cost of the per-triangle representation, and it is the number to
+        // watch if stepping gets slow. Exactness is bought with geoms rather than with cook time.
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo static world: %d convex objects taken whole, %d triangles from "
+                    "concave ones as thin prisms (exact surface, no decomposition)"),
+               static_cast<int32>(mjw->staticConvexObjects()),
+               static_cast<int32>(mjw->staticTrianglesEmitted()));
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo static world: %d inward-facing enclosures detected (always split - a "
+                    "room taken whole becomes a solid block around the robot)"),
+               static_cast<int32>(mjw->staticEnclosures()));
+        if (mjw->staticTrianglesSkipped() > 0) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: level geometry TRUNCATED ",
+                Utils::stringf("%d triangles dropped at the %d cap - that geometry is NOT THERE "
+                               "for this robot. Reduce UrdfStaticWorldRadius or raise "
+                               "UrdfStaticWorldMaxTriangles.",
+                               static_cast<int>(mjw->staticTrianglesSkipped()),
+                               vehicle_setting_->urdf_static_world_max_triangles),
+                LogDebugLevel::Failure);
+        }
+        if (mjw->staticPlanesEmitted() > 0) {
+            UE_LOG(LogUrdfBot, Log,
+                   TEXT("MuJoCo ground plane placed at z = %.3f (shape spanned z %.3f..%.3f) from "
+                        "'%s'   robot spawns at z = %.3f"),
+                   mjw->planeZ(), mjw->planeSpanLoZ(), mjw->planeZ(),
+                   UTF8_TO_TCHAR(mjw->planeBody().c_str()), opts.root_position.z);
+        }
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo static world EXTENT (pos+/-rbound): x[%.2f %.2f] y[%.2f %.2f] z[%.2f %.2f]   "
+                    "robot spawns at (%.2f %.2f %.2f)"),
+               gmin[0], gmax[0], gmin[1], gmax[1], gmin[2], gmax[2],
+               spawn_m.x, spawn_m.y, spawn_m.z);
+
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("MuJoCo contact masks: world contype=%d conaffinity=%d | robot contype=%d "
+                    "conaffinity=%d  (a pair collides only if type1&aff2 or type2&aff1)"),
+               mjw->staticContype(), mjw->staticConaffinity(), mjw->robotContype(),
+               mjw->robotConaffinity());
+
+        // The decisive one: is there anything under the robot at all?
+        if (mjw->groundProbeDistance() < 0) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: NOTHING beneath ",
+                getVehicleName() + " - a downward ray from its spawn point hits no static geometry, "
+                "so it will fall forever despite the level having compiled.",
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Error,
+                   TEXT("MuJoCo ground probe: NO HIT below the spawn point (upward ray: %.3f m - "
+                        "a positive value here means the robot spawned UNDER the level)"),
+                   mjw->ceilingProbeDistance());
+        }
+        else {
+            UE_LOG(LogUrdfBot, Log,
+                   TEXT("MuJoCo ground probe: %.3f m below the spawn, geom %d"),
+                   mjw->groundProbeDistance(), mjw->groundProbeGeom());
+        }
+
+        if (have_static_world && mjw->staticGeomsCompiled() == 0) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: MuJoCo emitted NO static geometry ",
+                getVehicleName() + " mirrored a level but produced no collision geometry from it, "
+                "and the scaffolding ground plane was suppressed because the engine claims to "
+                "mirror. This robot has NOTHING to stand on and will fall forever.",
+                LogDebugLevel::Failure);
+            UE_LOG(LogUrdfBot, Error,
+                   TEXT("'%s': static world mirrored (%d shapes) but 0 geoms emitted - the robot "
+                        "has no world"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()),
+                   static_cast<int32>(static_world_ ? static_world_->shapeCount() : 0));
+        }
+    }
+
     // The MuJoCo equivalent, and it exists for the same reason as the R2 audit: a robot whose
     // collision geometry quietly did not load looks completely normal and collides with nothing.
     // MuJoCo drops what it cannot read WITHOUT reporting it — package:// URIs (it has no notion of
@@ -737,10 +1088,12 @@ void UrdfBotSimApi::loadModelAndBackend()
                          vehicle_setting_->urdf_mesh_contact_shadow,
                          vehicle_setting_->urdf_mesh_decimate_grid,
                          vehicle_setting_->urdf_mesh_asset_dir,
-                         vehicle_setting_->urdf_mesh_asset_scale);
+                         vehicle_setting_->urdf_mesh_asset_scale,
+                         vehicle_setting_->urdf_mesh_runtime_static);
     UE_LOG(LogUrdfBot, Log,
            TEXT("mesh shading [%s]: cast_shadow=%d contact_shadow=%d inset_shadow=%d "
-                "two_sided_shadow=%d smooth_normals=%d flip_winding=%d base_material=%d"),
+                "two_sided_shadow=%d smooth_normals=%d flip_winding=%d base_material=%d "
+                "runtime_static=%d"),
            UTF8_TO_TCHAR(getVehicleName().c_str()),
            vehicle_setting_->urdf_mesh_cast_shadow ? 1 : 0,
            vehicle_setting_->urdf_mesh_contact_shadow ? 1 : 0,
@@ -748,11 +1101,23 @@ void UrdfBotSimApi::loadModelAndBackend()
            vehicle_setting_->urdf_mesh_two_sided_shadow ? 1 : 0,
            vehicle_setting_->urdf_mesh_smooth_normals ? 1 : 0,
            vehicle_setting_->urdf_mesh_flip_winding ? 1 : 0,
-           vehicle_setting_->urdf_mesh_base_material ? 1 : 0);
+           vehicle_setting_->urdf_mesh_base_material ? 1 : 0,
+           vehicle_setting_->urdf_mesh_runtime_static ? 1 : 0);
     pawn->buildFromModel(model_, dirOf(urdf_path), vehicle_setting_->urdf_mesh_search_paths);
 
+    // Settled below, AFTER the render buffers exist — see settleAndPublish().
     snapshot_.resize(backend_->linkCount());
     render_poses_.resize(backend_->linkCount());
+
+    settleAndPublish();
+
+    // ⚠ FILL THEM, do not merely size them. resize() default-constructs every LinkPose to position
+    // (0,0,0) with identity rotation, and those are what the pawn renders until the first physics
+    // update arrives. The robot therefore appears LIMP — every link at identity — for the first
+    // frames, which is exactly the "hangs for a moment before landing" symptom, and it survived the
+    // settle fix because settling moves the SOLVER while the renderer was still reading defaults.
+    for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+    render_poses_ = snapshot_;
 
     // Borrowed from the backend, which outlives the api — both are members of this sim api and
     // the backend is declared first, so it is destroyed last.
@@ -1203,7 +1568,7 @@ void UrdfBotSimApi::refreshKinematicMirror()
     // be here too — this is a second, independent path to addKinematicBody. Without it a MuJoCo
     // robot logged "kinematic mirror refresh: +6 bodies (now 6) ... now solid to this one" while
     // every handle was -1 and nothing was solid to anything. Observed 2026-08-19.
-    if (!backend_->mirrorsStaticWorld()) return;
+    if (!backend_->mirrorsKinematicBodies()) return;
 
     urdf::UrdfRobotBackend* backend = backend_.get();
 
@@ -1250,12 +1615,112 @@ void UrdfBotSimApi::refreshKinematicMirror()
     }
 }
 
+bool UrdfBotSimApi::sampleGroundHeightField(const urdf::Vec3& centre, double half_extent,
+                                            urdf::BackendOptions::HeightField& out)
+{
+    // ⚠ TRACES, NOT MIRRORED GEOMETRY. Unreal answers "how high is the ground here" exactly, for
+    // landscape, static meshes and BSP alike, without any of it being mirrored or approximated as
+    // convex. Deriving a floor from mirrored geometry failed repeatedly on Blocks, whose ground is
+    // one 40 km mesh with a bounding box 442 m tall around a surface at z = 0.36.
+    const int kSamples = 33;                    // 33x33 = 1089 traces, a few ms
+    const float world_to_meters = getNedTransform().fromNed(1.0f);
+
+    out = urdf::BackendOptions::HeightField();
+    out.rows = kSamples;
+    out.cols = kSamples;
+    out.center_x = centre.x;
+    out.center_y = centre.y;
+    out.half_extent = half_extent;
+    out.heights.assign(static_cast<size_t>(kSamples) * kSamples, 0.0f);
+
+    FCollisionQueryParams params(FName(TEXT("UrdfGroundGrid")), /*bTraceComplex=*/true);
+    params.AddIgnoredActor(getPawn());
+
+    std::vector<double> z(static_cast<size_t>(kSamples) * kSamples,
+                          std::numeric_limits<double>::quiet_NaN());
+    double lo = std::numeric_limits<double>::max();
+    int hits = 0;
+
+    for (int r = 0; r < kSamples; ++r) {
+        for (int c = 0; c < kSamples; ++c) {
+            // ⚠ Row-major with r along +y and c along +x, matching MuJoCo's hfield indexing.
+            // Transposing this yields terrain that is subtly rotated - much harder to notice than
+            // terrain that is simply missing.
+            const double wx = centre.x - half_extent + 2.0 * half_extent * c / (kSamples - 1);
+            const double wy = centre.y - half_extent + 2.0 * half_extent * r / (kSamples - 1);
+
+            const FVector start = UrdfTransform::toFVector(
+                urdf::Vec3{ wx, wy, centre.z + 50.0 }, world_to_meters);
+            const FVector end = UrdfTransform::toFVector(
+                urdf::Vec3{ wx, wy, centre.z - 500.0 }, world_to_meters);
+
+            FHitResult hit;
+            if (getPawn()->GetWorld()->LineTraceSingleByChannel(hit, start, end, ECC_Visibility,
+                                                                params)) {
+                const double h = hit.ImpactPoint.Z / world_to_meters;
+                z[static_cast<size_t>(r) * kSamples + c] = h;
+                lo = std::min(lo, h);
+                ++hits;
+            }
+        }
+    }
+
+    if (hits == 0) return false;
+
+    // ⚠ Holes filled with the LOWEST sample rather than left at zero. A gap - a pit, or a trace
+    // that escaped through a doorway - would otherwise become a spike at whatever z = 0 means in
+    // this map, and the robot would trip over nothing.
+    out.min_z = lo;
+    for (size_t i = 0; i < z.size(); ++i)
+        out.heights[i] = static_cast<float>((std::isnan(z[i]) ? lo : z[i]) - lo);
+    return true;
+}
+
+void UrdfBotSimApi::refreshGroundHeightField()
+{
+    // ⚠ A CLIPPED WORLD MUST FOLLOW THE ROBOT OR IT IS A CLIFF. The patch is sampled once around
+    // the spawn; drive past its edge and the ground simply ends. Re-centring when the robot passes
+    // the halfway mark keeps a full half-patch of margin ahead of it at all times.
+    //
+    // ⚠ GAME THREAD ONLY - line traces are not safe from the physics thread. updateRenderedState
+    // is the game-thread hook, which is why this is called from there and not from update().
+    if (!has_height_field_ || !built_ || backend_ == nullptr) return;
+
+#if WITH_MUJOCO_BINDING
+    // ⚠ render_poses_, not the backend. This runs on the game thread; reading the backend here
+    // would race the physics thread that is writing it. render_poses_ is the copy made for exactly
+    // this purpose at the top of updateRenderedState.
+    if (render_poses_.empty()) return;
+    const urdf::LinkPose root = render_poses_[0];
+    const double dx = root.position.x - height_field_centre_.x;
+    const double dy = root.position.y - height_field_centre_.y;
+    const double moved = std::sqrt(dx * dx + dy * dy);
+
+    if (moved < 0.5 * height_field_half_extent_) return;
+
+    urdf::BackendOptions::HeightField hf;
+    if (!sampleGroundHeightField(root.position, height_field_half_extent_, hf)) return;
+
+    auto* mj = static_cast<urdf::MuJoCoUrdfBackend*>(backend_.get());
+    if (mj->updateGroundHeightField(hf)) {
+        height_field_centre_ = root.position;
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("ground height field re-centred on (%.1f %.1f) after %.1f m of travel"),
+               root.position.x, root.position.y, moved);
+    }
+#endif
+}
+
 void UrdfBotSimApi::updateRenderedState(float dt)
 {
     {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         render_poses_ = snapshot_;
     }
+
+    // Game-thread only: line traces are not safe from the physics thread, and this is the hook
+    // that runs there.
+    refreshGroundHeightField();
 
     // Late-arriving vehicles (notably OTHER URDF robots) get picked up here, before their poses are
     // pushed, so a body registered this frame is driven from this frame.
@@ -1366,6 +1831,63 @@ void UrdfBotSimApi::updateRendering(float dt)
     PawnSimApi::updateRendering(dt);
 }
 
+void UrdfBotSimApi::settleAndPublish()
+{
+    if (!backend_ || vehicle_setting_->urdf_settle_seconds <= 0) return;
+
+    // ⚠ Stepped on the LOADING thread, before play, so the robot is already resting when the first
+    // frame is drawn. Drive input is untouched and zero, so this settles under gravity and contact
+    // only.
+    const double settle = vehicle_setting_->urdf_settle_seconds;
+
+    // ⚠ TRACE THE SETTLE, do not just report its endpoint. "root now at z=2.99" after a 0.5 s
+    // settle is compatible with two completely different stories — the robot never fell, or it
+    // fell and bounced back — and the endpoint cannot tell them apart. ExoMy does not move at all
+    // here while a Scout in the same map falls 1.2 m, and that difference is the whole question.
+    const urdf::LinkPose before = backend_->getLinkPose(0);
+    int steps = 0;
+    const int slices = 10;
+    for (int i = 0; i < slices; ++i) {
+        steps += backend_->step(settle / slices);
+        const urdf::LinkPose p = backend_->getLinkPose(0);
+        const urdf::Twist t = backend_->getLinkTwist(0);
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("  settle %s t=%.2f  z=%8.3f  vz=%8.3f  (x %.2f y %.2f)"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), settle * (i + 1) / slices,
+               p.position.z, t.linear.z, p.position.x, p.position.y);
+    }
+
+    // ⚠ If it did not move, say why it could not have: a fixed base and a zero timestep are the two
+    // ways a settle silently does nothing, and both look identical from the endpoint.
+    const urdf::LinkPose after0 = backend_->getLinkPose(0);
+    if (std::fabs(after0.position.z - before.position.z) < 1e-3) {
+        UE_LOG(LogUrdfBot, Warning,
+               TEXT("settle moved '%s' by less than 1 mm in %.2f s (%d steps). fixed_base=%d, "
+                    "backend=%s - either it is already resting, or it is anchored, or it is not "
+                    "being integrated."),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), settle, steps,
+               vehicle_setting_->urdf_fixed_base ? 1 : 0,
+               UTF8_TO_TCHAR(backend_->backendName()));
+    }
+
+    // Publish immediately: resize() default-constructs poses to identity, and those are what the
+    // pawn renders until the first physics update. Without this the robot is drawn limp regardless
+    // of how well it settled.
+    if (snapshot_.size() != backend_->linkCount()) snapshot_.resize(backend_->linkCount());
+    if (render_poses_.size() != backend_->linkCount()) render_poses_.resize(backend_->linkCount());
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+    }
+    render_poses_ = snapshot_;
+
+    const urdf::LinkPose after = backend_->getLinkPose(0);
+    UE_LOG(LogUrdfBot, Log,
+           TEXT("settled '%s' for %.2f s (%d steps) - root now at (%.2f %.2f %.2f)"),
+           UTF8_TO_TCHAR(getVehicleName().c_str()), settle, steps,
+           after.position.x, after.position.y, after.position.z);
+}
+
 void UrdfBotSimApi::resetImplementation()
 {
     PawnSimApi::resetImplementation();
@@ -1383,9 +1905,21 @@ void UrdfBotSimApi::resetImplementation()
         backend_->reset();
         last_update_time_ = 0;
         steps_taken_ = 0;
-        std::lock_guard<std::mutex> lock(snapshot_mutex_);
-        for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+        }
     }
+
+    // ⚠ RE-SETTLE. backend_->reset() rebuilds the world from scratch and puts the robot back at its
+    // spawn pose — deliberately, because Box3D has no rollback determinism. But the framework calls
+    // resetImplementation() AFTER initialize(), so a settle done only at load is discarded every
+    // single time and the robot falls into the scene anyway. That is why settling appeared to do
+    // nothing: it worked, and was then thrown away.
+    //
+    // Settling here as well makes "reset" mean "back to the resting initial state" rather than
+    // "back to mid-air", which is what an initial condition should be.
+    if (built_) settleAndPublish();
 }
 
 void UrdfBotSimApi::reportState(StateReporter& reporter)

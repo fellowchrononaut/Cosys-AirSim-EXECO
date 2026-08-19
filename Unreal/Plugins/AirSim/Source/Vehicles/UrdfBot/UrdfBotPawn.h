@@ -68,8 +68,10 @@ public:
     void setMeshShading(bool cast_shadow, bool smooth_normals, bool flip_winding,
                         bool base_material, bool inset_shadow, bool two_sided_shadow,
                         bool contact_shadow, double decimate_grid,
-                        const std::string& asset_dir, double asset_scale)
+                        const std::string& asset_dir, double asset_scale,
+                        bool runtime_static)
     {
+        mesh_runtime_static_ = runtime_static;
         mesh_asset_dir_ = asset_dir;
         mesh_asset_scale_ = asset_scale;
         mesh_decimate_grid_ = decimate_grid;
@@ -172,7 +174,36 @@ private:
     int64 mesh_triangles_after_ = 0;
     bool mesh_two_sided_shadow_ = false;
 
+    /// Force VSM to invalidate this robot's cached shadow pages every frame.
+    /// Default TRUE: the links are runtime-built meshes moved every frame, which is
+    /// what EShadowCacheInvalidationBehavior::Always exists for.
+    bool mesh_shadow_invalidate_always_ = true;
+
+    /// Runtime-built UStaticMesh per (file, scale). A 23-link robot reuses meshes.
+    TMap<FString, UStaticMesh*> static_mesh_cache_;
+    int32 mesh_built_static_ = 0;
+
+    /// Resolve the shared base material. Must run before ANY attach path uses it.
+    void ensureMeshMaterial();
+
+    bool attachBuiltStaticMesh(USceneComponent* link_component,
+                               const urdf::Geometry& g, const urdf::Origin& origin,
+                               const urdf::Material& material, const FName& name,
+                               bool collidable);
+
+    /// Build real UStaticMeshes at runtime instead of using procedural components.
+    /// Default TRUE: every VSM knob applied to UProceduralMeshComponent was measured
+    /// to do nothing, while a UStaticMeshComponent gets engine-built bounds,
+    /// tangents and shadow-cache behaviour.
+    bool mesh_runtime_static_ = true;
+
+    class UStaticMesh* buildStaticMeshFromData(const urdf::MeshData& mesh,
+                                               const FString& key, double sx,
+                                               double sy, double sz);
+
     bool logged_material_once_ = false;
+    bool logged_material_params_ = false;
+    bool logged_material_readback_ = false;
     bool logged_param_once_ = false;
 
     double mesh_load_seconds_ = 0.0;

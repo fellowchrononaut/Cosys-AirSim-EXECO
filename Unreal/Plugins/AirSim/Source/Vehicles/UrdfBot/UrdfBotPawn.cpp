@@ -9,7 +9,10 @@
 
 #include "Components/PrimitiveComponent.h"
 #include "Engine/StaticMesh.h"
+#include "MeshDescription.h"
+#include "StaticMeshAttributes.h"
 #include "Materials/Material.h"
+#include "SceneTypes.h"
 
 #include <cmath>
 #include <unordered_map>
@@ -217,6 +220,204 @@ void AUrdfBotPawn::attachGeometry(USceneComponent* link_component, const urdf::G
     applySegmentationId(c, segmentation_id_);
 }
 
+void AUrdfBotPawn::ensureMeshMaterial()
+{
+    if (mesh_material_ != nullptr) return;
+
+    // ⚠ HOISTED OUT OF THE PROCEDURAL PATH. This resolution used to live inline in
+    // attachMeshGeometry, so any path that ran BEFORE it saw mesh_material_ == nullptr. The runtime
+    // static-mesh path runs first, which left its material slot empty and its SetMaterial call
+    // skipped — a mesh that builds correctly, reports sane bounds and one section, and draws
+    // nothing. Resolving it up front is what makes the two paths share a material at all.
+    if (!mesh_base_material_)
+        mesh_material_ = LoadObject<UMaterialInterface>(
+            nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial_Inst.BasicShapeMaterial_Inst"));
+    if (mesh_material_ == nullptr)
+        mesh_material_ = LoadObject<UMaterialInterface>(
+            nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+    if (mesh_material_ == nullptr) {
+        mesh_material_ = UMaterial::GetDefaultMaterial(MD_Surface);
+        UE_LOG(LogUrdfBot, Warning,
+               TEXT("BasicShapeMaterial could not be loaded; falling back to the engine default. "
+                    "Link colours from <material> will NOT be applied."));
+    }
+    UE_LOG(LogUrdfBot, Log, TEXT("mesh base material: %s"), *GetNameSafe(mesh_material_));
+}
+
+UStaticMesh* AUrdfBotPawn::buildStaticMeshFromData(const urdf::MeshData& mesh,
+                                                  const FString& key, double sx, double sy,
+                                                  double sz)
+{
+    // ⚠ WHY A REAL UStaticMesh AND NOT A PROCEDURAL MESH.
+    //
+    // Every VSM mechanism was tried against the procedural path and measured: NormalBias does
+    // nothing, ResolutionLodBias does nothing, two-sided shadow casting does nothing, inset shadows
+    // are disabled by the engine under VSM, and ShadowCacheInvalidationBehavior::Always does
+    // nothing. Only disabling VSM or disabling shadow casting lifts the darkness, and both of those
+    // are losses rather than fixes. That pattern says the geometry in the shadow map is wrong in a
+    // way none of the sampling knobs can reach.
+    //
+    // A UStaticMesh goes through the engine's own build: bounds, tangents, LODs, distance fields
+    // and shadow-cache behaviour are all constructed the way the renderer expects, instead of being
+    // reconstructed by us. BuildFromMeshDescriptions is ENGINE_API and NOT editor-only, so this
+    // works at runtime and in packaged builds alike.
+    //
+    // ⚠ Cached per (file, scale). A 23-link robot reuses the same wheel mesh four times, and
+    // building it four times would be the dominant cost of a spawn.
+    ensureMeshMaterial();
+    if (UStaticMesh** found = static_mesh_cache_.Find(key)) return *found;
+
+    if (mesh.vertices.size() < 3) return nullptr;
+
+    FMeshDescription desc;
+    FStaticMeshAttributes attrs(desc);
+    attrs.Register();
+
+    const FPolygonGroupID group = desc.CreatePolygonGroup();
+    attrs.GetPolygonGroupMaterialSlotNames()[group] = FName(TEXT("Default"));
+
+    TVertexAttributesRef<FVector3f> positions = attrs.GetVertexPositions();
+    TVertexInstanceAttributesRef<FVector3f> normals = attrs.GetVertexInstanceNormals();
+    TVertexInstanceAttributesRef<FVector2f> uvs = attrs.GetVertexInstanceUVs();
+
+    const int32 tri_count = static_cast<int32>(mesh.vertices.size() / 3);
+    desc.ReserveNewVertices(tri_count * 3);
+    desc.ReserveNewVertexInstances(tri_count * 3);
+    desc.ReserveNewPolygons(tri_count);
+
+    for (int32 t = 0; t < tri_count; ++t) {
+        // ⚠ Same Y mirror as the procedural path — Unreal is left-handed — and the SAME winding
+        // decision, so the two paths cannot disagree about which way a face points. Reversing the
+        // order here compensates for the mirror's handedness flip; signed-volume measurement on the
+        // real meshes showed +V in source space and -V after the mirror, i.e. the mirror alone
+        // leaves every face inward.
+        const int32 src[3] = { t * 3 + 0, t * 3 + 2, t * 3 + 1 };
+
+        FVertexInstanceID inst[3];
+        for (int32 k = 0; k < 3; ++k) {
+            const urdf::Vec3& v = mesh.vertices[src[k]];
+            const FVertexID vid = desc.CreateVertex();
+            positions[vid] = FVector3f(static_cast<float>(v.x * sx),
+                                       static_cast<float>(-v.y * sy),
+                                       static_cast<float>(v.z * sz));
+            inst[k] = desc.CreateVertexInstance(vid);
+            uvs[inst[k]] = FVector2f(0.0f, 0.0f);
+        }
+
+        // Flat face normal; the engine recomputes tangents during the build.
+        const FVector3f e1 = positions[desc.GetVertexInstanceVertex(inst[1])] -
+                             positions[desc.GetVertexInstanceVertex(inst[0])];
+        const FVector3f e2 = positions[desc.GetVertexInstanceVertex(inst[2])] -
+                             positions[desc.GetVertexInstanceVertex(inst[0])];
+        const FVector3f n = FVector3f::CrossProduct(e1, e2).GetSafeNormal();
+        for (int32 k = 0; k < 3; ++k) normals[inst[k]] = n;
+
+        desc.CreatePolygon(group, TArray<FVertexInstanceID>({ inst[0], inst[1], inst[2] }));
+    }
+
+    UStaticMesh* built = NewObject<UStaticMesh>(this);
+
+    // ⚠ THE SLOT NAME MUST MATCH THE POLYGON GROUP'S. The build maps polygon groups onto material
+    // slots BY NAME; an unnamed FStaticMaterial against a group named "Default" leaves the section
+    // with no valid material index, and the mesh builds successfully and renders NOTHING. That is
+    // exactly how this first appeared — geometry present, bounds correct, invisible.
+    FStaticMaterial slot;
+    slot.MaterialSlotName = FName(TEXT("Default"));
+    slot.ImportedMaterialSlotName = FName(TEXT("Default"));
+    slot.MaterialInterface = mesh_material_;
+    built->GetStaticMaterials().Add(slot);
+
+    UStaticMesh::FBuildMeshDescriptionsParams params;
+    // ⚠ Collision is built separately from the URDF's own <collision>, so this must NOT cook
+    // physics from the visual mesh — that is the R2 distinction the whole audit exists to keep.
+    params.bBuildSimpleCollision = false;
+    params.bFastBuild = true;
+
+    if (!built->BuildFromMeshDescriptions({ &desc }, params)) {
+        UE_LOG(LogUrdfBot, Warning, TEXT("BuildFromMeshDescriptions failed for '%s'"), *key);
+        return nullptr;
+    }
+
+    static_mesh_cache_.Add(key, built);
+    ++mesh_built_static_;
+
+    // ⚠ Report the BOUNDS. "Built successfully" and "visible" are different claims, and a mesh with
+    // empty bounds is culled before it is ever drawn — indistinguishable from a material problem
+    // without this line.
+    const FBoxSphereBounds b = built->GetBounds();
+    UE_LOG(LogUrdfBot, Log,
+           TEXT("built static mesh '%s': %d tris, bounds extent (%.2f %.2f %.2f) radius %.2f, "
+                "sections %d"),
+           *key, tri_count, b.BoxExtent.X, b.BoxExtent.Y, b.BoxExtent.Z, b.SphereRadius,
+           built->GetNumSections(0));
+    return built;
+}
+
+bool AUrdfBotPawn::attachBuiltStaticMesh(USceneComponent* link_component,
+                                         const urdf::Geometry& g, const urdf::Origin& origin,
+                                         const urdf::Material& material, const FName& name,
+                                         bool collidable)
+{
+    // Resolved and cached exactly as the procedural path does — same directory, same search paths,
+    // same per-FILE cache, so the two paths never disagree about which file a link uses.
+    const std::string resolved =
+        urdf::resolveMeshPath(g.mesh_filename, urdf_dir_, mesh_search_paths_);
+    if (resolved.empty()) return false;
+
+    auto it = mesh_cache_.find(resolved);
+    if (it == mesh_cache_.end()) {
+        try {
+            it = mesh_cache_.emplace(resolved, urdf::loadMesh(resolved)).first;
+        }
+        catch (const std::exception&) {
+            return false;   // the procedural path reports this; do not duplicate the message
+        }
+    }
+    const urdf::MeshData& data = it->second;
+    if (data.vertices.size() < 3) return false;
+
+    const double sx = g.mesh_scale.x, sy = g.mesh_scale.y, sz = g.mesh_scale.z;
+    const FString key = FString::Printf(TEXT("%s|%f|%f|%f"), UTF8_TO_TCHAR(resolved.c_str()),
+                                        sx, sy, sz);
+    UStaticMesh* built = buildStaticMeshFromData(data, key, sx, sy, sz);
+    if (built == nullptr) return false;
+
+    UStaticMeshComponent* c = NewObject<UStaticMeshComponent>(this, name);
+    c->SetupAttachment(link_component);
+    c->SetMobility(EComponentMobility::Movable);
+
+    // Same pre-registration rule as everywhere else in this file: these are plain fields, not
+    // setters, and the scene proxy is built at registration.
+    c->SetCastShadow(mesh_cast_shadow_);
+    c->bCastInsetShadow = mesh_inset_shadow_;
+    c->bCastShadowAsTwoSided = mesh_two_sided_shadow_;
+    c->bCastContactShadow = mesh_contact_shadow_;
+
+    c->SetStaticMesh(built);
+    // Same fixed scale the other attach paths use — AirSim's world-to-metres is 100 and these are
+    // relative offsets only.
+    const float world_to_meters = 100.0f;
+    c->SetRelativeTransform(UrdfTransform::toFTransform(origin, world_to_meters));
+    c->SetCollisionEnabled(collidable ? ECollisionEnabled::QueryOnly
+                                      : ECollisionEnabled::NoCollision);
+    c->RegisterComponent();
+
+    // Same tint the procedural path applies — the material was measured to be correct, so this
+    // path must not diverge from it.
+    if (mesh_material_ != nullptr) {
+        if (UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this)) {
+            const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
+                                    static_cast<float>(material.b), static_cast<float>(material.a));
+            mid->SetVectorParameterValue(TEXT("Color"), tint);
+            mid->SetVectorParameterValue(TEXT("BaseColor"), tint);
+            mid->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
+            mid->SetScalarParameterValue(TEXT("Roughness"), 0.75f);
+            c->SetMaterial(0, mid);
+        }
+    }
+    return true;
+}
+
 bool AUrdfBotPawn::attachStaticMeshAsset(USceneComponent* link_component, const urdf::Geometry& g,
                                          const urdf::Origin& origin, const FName& name,
                                          bool collidable)
@@ -253,6 +454,25 @@ bool AUrdfBotPawn::attachStaticMeshAsset(USceneComponent* link_component, const 
     c->SetCastShadow(mesh_cast_shadow_);
     c->bCastInsetShadow = mesh_inset_shadow_;
     c->bCastShadowAsTwoSided = mesh_two_sided_shadow_;
+
+    // ⚠ SHADOW CACHE INVALIDATION — the last VSM-specific mechanism, and the one that fits the
+    // evidence. Measured on this robot: disabling VSM lifts the blackness, disabling shadow casting
+    // lifts it, but NEITHER r.Shadow.Virtual.NormalBias NOR ResolutionLodBias changes anything.
+    // Bias and resolution are both ways of sampling the shadow map better; their total ineffective-
+    // ness says the problem is not how we sample it but what is IN it.
+    //
+    // VSM caches shadow pages across frames and invalidates them from what the renderer can infer —
+    // World Position Offset and transform changes. A UProceduralMeshComponent whose geometry is
+    // built at runtime and whose transform is driven from physics every frame is exactly the case
+    // Epic documents Always for: "a primitive that is using some method of animating that is not
+    // known to the system" (SceneTypes.h). With stale pages the robot is shadowed by its own
+    // out-of-date depth, which no amount of biasing a lookup can fix.
+    //
+    // ⚠ Before RegisterComponent, like the flags above — see the note there. This is a plain
+    // UPROPERTY with no setter, so a value written after registration never reaches the proxy.
+    c->ShadowCacheInvalidationBehavior = mesh_shadow_invalidate_always_
+                                             ? EShadowCacheInvalidationBehavior::Always
+                                             : EShadowCacheInvalidationBehavior::Auto;
     c->bCastContactShadow = mesh_contact_shadow_;
 
     c->SetStaticMesh(asset);
@@ -496,6 +716,15 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     c->SetCastShadow(mesh_cast_shadow_);
     c->bCastInsetShadow = mesh_inset_shadow_;
     c->bCastShadowAsTwoSided = mesh_two_sided_shadow_;
+
+    // ⚠ The PROCEDURAL path needs this most — see the long note at the static-mesh site. A runtime-
+    // built mesh moved every frame is precisely the primitive VSM's Auto invalidation cannot reason
+    // about, and stale cached pages explain why neither NormalBias nor ResolutionLodBias moved the
+    // needle while disabling VSM entirely did.
+    c->ShadowCacheInvalidationBehavior = mesh_shadow_invalidate_always_
+                                             ? EShadowCacheInvalidationBehavior::Always
+                                             : EShadowCacheInvalidationBehavior::Auto;
+
     // ⚠ Screen-space contact shadows — the only remaining mechanism that is inherently
     // distance-dependent. ContactShadowLength is in SCREEN space unless the light sets
     // ContactShadowLengthInWS, so a nearer object gets a longer ray march and self-shadows harder
@@ -527,7 +756,8 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     // silently assigned NO material — which renders black. That is indistinguishable from every
     // other cause of a black robot, and it was never logged, so it survived two rounds of chasing
     // normals and tangents. A missing material must now announce itself.
-    if (mesh_material_ == nullptr) {
+    ensureMeshMaterial();
+    if (false) {
         // ⚠ Prefer the INSTANCE over the base material.
         //
         // BasicShapeMaterial is the base; BasicShapeMaterial_Inst is what the engine's own
@@ -565,6 +795,29 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
     if (mesh_material_ != nullptr) {
         UMaterialInstanceDynamic* mid = UMaterialInstanceDynamic::Create(mesh_material_, this);
         if (mid) {
+            // ⚠ ENUMERATE THE PARAMETERS ONCE. A MID silently ignores a parameter the material does
+            // not expose, so SetVectorParameterValue("Color", ...) on a material whose parameter is
+            // named something else is a no-op that looks exactly like a lighting or normals bug.
+            // Three fixes were proposed for the "shadowy robot" without anyone establishing that
+            // the tint reaches the shader at all. This settles it.
+            if (!logged_material_params_) {
+                logged_material_params_ = true;
+                TArray<FMaterialParameterInfo> infos;
+                TArray<FGuid> guids;
+
+                mid->GetAllVectorParameterInfo(infos, guids);
+                FString names;
+                for (const FMaterialParameterInfo& i : infos)
+                    names += (names.IsEmpty() ? TEXT("") : TEXT(", ")) + i.Name.ToString();
+                UE_LOG(LogUrdfBot, Log, TEXT("material VECTOR params: [%s]"), *names);
+
+                infos.Reset(); guids.Reset();
+                mid->GetAllScalarParameterInfo(infos, guids);
+                names.Empty();
+                for (const FMaterialParameterInfo& i : infos)
+                    names += (names.IsEmpty() ? TEXT("") : TEXT(", ")) + i.Name.ToString();
+                UE_LOG(LogUrdfBot, Log, TEXT("material SCALAR params: [%s]"), *names);
+            }
             const FLinearColor tint(static_cast<float>(material.r), static_cast<float>(material.g),
                                     static_cast<float>(material.b), static_cast<float>(material.a));
             // The parameter name differs between engine base materials, and a MID silently ignores
@@ -572,6 +825,43 @@ bool AUrdfBotPawn::attachMeshGeometry(USceneComponent* link_component, const urd
             // does not turn the robot grey again.
             mid->SetVectorParameterValue(TEXT("Color"), tint);
             mid->SetVectorParameterValue(TEXT("BaseColor"), tint);
+
+            // ⚠ SET THE SHADING PARAMETERS, do not inherit them. Only the colour was being
+            // overridden, so the robot took whatever Metallic/Roughness BasicShapeMaterial_Inst
+            // happens to carry — and a DARK base colour on a METALLIC surface renders very nearly
+            // black, lit only by specular highlights. That is the "shadowy robot" look: ExoMy
+            // authors 12 links at rgba 0.298 and 2 at 0.102, which should read as clear greys and
+            // instead read as black with shiny rims.
+            //
+            // A URDF <material> describes a diffuse colour and nothing else — there is no notion of
+            // metalness in the format — so treating it as a matte dielectric is the faithful
+            // reading, not a stylistic choice.
+            mid->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
+            mid->SetScalarParameterValue(TEXT("Roughness"), 0.75f);
+            mid->SetScalarParameterValue(TEXT("Specular"), 0.35f);
+
+            // ⚠ Read the value BACK. Setting a parameter always "succeeds"; only a read-back shows
+            // whether the material actually holds it.
+            if (!logged_material_readback_) {
+                logged_material_readback_ = true;
+                FLinearColor got_colour(ForceInit);
+                const bool has_colour = mid->GetVectorParameterValue(
+                    FMaterialParameterInfo(TEXT("Color")), got_colour);
+                FLinearColor got_base(ForceInit);
+                const bool has_base = mid->GetVectorParameterValue(
+                    FMaterialParameterInfo(TEXT("BaseColor")), got_base);
+                float got_metallic = -1.0f;
+                const bool has_metallic = mid->GetScalarParameterValue(
+                    FMaterialParameterInfo(TEXT("Metallic")), got_metallic);
+
+                UE_LOG(LogUrdfBot, Log,
+                       TEXT("tint requested (%.3f %.3f %.3f)  ->  Color exists=%d (%.3f %.3f %.3f)  "
+                            "BaseColor exists=%d (%.3f %.3f %.3f)  Metallic exists=%d (%.2f)"),
+                       tint.R, tint.G, tint.B,
+                       has_colour ? 1 : 0, got_colour.R, got_colour.G, got_colour.B,
+                       has_base ? 1 : 0, got_base.R, got_base.G, got_base.B,
+                       has_metallic ? 1 : 0, got_metallic);
+            }
 
             // ⚠ Forced matte, and this is why the rover went black only when the camera got CLOSE.
             //
@@ -672,6 +962,16 @@ USceneComponent* AUrdfBotPawn::createLinkComponent(const urdf::Link& link, int i
             // UStaticMeshComponent takes, which renders correctly under Virtual Shadow Maps where
             // the procedural path does not.
             if (attachStaticMeshAsset(c, v.geometry, v.origin, vis_name, visual_collision_)) {
+                ++drawn;
+                continue;
+            }
+            // ⚠ Then a UStaticMesh BUILT AT RUNTIME from the same mesh data, before falling back to
+            // the procedural path. This is the fix for the shading: a real UStaticMeshComponent
+            // gets engine-built bounds, tangents and shadow-cache behaviour, where every VSM knob
+            // applied to UProceduralMeshComponent was measured to do nothing.
+            if (mesh_runtime_static_ &&
+                attachBuiltStaticMesh(c, v.geometry, v.origin, v.material, vis_name,
+                                      visual_collision_)) {
                 ++drawn;
                 continue;
             }

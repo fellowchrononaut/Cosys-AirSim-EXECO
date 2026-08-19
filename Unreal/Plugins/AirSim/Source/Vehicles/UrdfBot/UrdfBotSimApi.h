@@ -177,6 +177,21 @@ private:
     /// §6.0c; the robot is now placed into the shared frame via BackendOptions::root_position.
     std::shared_ptr<const urdf::StaticWorld> static_world_;
 
+    /// Ground sampling, for backends that cannot mirror the level's ground (MuJoCo).
+    bool sampleGroundHeightField(const urdf::Vec3& centre, double half_extent,
+                                 urdf::BackendOptions::HeightField& out);
+    void refreshGroundHeightField();
+
+    /// Step the backend before play so the robot starts at rest, then publish those
+    /// poses to the renderer. Called at load AND after every reset — reset rebuilds
+    /// the world at the spawn pose, so a load-only settle is silently discarded.
+    void settleAndPublish();
+
+    /// Where the current height patch is centred, so the robot driving out of it can be detected.
+    urdf::Vec3 height_field_centre_;
+    double height_field_half_extent_ = 0;
+    bool has_height_field_ = false;
+
     bool built_ = false;
     int64_t steps_taken_ = 0;
 };

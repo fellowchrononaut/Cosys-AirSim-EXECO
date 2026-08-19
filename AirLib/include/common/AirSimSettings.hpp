@@ -494,6 +494,62 @@ namespace airlib
             /// explicit here: true for an arm on a bench, false for anything that drives.
             bool urdf_fixed_base = false;
 
+            /// Half-extent of the box around the robot within which level triangles become
+            /// collision geometry, and the hard ceiling on how many. Backends that mirror the level
+            /// concavely (Box3D) ignore both.
+            /// Build real UStaticMeshes at runtime for <visual><mesh> links instead of using
+            /// UProceduralMeshComponent.
+            ///
+            /// ⚠ DEFAULTS FALSE — the procedural path is still the shipping one. The static path
+            /// exists because every Virtual Shadow Map remedy was measured INERT against procedural
+            /// meshes (NormalBias, ResolutionLodBias, two-sided casting, inset shadows,
+            /// ShadowCacheInvalidationBehavior::Always), while only disabling VSM or disabling
+            /// shadow casting lifts the darkness — and both of those are losses, not fixes.
+            ///
+            /// Keep the choice available either way: the procedural path is proven and fast to
+            /// build, the static path goes through the engine's own mesh build and gets correct
+            /// bounds, tangents and shadow-cache behaviour for free.
+            bool urdf_mesh_runtime_static = false;
+
+            /// Dump each engine's collision geometry to Wavefront OBJ at load, for comparison.
+            ///
+            /// ⚠ Writes what the SOLVER has, not what we think we gave it — MuJoCo's after
+            /// convexification and decomposition, Box3D's real triangles. Those two diverged badly
+            /// and invisibly for hours; a mesh viewer settles in seconds what argument does not.
+            /// Files land beside the log as <vehicle>_mujoco_collision.obj / _box3d_collision.obj.
+            bool urdf_dump_collision_obj = false;
+
+            /// "split" (default), "whole" or "auto" - how mirrored level meshes become collision
+            /// geometry.
+            ///
+            /// ⚠ Split by default because it is CORRECT for any geometry; the others are faster
+            /// and can be wrong. "whole" suits a map of convex props; "auto" tries to tell props
+            /// from enclosures by winding and is not yet trusted. See BackendOptions::StaticMeshMode.
+            std::string urdf_static_mesh_mode = "split";
+
+            double urdf_static_world_radius = 30.0;
+            int urdf_static_world_max_triangles = 20000;
+
+            /// Half-extent, in metres, of the ground height grid sampled around the robot.
+            ///
+            /// ⚠ Only used by backends that cannot mirror the level's ground directly (MuJoCo).
+            /// Larger covers more driving before the patch runs out; the trace count is fixed, so
+            /// larger also means coarser. 40 m over a 33x33 grid is a 2.5 m sample spacing.
+            double urdf_ground_sample_extent = 40.0;
+
+            /// Seconds of simulation to run at LOAD, before play begins, so the robot starts
+            /// resting instead of falling.
+            ///
+            /// ⚠ A urdfbot spawns wherever the settings put it — ExoMy at Z=-2 is 1.6 m above a
+            /// floor at 0.36 — and then free-falls once the clock starts. The visible result is a
+            /// robot that hangs for a moment, swings its unloaded joints, and drops. That is not a
+            /// physics fault, it is initial conditions, and settling here fixes it at the source
+            /// rather than by moving the spawn (which is the operator's choice to make).
+            ///
+            /// Cheap: 0.5 s at a 3 ms step is ~167 iterations. 0 disables it, which is what you
+            /// want if the drop itself is the thing under test.
+            double urdf_settle_seconds = 0.5;
+
             /// Break a concave <collision><mesh> into several convex parts instead of collapsing
             /// it to one hull.
             ///
@@ -513,6 +569,16 @@ namespace airlib
             /// Hard ceiling on parts per mesh. A safety net against an unlucky mesh, not a knob to
             /// tune. -1 = unlimited.
             int urdf_convex_decomposition_max_hulls = 32;
+
+            /// Delete every cached decomposition for this robot before loading, forcing a
+            /// re-cook.
+            ///
+            /// ⚠ Leave this OFF. The cache is content-addressed — mesh bytes plus the options —
+            /// so a changed mesh or threshold is already a different entry and stale results
+            /// cannot be served. Flushing is for recovering from a corrupted cache or reclaiming
+            /// disk, not for picking up changes. Left on, it re-cooks on EVERY load: 312 s for
+            /// ExoMy, every time.
+            bool urdf_convex_decomposition_flush_cache = false;
 
             /// Where decomposition results are cached between runs.
             ///
@@ -1470,6 +1536,22 @@ namespace airlib
                     settings_json.getInt("UrdfConvexDecompositionMaxHulls", 32);
                 vehicle_setting->urdf_convex_decomposition_cache_dir =
                     settings_json.getString("UrdfConvexDecompositionCacheDir", "");
+                vehicle_setting->urdf_convex_decomposition_flush_cache =
+                    settings_json.getBool("UrdfConvexDecompositionFlushCache", false);
+                vehicle_setting->urdf_settle_seconds =
+                    settings_json.getDouble("UrdfSettleSeconds", 0.5);
+                vehicle_setting->urdf_ground_sample_extent =
+                    settings_json.getDouble("UrdfGroundSampleExtent", 40.0);
+                vehicle_setting->urdf_static_world_radius =
+                    settings_json.getDouble("UrdfStaticWorldRadius", 30.0);
+                vehicle_setting->urdf_static_mesh_mode =
+                    settings_json.getString("UrdfStaticMeshMode", "split");
+                vehicle_setting->urdf_dump_collision_obj =
+                    settings_json.getBool("UrdfDumpCollisionObj", false);
+                vehicle_setting->urdf_mesh_runtime_static =
+                    settings_json.getBool("UrdfMeshRuntimeStatic", false);
+                vehicle_setting->urdf_static_world_max_triangles =
+                    settings_json.getInt("UrdfStaticWorldMaxTriangles", 20000);
 
                 if (vehicle_setting->urdf_file.empty())
                     throw std::invalid_argument(

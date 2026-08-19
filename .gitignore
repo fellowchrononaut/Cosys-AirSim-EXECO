@@ -341,6 +341,12 @@ cmake_build/
 # Out-of-tree third-party build (build_thirdparty.sh). Separate from build_release because it
 # uses Unreal's toolchain rather than the host's - see cmake/cmake-modules/UnrealToolchain.cmake.
 /build_thirdparty
+# Cooked convex decompositions. Content-addressed binary blobs regenerated on demand -
+# they belong WITH a copied plugin (that is why they live under the plugin) but not in
+# git: ExoMy alone is 235 parts across 16 files, and they are reproducible from the meshes.
+Plugins/AirSim/Saved/ConvexCache/
+Unreal/Plugins/AirSim/Saved/ConvexCache/
+**/.convex_cache/
 /build_mujoco
 # MuJoCo's FetchContent cache. ⚠ These are GIT CLONES of qhull, ccd, lodepng, miniz,
 # tinyobjloader and tinyxml2 - `git add` on cmake/ will otherwise embed six repositories.

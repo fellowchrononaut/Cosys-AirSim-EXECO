@@ -113,6 +113,14 @@ struct KinematicBody {
 /// the cooked-geometry cache is keyed on: two robots handed the same pointer share one cook, and
 /// two robots handed equal-but-distinct worlds do not. Sharing the pointer is therefore not an
 /// optimisation detail, it is how the saving is claimed.
+/// Write a StaticWorld to a Wavefront OBJ — the geometry Box3D cooks, in world coordinates.
+///
+/// ⚠ Exists to be diffed against MuJoCo's compiled geoms. Box3D takes these triangles exactly;
+/// MuJoCo can only take convex shapes, so the two differ by whatever approximation the MuJoCo path
+/// applied. Looking at them side by side is the only way to judge that approximation rather than
+/// argue about it.
+bool writeStaticWorldObj(const struct StaticWorld& world, const std::string& path);
+
 struct StaticWorld {
     std::vector<StaticBody> bodies;
 

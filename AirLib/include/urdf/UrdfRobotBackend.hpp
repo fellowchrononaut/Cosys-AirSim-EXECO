@@ -119,6 +119,91 @@ struct BackendOptions {
     bool add_ground_plane = false;
     double ground_plane_z = 0.0;
 
+    /// A sampled height grid of the ground around the robot, supplied by the host because only it
+    /// can query the level's real geometry.
+    ///
+    /// ⚠ THIS IS WHAT MAKES A NON-FLAT MAP WORK. An infinite plane at one traced height is correct
+    /// for Blocks and wrong for everything else: on terrain the robot walks on an invisible flat
+    /// floor, and in a multi-storey building the plane cuts through every floor. A height grid is
+    /// exact for slopes, steps and hills, and MuJoCo has a native primitive for it (mjGEOM_HFIELD)
+    /// that needs no decomposition at all.
+    ///
+    /// Sampled by downward line traces, so it reflects whatever Unreal actually has — landscape,
+    /// static meshes, BSP — without any of it being mirrored or approximated as convex.
+    struct HeightField {
+        int rows = 0;                 ///< samples along y
+        int cols = 0;                 ///< samples along x
+        double center_x = 0;          ///< world centre of the patch
+        double center_y = 0;
+        double half_extent = 0;       ///< metres from centre to edge, in x and y
+        double min_z = 0;             ///< elevation floor; `heights` are metres ABOVE this
+        std::vector<float> heights;   ///< rows*cols, row-major, metres above min_z
+
+        bool valid() const { return rows > 1 && cols > 1 &&
+                                    heights.size() == static_cast<size_t>(rows) * cols; }
+    };
+    HeightField ground_height_field;
+
+    /// Half-extent, in metres, of the box around the robot's spawn that mirrored STATIC geometry
+    /// is clipped to. 0 disables clipping and takes the level whole.
+    ///
+    /// ⚠ Needed because a level's ground is often ONE enormous mesh — Blocks' is 40 km across with
+    /// a bounding box 442 m tall, while the surface a robot stands on is at z = 0.36. Nothing
+    /// derived from that bounding box locates the surface, and handing the whole mesh to a convex
+    /// engine wrecks its broadphase. Taking only the nearby triangles avoids both without
+    /// approximating anything.
+    ///
+    /// ⚠ A robot that drives beyond this radius leaves its mirrored world behind. Currently
+    /// clipped once, at load, around the spawn.
+    /// Called during buildFromUrdf as work proceeds, so a host can draw a progress bar.
+    ///
+    /// ⚠ SEPARATE FROM DecompositionOptions::progress, which only ever covered the robot's own
+    /// mesh decomposition. Building the static world is the OTHER long job — an enclosed map
+    /// emitted 52,074 collision prisms with no reporting whatsoever, and since that robot had no
+    /// mesh collisions the decomposition dialog never appeared either. Minutes of a frozen editor
+    /// with nothing on screen.
+    ///
+    /// `stage` names what is happening; `done`/`total` are counts within that stage.
+    std::function<void(const std::string& stage, int done, int total)> build_progress;
+
+    /// How mirrored level meshes become collision geometry.
+    ///
+    /// ⚠ AUTOMATIC CLASSIFICATION IS THE HARD PART, and it is where every heuristic in this file
+    /// has failed at least once. UnrealRoboticsLab sidesteps it entirely: a human ticks
+    /// "ComplexMeshRequired" per actor in the editor and nothing is physical unless marked. AirSim's
+    /// premise is the opposite — any level should just work — so classification is automatic here,
+    /// and this override exists for when the guess is wrong.
+    enum class StaticMeshMode {
+        Auto,    ///< convex + outward-facing => whole; otherwise split per triangle
+        Whole,   ///< always one geom (fast, wrong for enclosures)
+        Split    ///< always per triangle (exact, expensive)
+    };
+    /// ⚠ DEFAULTS TO Split — CORRECTNESS FIRST, SPEED BY OPT-IN.
+    ///
+    /// Auto is tempting and is not trustworthy yet. Classifying level geometry automatically has
+    /// failed four separate ways in one day — an oversize test that never fired, a plane fitted to
+    /// a bounding box 218 m off, a convexity test that declared an enclosure convex, and a signed-
+    /// volume test that is still unvalidated because every fixture written to check it was wrong.
+    /// Each failure put a robot in a world that was not the level.
+    ///
+    /// Split is correct regardless of winding, convexity or authorial intent: real triangles, thin
+    /// convex prisms, exact surface. Its cost is bounded by static_world_radius and
+    /// static_world_max_triangles, both of which are visible and tunable. Whole is a genuine
+    /// speedup where a map is known to be convex props, and it is available by asking.
+    StaticMeshMode static_mesh_mode = StaticMeshMode::Split;
+
+    double static_world_radius = 30.0;
+
+    /// Hard ceiling on level triangles emitted as collision prisms. Beyond it the rest are dropped
+    /// and the caller is told, loudly.
+    ///
+    /// ⚠ EXACTNESS IS PAID FOR IN GEOMS, and the bill is unbounded without this. An enclosed map
+    /// mirrored 52,074 triangles inside the region radius; emitting all of them drove the editor to
+    /// 6.7 GB resident and minutes of load, and would have left MuJoCo stepping 52k geoms forever.
+    /// A cap turns "the simulator hangs" into "some distant geometry is missing, and here is the
+    /// number", which is a far better failure.
+    int static_world_max_triangles = 20000;
+
     /// Convex decomposition of <mesh> collision, shared by both backends. Defaults are in
     /// UrdfConvexDecomposition.hpp; `enabled` with no CoACD in the build is harmless and simply
     /// yields one part, i.e. the behaviour that existed before.
@@ -164,6 +249,36 @@ public:
     /// A new backend must therefore answer this question rather than inherit an answer, because
     /// the wrong answer is silent and the failure is a robot falling out of the map.
     virtual bool mirrorsStaticWorld() const = 0;
+
+    /// Whether addKinematicBody actually produces a body this engine will push the robot with.
+    ///
+    /// ⚠ SEPARATE FROM mirrorsStaticWorld, because the two are implemented independently and
+    /// conflating them produces confident nonsense in the log. MuJoCo mirrors the static level but
+    /// not yet the moving bodies; with one shared flag, turning static mirroring on would also
+    /// re-enable kinematic registration, whose addKinematicBody returns -1 — and the log would once
+    /// again announce "+6 bodies ... now solid to this one" about handles that do nothing.
+    ///
+    /// Static geometry is a level; kinematic bodies are other vehicles. A backend can honestly do
+    /// one and not the other.
+    virtual bool mirrorsKinematicBodies() const = 0;
+
+    /// Whether this backend still needs the scaffolding ground plane even when the level mirrored.
+    ///
+    /// ⚠ TRUE FOR MUJOCO, AND THE REASON IS AN ENGINE PROPERTY, NOT A GAP. Box3D has a static
+    /// CONCAVE triangle-mesh collider (b3CreateMesh), so it cooks a level's ground exactly and a
+    /// scaffolding plane would be a redundant second floor. MuJoCo convexifies EVERY mesh geom, so
+    /// a level's ground — typically one enormous mesh; Blocks' is 40 km across with a bounding box
+    /// 442 m tall around a surface at z = 0.36 — cannot be represented faithfully at all.
+    ///
+    /// Approximating it was tried three ways and all three were wrong: a plane at the bounding
+    /// box's top face (218 m too high), the same after clipping and convex decomposition (metres
+    /// low, because the decomposition of a clipped concave patch bulges), and a thin-slab test that
+    /// never fired. All of them were deriving a number we can simply MEASURE: Unreal's downward
+    /// trace already reports the floor exactly, and mjGEOM_PLANE represents it exactly.
+    ///
+    /// So: give MuJoCo the traced plane, and let it skip the ground mesh entirely. No decomposition
+    /// is involved in standing on the floor.
+    virtual bool needsScaffoldingGroundPlane() const = 0;
 
     /// Register a body whose pose is driven from outside the solver, and return a handle for
     /// `setKinematicPose`. May be called before or after `buildFromUrdf`.

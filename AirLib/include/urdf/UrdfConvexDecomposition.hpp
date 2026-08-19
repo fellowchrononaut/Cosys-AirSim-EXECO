@@ -23,6 +23,7 @@
 #include "urdf/UrdfModel.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -51,9 +52,33 @@ struct DecompositionOptions {
     /// can produce hundreds of parts, and no link needs hundreds. -1 means unlimited.
     int max_hulls = 32;
 
+    /// Vertices per convex part, asked of the decomposer directly.
+    ///
+    /// ⚠ 64, NOT CoACD's default of 256, and this one is a CRASH FIX rather than a tuning choice.
+    /// Box3D's hull builder has a hard ceiling of 255 HALF-EDGES, and a 256-vertex cloud sails past
+    /// it: measured on ExoMy, parts arrived at 266-342 half-edges. Box3D usually refuses such a
+    /// hull by returning null, but on some of them it segfaults inside b3NewellPlane instead — it
+    /// took the editor down on 2026-08-19.
+    ///
+    /// Capping here rather than thinning the cloud afterwards is the right place: the decomposer
+    /// chooses which vertices to keep with the shape in view, whereas a post-hoc decimation would
+    /// be throwing away points it does not understand. Box3D's own budget walk still runs after
+    /// this as a second line of defence.
+    int max_part_vertices = 64;
+
     /// Off => one part, i.e. today's behaviour. Exposed so a robot can opt out per vehicle without
     /// rebuilding, and so a bad decomposition can be ruled out when diagnosing contact problems.
     bool enabled = true;
+
+    /// Called once per mesh, BEFORE the work starts, with a short description.
+    ///
+    /// ⚠ The whole point is that this happens while the caller is blocked. Decomposition runs
+    /// synchronously on whichever thread builds the robot — the game thread, in Unreal — so a cold
+    /// cook freezes the editor with no window, no cursor and no clue. Measured on ExoMy: 312 s.
+    /// A caller that can draw progress supplies this; AirLib itself cannot, and must not, know how.
+    ///
+    /// Not part of the cache key, obviously — it does not change the geometry.
+    std::function<void(const std::string& what)> progress;
 
     /// ⚠ WITHOUT A CACHE THIS FEATURE IS NOT USABLE, and that is a measurement, not a caution.
     /// The Go2 hip takes 20-30 s and a mirrored Blocks level is 172 meshes; a cold cook of the
@@ -79,6 +104,22 @@ struct DecompositionResult {
     /// to one hull is exactly the kind of quiet fidelity loss the R2 audit exists to prevent.
     std::string note;
 };
+
+/// Does this point cloud span three dimensions well enough to be hulled?
+///
+/// ⚠ SHARED BECAUSE BOTH ENGINES BREAK ON THE SAME INPUT, in different ways. Box3D's b3CreateHull
+/// SEGFAULTS on a cloud with no volume (it took the editor down on 2026-08-19); MuJoCo's compiler
+/// refuses one — "mesh has colocated vertices, cannot compute convex hull" (user_mesh.cc:1760) —
+/// which fails the entire model, not just that shape. A crash and a failed load are different
+/// symptoms of one cause, so the check lives here rather than in either backend.
+///
+/// Convex decomposition is what makes this matter: one hull per mesh meant one big well-conditioned
+/// cloud, while N parts per mesh means the decomposer's thin slivers reach the hull builders too.
+///
+/// The test is the one a hull builder needs — can four points be found spanning three dimensions?
+/// Walked as extent, then area, then thickness, taking the most extreme point at each step, so a
+/// genuinely thin-but-valid slab passes while a flat sheet does not.
+bool hasHullableVolume(const std::vector<Vec3>& points, double eps = 1.0e-4);
 
 /// Decompose an INDEXED mesh. Three indices per triangle.
 DecompositionResult decomposeConvex(const std::vector<Vec3>& vertices,

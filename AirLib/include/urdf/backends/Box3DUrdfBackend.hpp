@@ -17,6 +17,10 @@ public:
 
     void setStaticWorld(std::shared_ptr<const StaticWorld> world) override;
     bool mirrorsStaticWorld() const override { return true; }
+    bool mirrorsKinematicBodies() const override { return true; }
+    /// False: b3CreateMesh cooks the level's real triangles, so a plane would be a
+    /// redundant second floor sitting through the map.
+    bool needsScaffoldingGroundPlane() const override { return false; }
     int addKinematicBody(const KinematicBody& body) override;
     void setKinematicPose(int handle, const Vec3& position, const Quat& orientation) override;
     void buildFromUrdf(const Robot& model, const BackendOptions& opts) override;

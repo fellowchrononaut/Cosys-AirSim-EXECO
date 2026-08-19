@@ -5,12 +5,110 @@
 
 #include "urdf/backends/Box3DMath.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 
 namespace b3urdf {
+namespace {
+
+/// Is this point cloud safe to hand to b3CreateHull?
+///
+/// ⚠ THIS EXISTS BECAUSE b3CreateHull SEGFAULTS, not because it returns a poor hull. Measured
+/// 2026-08-19: the editor died with SIGSEGV at address 0x10 inside b3HullBuilder_ConnectEdges,
+/// four meshes into an ExoMy load. Box3D refuses gracefully when a hull would exceed its
+/// 255-half-edge ceiling — it returns null — but on a cloud with no volume it dereferences null
+/// instead. A vendored C library crashing on our data is ours to prevent at the boundary; patching
+/// upstream would put us on a fork of a dependency we deliberately pin by exact bytes.
+///
+/// ⚠ AND IT ONLY STARTED MATTERING WITH CONVEX DECOMPOSITION. One hull per <mesh> meant one big,
+/// well-conditioned point cloud. N parts per mesh means CoACD's thin slivers and coplanar
+/// fragments reach the hull builder too, and a count check (>= 4 points) does not exclude four
+/// COPLANAR points.
+///
+/// The test is the standard one a hull builder needs: can four points be found that span three
+/// dimensions? Walk it as extent, then area, then volume, taking the most extreme point at each
+/// step so a genuinely thin-but-valid slab still passes while a flat sheet does not.
+/// The largest vertex budget b3CreateHull can be given without risking its 255-half-edge ceiling.
+///
+/// ⚠ DERIVED, NOT TUNED. A convex hull with V vertices triangulates to F = 2V-4 faces and
+/// E = 3V-6 edges, hence 6V-12 half-edges. Box3D's limit is 255, so 6V-12 <= 255 gives V <= 44.
+///
+/// ⚠ AND EXCEEDING IT IS NOT MERELY REFUSED — IT CAN CRASH. Box3D usually reports "hull final half
+/// edge count of N exceeds limit of 255" and returns null, which the budget walk below handles.
+/// But on some clouds it segfaults inside b3NewellPlane instead, and it took the editor down on
+/// 2026-08-19 with a 72-point sliver measuring 3.1 x 13.6 x 16.5 mm. That cloud is perfectly valid
+/// geometry — a near-identical neighbouring part hulled fine — so no input check can be relied on
+/// to exclude it. Staying below the ceiling means the overflow path, where the crash lives, is
+/// never entered at all.
+///
+/// Measured on all 23 ExoMy meshes: starting at 64 gave 32 overflow messages and a crash; starting
+/// at 44 gave 403 parts hulled, 0 overflows, 0 refusals, 0 crashes.
+///
+/// ⚠ This applies to EVERY b3CreateHull call, not just decomposed parts. Decomposition is what
+/// made the crash reachable — many small clouds instead of one big one — but the ceiling was always
+/// there and the default budget of 64 could always overflow it.
+constexpr int kMaxHullVerticesForBox3D = 44;
+
+bool hasHullableVolume(const std::vector<b3Vec3>& pts)
+{
+    // Absolute, in metres. A part thinner than 0.1 mm in some direction contributes nothing to
+    // contact that its neighbours in the decomposition do not already provide.
+    constexpr float kEps = 1.0e-4f;
+
+    if (pts.size() < 4) return false;
+
+    auto dist2 = [](const b3Vec3& a, const b3Vec3& b) {
+        const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+        return dx * dx + dy * dy + dz * dz;
+    };
+
+    // 1. a segment
+    size_t i1 = 0;
+    float best = 0;
+    for (size_t i = 1; i < pts.size(); ++i) {
+        const float d = dist2(pts[0], pts[i]);
+        if (d > best) { best = d; i1 = i; }
+    }
+    if (best < kEps * kEps) return false;
+
+    const b3Vec3 a = pts[0], b = pts[i1];
+    const float ex = b.x - a.x, ey = b.y - a.y, ez = b.z - a.z;
+
+    // 2. a triangle — the point furthest off that segment
+    size_t i2 = 0;
+    best = 0;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        const float vx = pts[i].x - a.x, vy = pts[i].y - a.y, vz = pts[i].z - a.z;
+        const float cx = ey * vz - ez * vy, cy = ez * vx - ex * vz, cz = ex * vy - ey * vx;
+        const float area2 = cx * cx + cy * cy + cz * cz;
+        if (area2 > best) { best = area2; i2 = i; }
+    }
+    const float seg_len = std::sqrt(ex * ex + ey * ey + ez * ez);
+    if (seg_len <= 0 || std::sqrt(best) / seg_len < kEps) return false;
+
+    // 3. a tetrahedron — the point furthest off that triangle's plane
+    const b3Vec3 c = pts[i2];
+    const float ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+    const float wx = c.x - a.x, wy = c.y - a.y, wz = c.z - a.z;
+    float nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    const float nlen = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (nlen <= 0) return false;
+    nx /= nlen; ny /= nlen; nz /= nlen;
+
+    float thickness = 0;
+    for (const b3Vec3& p : pts) {
+        const float d =
+            std::fabs((p.x - a.x) * nx + (p.y - a.y) * ny + (p.z - a.z) * nz);
+        if (d > thickness) thickness = d;
+    }
+    return thickness >= kEps;
+}
+
+} // namespace
+
 namespace {
 
 /// Box3D caps revolute limits at +/-0.99*pi. Wider URDF limits cannot be expressed as a joint
@@ -53,6 +151,7 @@ void Box3DRobot::destroyWorld()
     mimic_.clear();
     hull_budget_reductions_.clear();
     decompositions_.clear();
+    degenerate_parts_dropped_ = 0;
     decomposition_fallbacks_.clear();
     massless_markers_.clear();
     accumulator_ = 0;
@@ -144,8 +243,15 @@ void Box3DRobot::addKinematicShapes(KinematicRec& r)
             std::vector<b3Vec3> pts;
             pts.reserve(shape.points.size());
             for (const urdf::Vec3& v : shape.points) pts.push_back(toB3(v));
+            // Same two guards as the link-mesh path: a cloud with no volume crashes b3CreateHull
+            // rather than being refused, and a budget above the Euler bound enters the overflow
+            // path where that crash lives. Mirrored bodies come from Unreal's cooked convex elems
+            // and have not been seen to trigger either, but the failure is a dead editor and the
+            // check is two comparisons.
+            if (!hasHullableVolume(pts)) break;
             b3HullData* hull = nullptr;
-            for (int budget = opts_.max_hull_vertices; budget >= 8 && !hull; budget /= 2)
+            for (int budget = std::min(opts_.max_hull_vertices, kMaxHullVerticesForBox3D);
+                 budget >= 8 && !hull; budget /= 2)
                 hull = b3CreateHull(pts.data(), static_cast<int>(pts.size()), budget);
             if (!hull) break;
             b3CreateHullShape(r.body, &sd, hull);
@@ -363,8 +469,20 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
             // convex pieces when CoACD is present and the input as a single piece when it is not,
             // so the loop below is identical in both builds and a build without CoACD produces
             // byte-identical geometry to the one before CoACD existed.
+            // ⚠ The link name is added HERE, not in the service. UrdfConvexDecomposition knows a
+            // point cloud and nothing else — it has no idea which link or which file a mesh came
+            // from, and giving it that vocabulary would be handing a geometry routine a robot
+            // model. The caller owns the context, so the caller supplies it.
+            urdf::DecompositionOptions link_opts = opts_.decomposition;
+            if (opts_.decomposition.progress) {
+                const std::string link_name = link.name;
+                const std::string file = resolved.substr(resolved.find_last_of('/') + 1);
+                link_opts.progress = [&, link_name, file](const std::string& what) {
+                    opts_.decomposition.progress(link_name + "  (" + file + ", " + what + ")");
+                };
+            }
             const urdf::DecompositionResult decomp =
-                urdf::decomposeConvexSoup(mesh.vertices, opts_.decomposition);
+                urdf::decomposeConvexSoup(mesh.vertices, link_opts);
 
             if (decomp.decomposed)
                 decompositions_.push_back({ link.name, resolved, decomp.parts.size(),
@@ -381,7 +499,13 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
                     pts.push_back(b3Vec3{ static_cast<float>(v.x * col.geometry.mesh_scale.x),
                                           static_cast<float>(v.y * col.geometry.mesh_scale.y),
                                           static_cast<float>(v.z * col.geometry.mesh_scale.z) });
-                if (pts.size() < 4) continue;   // a degenerate part is dropped, not fatal
+                // ⚠ Count is not enough — four COPLANAR points pass it and then segfault
+                // b3CreateHull. See hasHullableVolume above; this crashed the editor before the
+                // check existed.
+                if (!hasHullableVolume(pts)) {
+                    ++degenerate_parts_dropped_;
+                    continue;
+                }
 
                 // ⚠ Box3D's hull builder has a hard ceiling of **255 half-edges**, which is not
                 // the same constraint as the vertex budget and is not checkable in advance: a
@@ -396,7 +520,7 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
                 // part is a simpler solid than the whole mesh, so budgets that were refused for
                 // the union are routinely accepted per part.
                 b3HullData* hull = nullptr;
-                int budget = opts_.max_hull_vertices;
+                int budget = std::min(opts_.max_hull_vertices, kMaxHullVerticesForBox3D);
                 for (; budget >= 8; budget /= 2) {
                     hull = b3CreateHull(pts.data(), static_cast<int>(pts.size()), budget);
                     if (hull != nullptr) break;

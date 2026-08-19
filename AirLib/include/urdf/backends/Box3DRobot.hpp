@@ -257,6 +257,14 @@ public:
     };
 
     const std::vector<MeshDecomposition>& decompositions() const { return decompositions_; }
+
+    /// Convex parts discarded because they had no volume to hull.
+    ///
+    /// ⚠ Non-zero is NORMAL and not a fault: CoACD emits thin slivers among its parts. It is
+    /// reported because it is also the number that would have crashed the editor — b3CreateHull
+    /// segfaults on a degenerate cloud rather than refusing it (see hasHullableVolume in
+    /// Box3DRobot.cpp). A sudden jump here means the decomposition threshold is producing junk.
+    size_t degenerateParts() const { return degenerate_parts_dropped_; }
     const std::vector<MeshDecompositionFallback>& decompositionFallbacks() const
     {
         return decomposition_fallbacks_;
@@ -374,6 +382,7 @@ private:
     std::vector<urdf::MimicClassification> mimic_;
     std::vector<HullBudgetReduction> hull_budget_reductions_;
     std::vector<MeshDecomposition> decompositions_;
+    size_t degenerate_parts_dropped_ = 0;
     std::vector<MeshDecompositionFallback> decomposition_fallbacks_;
     std::vector<std::string> massless_markers_;
     std::vector<JointControl> control_;
