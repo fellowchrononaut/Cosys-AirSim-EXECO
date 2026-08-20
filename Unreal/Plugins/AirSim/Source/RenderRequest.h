@@ -85,10 +85,27 @@ private:
     void executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& readback_stamps);
     void warnUnsupportedFormatOnce(unsigned int index, EPixelFormat format);
 
-    // Batched-readback scratch, valid only inside executeBatchedGpuReadback.
+    // B3. The batched path split in two so the drain can happen in a LATER frame than the submit.
+    // Mode 1 calls them back to back; mode 2 puts a frame boundary between them.
+    void submitGpuReadbacks();
+    bool drainGpuReadbacks(TArray<msr::airlib::TTimePoint>& readback_stamps, bool force_blocking);
+
+    // Post-readback tail: stamps, diagnostics, and the signal that releases getScreenshot.
+    void finishTask(const TArray<msr::airlib::TTimePoint>& readback_stamps);
+
+    // B3. Render-thread-only registry of batches waiting on their GPU fence.
+    static void drainPendingDeferredReadbacks();
+    static void ensureDeferredDrainHook();
+
+    // Batched-readback scratch. Under mode 2 these OUTLIVE the submitting call and stay valid
+    // until the deferred drain consumes them, so nothing here may be reset by the submit path.
     TArray<TUniquePtr<class FRHIGPUTextureReadback>> readbacks_;
     TArray<bool> enqueued_;
     TArray<EPixelFormat> formats_;
+
+    // B3. Deferred-drain state. Only touched on the render thread.
+    TArray<msr::airlib::TTimePoint> deferred_stamps_;
+    int32 deferred_frames_waited_ = 0;
 
     std::shared_ptr<RenderParams>* params_;
     std::shared_ptr<RenderResult>* results_;

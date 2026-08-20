@@ -2,6 +2,7 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -27,6 +28,15 @@ def generate_launch_description():
         "batch_image_capture",
         default_value='True')
 
+    # ⚠ This was a HARDCODED 0.2 in the parameter dict below, not a launch argument, so
+    # `update_airsim_img_response_every_n_sec:=X` on the command line was silently ignored and
+    # every run polled at 5 Hz. That invalidated a whole FPS-vs-request-rate sweep on 2026-08-21
+    # before the flat `got Hz` column gave it away. Rate is the main knob an integrator has for
+    # trading image throughput against sim frame rate; it has to be settable.
+    update_airsim_img_response_every_n_sec = DeclareLaunchArgument(
+        "update_airsim_img_response_every_n_sec",
+        default_value='0.2')
+
     is_vulkan = DeclareLaunchArgument(
         "is_vulkan",
         default_value='True')
@@ -50,7 +60,8 @@ def generate_launch_description():
             output=LaunchConfiguration('output'),
             parameters=[{
                 'is_vulkan': LaunchConfiguration('is_vulkan'),
-                'update_airsim_img_response_every_n_sec': 0.2,
+                'update_airsim_img_response_every_n_sec': ParameterValue(
+                    LaunchConfiguration('update_airsim_img_response_every_n_sec'), value_type=float),
                 'update_airsim_control_every_n_sec': 0.01,
                 'update_lidar_every_n_sec': 0.01,
                 'update_gpulidar_every_n_sec': 0.01,
@@ -67,6 +78,7 @@ def generate_launch_description():
     ld.add_action(output)
     ld.add_action(publish_clock)
     ld.add_action(batch_image_capture)
+    ld.add_action(update_airsim_img_response_every_n_sec)
     ld.add_action(is_vulkan)
     ld.add_action(host_ip)
     ld.add_action(enable_api_control)

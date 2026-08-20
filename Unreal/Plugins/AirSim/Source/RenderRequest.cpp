@@ -8,6 +8,7 @@
 #include "Async/Async.h"
 #include "HAL/IConsoleManager.h"
 #include "RHIGPUReadback.h"
+#include "Misc/CoreDelegates.h"
 #include "Async/ParallelFor.h"
 #include "common/AirSimSettings.hpp"
 
@@ -53,13 +54,44 @@ TAutoConsoleVariable<int32> CVarLogImageTiming(
  *  question; flipping this needs no rebuild, which matters because a rebuild here is expensive.
  *   0 = legacy per-image blocking RHICmdList.ReadSurfaceData (current shipped behaviour)
  *   1 = batched FRHIGPUTextureReadback: all EnqueueCopy submitted, then Lock each
+ *   2 = B3 DEFERRED: submit, release the render thread, drain in a later frame
  *  Default 0 so behaviour is unchanged until the measurement says otherwise. */
 static TAutoConsoleVariable<int32> CVarGpuReadback(
     TEXT("airsim.GpuReadback"),
     0,
     TEXT("I-G: image readback path.\n")
     TEXT(" 0: legacy ReadSurfaceData per image, one GPU sync point each (default)\n")
-    TEXT(" 1: batched FRHIGPUTextureReadback - submit all copies, then drain"),
+    TEXT(" 1: batched FRHIGPUTextureReadback - submit all copies, then drain\n")
+    TEXT(" 2: deferred - submit, free the render thread, drain at a later frame boundary"),
+    ECVF_Default);
+
+/** B3. Whether mode 2 also defers CUBE (fisheye) requests. Default ON.
+ *
+ *  This was briefly gated OFF, on the belief that deferral corrupted fisheye SurfaceNormals. That
+ *  was the wrong diagnosis: the corruption was a readback DISPATCH bug that hit the pinhole path
+ *  just as hard, and it is fixed in drainGpuReadbacks. With the sim paused, SurfaceNormals is now
+ *  byte-identical over 8 captures in all three modes, cube and pinhole alike. Kept as a switch so
+ *  the cube path can be isolated without a rebuild if it is ever suspect again. */
+static TAutoConsoleVariable<int32> CVarGpuReadbackCube(
+    TEXT("airsim.GpuReadbackCube"),
+    1,
+    TEXT("B3: 1 = airsim.GpuReadback 2 defers CUBE requests too (default). 0 = cube stays blocking."),
+    ECVF_Default);
+
+/** B3 investigation. Per-request trace of what the cube resample actually bound. */
+static TAutoConsoleVariable<int32> CVarLogCubeResample(
+    TEXT("airsim.LogCubeResample"),
+    0,
+    TEXT("B3 test: log the output/face textures each cube resample binds, and whether it ran."),
+    ECVF_Default);
+
+/** B3. How many rendered frames a deferred batch may wait for its GPU fence before the drain
+ *  gives up and blocks. A batch that never reports IsReady() would otherwise hang the calling
+ *  RPC thread forever, since getScreenshot waits on wait_signal_ with no deadline. */
+static TAutoConsoleVariable<int32> CVarGpuReadbackMaxFrames(
+    TEXT("airsim.GpuReadbackMaxFrames"),
+    4,
+    TEXT("B3: frames a deferred readback may wait before forcing a blocking drain."),
     ECVF_Default);
 
 /** I-G: parallelise the per-pixel decode on the RPC thread.
@@ -263,7 +295,36 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             if (!params[i]->pixels_as_float) {
                 if (results[i]->width != 0 && results[i]->height != 0) {
                     results[i]->image_data_uint8.SetNumUninitialized(results[i]->width * results[i]->height * 3, false);
-                    if (params[i]->compress)
+
+                    // ⚠ Fail LOUD and BLACK rather than quietly returning uninitialised heap.
+                    //
+                    // image_data_uint8 is SetNumUninitialized and the copy below is bounded by
+                    // bmp.Num(), so a short or empty bmp leaves part or all of the buffer holding
+                    // whatever the allocator last had there - which in practice is the PREVIOUS
+                    // capture. That is how a SurfaceNormals request returned Segmentation pixels
+                    // (2026-08-21): a plausible, well-formed, completely wrong image, with no
+                    // error anywhere. It also hands raw process memory to an RPC client.
+                    //
+                    // The dispatch bug that caused it is fixed in drainGpuReadbacks; this is the
+                    // guard that makes the NEXT one visible instead of convincing.
+                    const int32 expected_px = results[i]->width * results[i]->height;
+                    if (results[i]->bmp.Num() < expected_px) {
+                        static FCriticalSection warn_mutex;
+                        static bool warned = false;
+                        {
+                            FScopeLock lock(&warn_mutex);
+                            if (!warned) {
+                                warned = true;
+                                UE_LOG(LogTemp, Error,
+                                       TEXT("[AirSim] readback produced %d of %d expected pixels - returning BLACK. ")
+                                       TEXT("A readback path filled the wrong buffer for this request."),
+                                       results[i]->bmp.Num(), expected_px);
+                            }
+                        }
+                        FMemory::Memzero(results[i]->image_data_uint8.GetData(),
+                                         results[i]->image_data_uint8.Num());
+                    }
+                    else if (params[i]->compress)
                         UAirBlueprintLib::CompressImageArray(results[i]->width, results[i]->height, results[i]->bmp, results[i]->image_data_uint8);
                     else {
                         // BGRA -> RGB. Byte-at-a-time over every pixel: ~2M iterations for one
@@ -456,18 +517,38 @@ void RenderRequest::executeLegacyReadback(TArray<msr::airlib::TTimePoint>& readb
 // within-arm spread. Removing N-1 GPU sync points changed NOTHING, so the cost was never sync
 // serialisation.
 //
-// It is the CPU copy out of GPU-visible staging memory: 8.29 MB in ~19 ms is ~436 MB/s, the
-// signature of reading uncached/write-combined memory. BOTH paths do that copy per image, which is
-// why batching cannot win - and why async could not either, since it would relocate the copy, not
-// remove it. The lever is parallelising the per-image CPU work, not restructuring the readback.
+// ⚠ BOTH of this comment's original conclusions were RETRACTED on 2026-08-20 (PHASE-A1-RESULTS
+// §22.2). They are recorded here because both argued against the fix that turned out to work.
 //
-// ⚠ It also CORRUPTS float image types: DepthPlanar sample mean 0.339 (legacy) vs 131.642 (this
-// path), with no format warning - so the target really was PF_FloatRGBA. ReadSurfaceFloatData is
-// therefore NOT equivalent to a raw staging copy; it applies a conversion this memcpy does not
-// reproduce. Scene/BGRA content did match exactly.
+// RETRACTED 1 - "it is the CPU copy out of staging memory, 8.29 MB in ~19 ms = ~436 MB/s ... and
+// why async could not [win] either, since it would relocate the copy, not remove it."
+// The copy is not 19 ms. Measured with the Lock/copy split that this function now records,
+// 8.29 MB takes 3.25 ms - 2.56 GB/s. The 19 ms was the GPU FENCE WAIT, which the 2026-08-04 A/B
+// had no way to separate from the copy. The two want opposite fixes, so the misattribution led
+// directly to the wrong conclusion: deferring the readback does not relocate a copy, it deletes
+// an ~11 ms render-thread stall. That is airsim.GpuReadback 2, and it works.
 //
-// Kept, defaulted off, as the control for any future attempt. See I-G in sim_issues plan.
+// RETRACTED 2 - "it also CORRUPTS float image types: DepthPlanar mean 0.339 vs 131.642."
+// Does not reproduce. Warmed and interleaved over 4 rounds, DepthPlanar / DepthPerspective /
+// DisparityNormalized agree between modes 0, 1 and 2 to 3 decimal places. The original figure is
+// consistent with the known COLD-FRAME defect: a lazily created render target's first capture
+// returns a stale frame, and whichever mode was measured first absorbed it. A cold
+// DepthPerspective reads mean 0.356 against a warm 1.183 - the same shape as the 0.339 quoted.
+//
+// What DOES still hold: batching alone buys nothing (47.8 vs 48.1 ms/call at 1080p), and now it
+// has a mechanism. Batching removes N-1 sync points, but there was only ever ONE fence wait to
+// remove, so it had nothing to win.
+//
+// Kept, defaulted off, as the A/B control. See I-G in sim_issues plan.
 void RenderRequest::executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& readback_stamps)
+{
+    submitGpuReadbacks();
+    drainGpuReadbacks(readback_stamps, /*force_blocking=*/true);
+}
+
+// B3 phase 1. Submit every copy and RETURN. Shared by mode 1 (which drains immediately) and
+// mode 2 (which drains in a later frame) - one submit path, so the two modes cannot drift apart.
+void RenderRequest::submitGpuReadbacks()
 {
     FRHICommandListImmediate& RHICmdList = GetImmediateCommandList_ForRenderCommand();
 
@@ -511,8 +592,28 @@ void RenderRequest::executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& r
         enqueued_[(int32)i] = true;
     }
 
-    // Phase 2 - now drain. The first Lock waits on its fence; later ones usually return
-    // immediately because their copies were submitted alongside the first.
+}
+
+// B3 phase 2. Drain the submitted copies into results_.
+//
+// force_blocking=true  - mode 1 and the deferred fallback: Lock unconditionally, which waits on
+//                        the GPU fence. This is the ~11 ms stall measured in PHASE-A1-RESULTS §22.
+// force_blocking=false - mode 2: only drain when every readback reports IsReady(), so Lock finds
+//                        its fence already signalled and returns without waiting. Returns false if
+//                        the batch is not ready yet, leaving state untouched for the next frame.
+bool RenderRequest::drainGpuReadbacks(TArray<msr::airlib::TTimePoint>& readback_stamps, bool force_blocking)
+{
+    if (!force_blocking) {
+        for (unsigned int i = 0; i < req_size_; ++i) {
+            if (!enqueued_[(int32)i])
+                continue;
+            if (readbacks_[(int32)i].IsValid() && !readbacks_[(int32)i]->IsReady())
+                return false;          // not this frame; nothing has been consumed yet
+        }
+    }
+
+    // The first Lock waits on its fence; later ones usually return immediately because their
+    // copies were submitted alongside the first.
     for (unsigned int i = 0; i < req_size_; ++i) {
         if (!enqueued_[(int32)i] || results_[i]->width <= 0 || results_[i]->height <= 0) {
             readback_stamps[(int32)i] = msr::airlib::ClockFactory::get()->nowNanos();
@@ -538,21 +639,63 @@ void RenderRequest::executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& r
             const int32 w = results_[i]->width;
             const int32 h = results_[i]->height;
 
-            // Dispatch on the ACTUAL GPU format, not the client's pixels_as_float request - those
-            // can disagree, and trusting the request is how you get garbage pixels.
+            // ⚠ BOTH the GPU format AND the client's request matter, and they DISAGREE routinely.
+            //
+            // The old code dispatched on the GPU format alone, with a comment claiming that
+            // trusting the request "is how you get garbage pixels". The opposite was true. A
+            // SurfaceNormals target is created with auto_format + force_linear_gamma, which
+            // resolves to PF_FloatRGBA, while the client asks for uint8. The format-only dispatch
+            // then filled bmp_float and left bmp EMPTY - and the uint8 formatter in getScreenshot
+            // reads results[i]->bmp unconditionally, walking off an empty TArray.
+            //
+            // That out-of-bounds read is why a SurfaceNormals request came back holding the
+            // PREVIOUS capture's pixels: measured 2026-08-21 with the sim paused, SurfaceNormals
+            // returned mean 225.14 against Segmentation's 225.04 on the cube path, and 253.33
+            // against 253.38 on the pinhole path. Plausible images, entirely wrong content. The
+            // legacy path never had this because RHIReadSurfaceData converts float -> FColor
+            // itself.
+            //
+            // So: convert whenever the pair disagrees. RCM_UNorm + SetLinearToGamma(false) is what
+            // setupRenderResource asks the legacy path for, and ToFColor(false) is its equivalent.
+            const bool want_float = (params_ != nullptr && params_[i] != nullptr)
+                                        ? params_[i]->pixels_as_float
+                                        : (formats_[(int32)i] == PF_FloatRGBA);
+
             if (formats_[(int32)i] == PF_B8G8R8A8) {
-                results_[i]->bmp.SetNumUninitialized(w * h, false);
                 const FColor* src = static_cast<const FColor*>(raw);
-                FColor* dst = results_[i]->bmp.GetData();
-                for (int32 y = 0; y < h; ++y)
-                    FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FColor));
+                if (!want_float) {
+                    results_[i]->bmp.SetNumUninitialized(w * h, false);
+                    FColor* dst = results_[i]->bmp.GetData();
+                    for (int32 y = 0; y < h; ++y)
+                        FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FColor));
+                }
+                else {
+                    results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+                    FFloat16Color* dst = results_[i]->bmp_float.GetData();
+                    for (int32 y = 0; y < h; ++y)
+                        for (int32 x = 0; x < w; ++x)
+                            dst[y * w + x] = FFloat16Color(FLinearColor(src[y * row_pitch_in_pixels + x]));
+                }
             }
             else { //PF_FloatRGBA, guaranteed by phase 1
-                results_[i]->bmp_float.SetNumUninitialized(w * h, false);
                 const FFloat16Color* src = static_cast<const FFloat16Color*>(raw);
-                FFloat16Color* dst = results_[i]->bmp_float.GetData();
-                for (int32 y = 0; y < h; ++y)
-                    FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FFloat16Color));
+                if (want_float) {
+                    results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+                    FFloat16Color* dst = results_[i]->bmp_float.GetData();
+                    for (int32 y = 0; y < h; ++y)
+                        FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FFloat16Color));
+                }
+                else {
+                    results_[i]->bmp.SetNumUninitialized(w * h, false);
+                    FColor* dst = results_[i]->bmp.GetData();
+                    for (int32 y = 0; y < h; ++y) {
+                        for (int32 x = 0; x < w; ++x) {
+                            const FFloat16Color& c = src[y * row_pitch_in_pixels + x];
+                            dst[y * w + x] = FLinearColor(c.R.GetFloat(), c.G.GetFloat(),
+                                                          c.B.GetFloat(), c.A.GetFloat()).ToFColor(false);
+                        }
+                    }
+                }
             }
         }
         if (split_on)
@@ -563,6 +706,7 @@ void RenderRequest::executeBatchedGpuReadback(TArray<msr::airlib::TTimePoint>& r
     }
 
     readbacks_.Reset();
+    return true;
 }
 
 // Phase 3b step 4. Six pinhole cube faces -> one image of the calibrated camera, written into
@@ -618,6 +762,19 @@ void RenderRequest::executeCubeResample()
             }
             face_textures[face] = face_texture;
         }
+        if (CVarLogCubeResample.GetValueOnRenderThread() != 0) {
+            FString faces;
+            for (int32 f = 0; f < face_count; ++f)
+                faces += FString::Printf(TEXT(" f%d=%s"), f,
+                                         face_textures[f] ? *face_textures[f]->GetName().ToString() : TEXT("NULL"));
+            UE_LOG(LogTemp, Log,
+                   TEXT("[AirSim][cube] req[%u] mode=%d out=%s %dx%d ready=%d faces:%s"),
+                   i, params->resample_mode,
+                   *output_texture->GetName().ToString(),
+                   output_texture->GetSizeX(), output_texture->GetSizeY(),
+                   faces_ready ? 1 : 0, *faces);
+        }
+
         if (!faces_ready)
             continue; //leave the target alone rather than write half an image into it
 
@@ -626,6 +783,45 @@ void RenderRequest::executeCubeResample()
 
         AirSimCubeResample_RenderThread(*cmd_list, face_textures, face_count, output_texture, *params->raymap,
                                         static_cast<EAirSimCubeResampleMode>(params->resample_mode));
+    }
+}
+
+// B3. Deferred batches waiting for their GPU fence.
+//
+// ⚠ Render thread ONLY. Every writer is on the render thread - ExecuteTask arrives via
+// ENQUEUE_RENDER_COMMAND and the drain runs from OnEndFrameRT - so no lock is needed. That is
+// load-bearing: the MultiAgent build runs four RPC servers whose handlers capture concurrently,
+// and their RenderRequests would otherwise race here.
+namespace
+{
+    TArray<RenderRequest*> g_deferred_pending;
+    FDelegateHandle g_deferred_hook;
+}
+
+void RenderRequest::ensureDeferredDrainHook()
+{
+    if (!g_deferred_hook.IsValid())
+        g_deferred_hook = FCoreDelegates::OnEndFrameRT.AddStatic(&RenderRequest::drainPendingDeferredReadbacks);
+}
+
+// One pass per rendered frame. A batch whose fence is still unsignalled stays in the list and is
+// retried next frame, until CVarGpuReadbackMaxFrames - after which it drains blocking rather than
+// leaving the caller waiting on wait_signal_ with no deadline.
+void RenderRequest::drainPendingDeferredReadbacks()
+{
+    check(IsInRenderingThread());
+    for (int32 i = g_deferred_pending.Num() - 1; i >= 0; --i) {
+        RenderRequest* req = g_deferred_pending[i];
+        if (req == nullptr) {
+            g_deferred_pending.RemoveAt(i);
+            continue;
+        }
+        ++req->deferred_frames_waited_;
+        const bool force = req->deferred_frames_waited_ >= FMath::Max(1, CVarGpuReadbackMaxFrames.GetValueOnRenderThread());
+        if (req->drainGpuReadbacks(req->deferred_stamps_, force)) {
+            g_deferred_pending.RemoveAt(i);
+            req->finishTask(req->deferred_stamps_);
+        }
     }
 }
 
@@ -641,11 +837,55 @@ void RenderRequest::ExecuteTask()
         TArray<msr::airlib::TTimePoint> readback_stamps;
         readback_stamps.SetNumZeroed(req_size_);
 
-        if (CVarGpuReadback.GetValueOnRenderThread() != 0)
+        const int32 readback_mode = CVarGpuReadback.GetValueOnRenderThread();
+
+        // B3. Submit the copies and hand the render thread back. finishTask - and with it the
+        // signal that unblocks the caller - happens in drainPendingDeferredReadbacks, a later
+        // frame, once the GPU fence is signalled and Lock costs nothing.
+        //
+        // The CALLER still blocks: getScreenshot waits on wait_signal_ either way. What changes
+        // is that the RENDER THREAD no longer spends ~11 ms (§22.1) parked on a fence inside the
+        // frame it just drew, which is the cost that shows up as lost FPS.
+        // Cube requests defer like any other unless airsim.GpuReadbackCube is turned off.
+        // Pinhole requests carry no faces, so they pay one TArray::Num() compare.
+        bool has_cube_faces = false;
+        for (unsigned int i = 0; i < req_size_ && !has_cube_faces; ++i) {
+            if (params_[i] != nullptr &&
+                (params_[i]->face_targets.Num() > 0 || params_[i]->face_components.Num() > 0))
+                has_cube_faces = true;
+        }
+
+        const bool cube_blocks_deferral =
+            has_cube_faces && CVarGpuReadbackCube.GetValueOnRenderThread() == 0;
+
+        if (readback_mode == 2 && !cube_blocks_deferral) {
+            deferred_stamps_.SetNumZeroed(req_size_);
+            deferred_frames_waited_ = 0;
+            submitGpuReadbacks();
+            ensureDeferredDrainHook();
+            g_deferred_pending.Add(this);
+            return;
+        }
+
+        // mode 2 on a cube batch falls through to the batched blocking path, not the legacy one:
+        // it is the same submit/drain code, just drained in the same frame.
+        if (readback_mode != 0)
             executeBatchedGpuReadback(readback_stamps);
         else
             executeLegacyReadback(readback_stamps);
 
+        finishTask(readback_stamps);
+    }
+}
+
+// Everything after the pixels land: per-image stamps, the timestamp diagnostic, the segment
+// boundary, and the signal that releases getScreenshot. Split out of ExecuteTask so the deferred
+// path can run it from a different frame than the one that submitted.
+void RenderRequest::finishTask(const TArray<msr::airlib::TTimePoint>& readback_stamps)
+{
+    if (params_ == nullptr || req_size_ == 0)
+        return;
+    {
         for (unsigned int i = 0; i < req_size_; ++i) {
             // Readback-completion time for this image. Sampled per result, so under the legacy
             // convention a batch of images that all depict batch_time_stamp_ ends up with stamps
