@@ -329,6 +329,30 @@ class VehicleClient:
         responses_raw = self.client.call('simGetImages', requests, vehicle_name)
         return [ImageResponse.from_msgpack(response_raw) for response_raw in responses_raw]
 
+    def simGetImagesAllVehicles(self, vehicle_requests):
+        """D9 fleet-synchronous capture: every camera on every named vehicle in ONE render pass.
+
+        Args:
+            vehicle_requests (dict): {vehicle_name: [ImageRequest, ...]}
+
+        Returns:
+            dict: {vehicle_name: [ImageResponse, ...]}
+
+        Why use this instead of a simGetImages per vehicle:
+          * a simGetImages call carries a per-call floor of ~32.5 ms that does NOT depend on
+            resolution (measured 32.37 ms at VGA and 32.55 ms at 1080p). Calling once per vehicle
+            pays that floor N times; this pays it once.
+          * every image in the batch shares ONE capture instant. Separate calls sample separate
+            frames, and no amount of timestamping afterwards can recover a common instant that was
+            never taken.
+
+        Safe on any port: it resolves through the world API and never casts to a vehicle family.
+        """
+        payload = {name: [req for req in reqs] for name, reqs in vehicle_requests.items()}
+        responses_raw = self.client.call('simGetImagesAllVehicles', payload)
+        return {name: [ImageResponse.from_msgpack(r) for r in resps]
+                for name, resps in responses_raw.items()}
+
     def simGetPresetLensSettings(self, camera_name, vehicle_name=''):
         """
         Get the preset lens settings for a given camera

@@ -3,7 +3,15 @@
 #include "ImageUtils.h"
 
 #include "RenderRequest.h"
+#include "ImageTiming.h"
 #include "common/ClockFactory.hpp"
+
+namespace
+{
+    // ⚠ Guarded: MultiAgent runs four RPC servers whose handlers can assemble concurrently.
+    FCriticalSection g_assembly_mutex;
+    AirSimImageTiming::AssemblyWindow g_assembly_window;
+}
 
 UnrealImageCapture::UnrealImageCapture(const common_utils::UniqueValueMap<std::string, APIPCamera*>* cameras)
     : cameras_(cameras)
@@ -61,14 +69,19 @@ APIPCamera* UnrealImageCapture::requireCamera(const std::string& camera_name) co
         " on this vehicle; available: " + available);
 }
 
-void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,
-                                              std::vector<msr::airlib::ImageCaptureBase::ImageResponse>& responses, bool use_safe_method) const
+void UnrealImageCapture::collectRenderParams(
+    const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,
+    std::vector<msr::airlib::ImageCaptureBase::ImageResponse>& responses,
+    std::vector<std::shared_ptr<RenderRequest::RenderParams>>& render_params,
+    std::vector<CameraResponsePair>& camera_response_pairs,
+    UGameViewportClient*& gameViewport,
+    bool use_safe_method) const
 {
-    std::vector<std::shared_ptr<RenderRequest::RenderParams>> render_params;
-    std::vector<std::shared_ptr<RenderRequest::RenderResult>> render_results;
-
-    
-
+    // ⚠ EXTRACTED SO THERE IS EXACTLY ONE COPY OF THIS. It carries the whole Phase 3b generic-camera
+    // rig — cube resample mode, raymap, per-face components, the NativeGEER Scene exception and the
+    // size-match fallback. A fleet-batch path with its own second copy would drift from this one,
+    // and the symptom would be fisheye cameras quietly falling back to a pinhole render in batch
+    // mode only. Both getSceneCaptureImage and WorldSimApi::getImagesAllVehicles call this.
     bool visibilityChanged = false;
     for (unsigned int i = 0; i < requests.size(); ++i) {
         APIPCamera* camera = requireCamera(requests.at(i).camera_name);
@@ -89,7 +102,6 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
         std::this_thread::sleep_for(std::chrono::duration<double>(0.2));
     }
 
-    UGameViewportClient* gameViewport = nullptr;
     for (unsigned int i = 0; i < requests.size(); ++i) {
 
         APIPCamera* camera = requireCamera(requests.at(i).camera_name);
@@ -98,8 +110,12 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
             gameViewport = camera->GetWorld()->GetGameViewport();
         }
 
+        // ⚠ APPEND-AND-BACK, never responses.at(i). In a fleet batch this vector already holds
+        // earlier vehicles' entries, so indexing by the per-vehicle request index would overwrite
+        // another vehicle's response — silently, and only for the second vehicle onward.
+        const size_t response_index = responses.size();
         responses.push_back(ImageResponse());
-        ImageResponse& response = responses.at(i);          
+        ImageResponse& response = responses.back();
         UTextureRenderTarget2D* textureTarget = nullptr;
         USceneCaptureComponent2D* capture = nullptr;
         if (requests[i].image_type == ImageType::Annotation) {
@@ -210,50 +226,119 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
         }
 
         render_params.push_back(params);
+        camera_response_pairs.push_back(CameraResponsePair{ camera, response_index });
     }
+}
+
+size_t UnrealImageCapture::fillResponseFromResult(
+    const msr::airlib::ImageCaptureBase::ImageRequest& request,
+    const RenderRequest::RenderResult& result,
+    msr::airlib::ImageCaptureBase::ImageResponse& response)
+{
+    response.camera_name = request.camera_name;
+    response.time_stamp = result.time_stamp;
+
+    // ⚠ MEASURED, AND DELIBERATELY LEFT AS A COPY. Phase A1 timed this at ~2600 MB/s: ~16 ms of a
+    // 303 ms 1080p six-image call, i.e. 7%. The 93% is rpclib's msgpack encode plus the socket.
+    // Making this a move would mean changing RenderResult's buffers from TArray to std::vector, and
+    // it would buy 7%. See ExecoSimArchitecture/PHASE-A1-RESULTS.md §9 before revisiting.
+    const size_t bytes = static_cast<size_t>(result.image_data_uint8.Num()) +
+                         static_cast<size_t>(result.image_data_float.Num()) * sizeof(float);
+    response.image_data_uint8 = std::vector<uint8_t>(
+        result.image_data_uint8.GetData(),
+        result.image_data_uint8.GetData() + result.image_data_uint8.Num());
+    response.image_data_float = std::vector<float>(
+        result.image_data_float.GetData(),
+        result.image_data_float.GetData() + result.image_data_float.Num());
+
+    response.pixels_as_float = request.pixels_as_float;
+    response.compress = request.compress;
+    response.width = result.width;
+    response.height = result.height;
+    response.image_type = request.image_type;
+    response.annotation_name = request.annotation_name;
+    return bytes;
+}
+
+void UnrealImageCapture::noteAssembly(double elapsed_ms, size_t images, size_t bytes)
+{
+    const AirSimImageTiming::Clock::time_point now = AirSimImageTiming::Clock::now();
+    const double period = static_cast<double>(AirSimImageTiming::ReportPeriodSeconds());
+    if (period <= 0.0) return;
+
+    bool report = false;
+    AirSimImageTiming::AssemblyWindow snapshot;
+    {
+        FScopeLock lock(&g_assembly_mutex);
+        g_assembly_window.note(elapsed_ms, images, bytes, now);
+        if (g_assembly_window.shouldReport(now, period)) {
+            snapshot = g_assembly_window;
+            g_assembly_window.reset();
+            report = true;
+        }
+    }
+    if (report) {
+        const double n = static_cast<double>(snapshot.calls);
+        const double mb = static_cast<double>(snapshot.bytes) / 1e6;
+        UE_LOG(LogTemp, Log,
+               TEXT("[AirSim][imgassembly] %llu calls, %.2f img/call | copy %.2f ms avg "
+                    "(max %.2f) | %.1f MB total, %.1f MB/call | %.0f MB/s while copying"),
+               snapshot.calls, snapshot.images / n, snapshot.ms / n, snapshot.max_ms,
+               mb, mb / n, snapshot.ms > 0.0 ? mb / (snapshot.ms / 1000.0) : 0.0);
+    }
+}
+
+void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests,
+                                              std::vector<msr::airlib::ImageCaptureBase::ImageResponse>& responses, bool use_safe_method) const
+{
+    std::vector<std::shared_ptr<RenderRequest::RenderParams>> render_params;
+    std::vector<std::shared_ptr<RenderRequest::RenderResult>> render_results;
+    std::vector<CameraResponsePair> camera_response_pairs;
+    UGameViewportClient* gameViewport = nullptr;
+
+    collectRenderParams(requests, responses, render_params, camera_response_pairs,
+                        gameViewport, use_safe_method);
 
     if (nullptr == gameViewport) {
         return;
     }
 
-    auto query_camera_pose_cb = [this, &requests, &responses]() {
-        size_t count = requests.size();
-        for (size_t i = 0; i < count; i++) {
-            const ImageRequest& request = requests.at(i);
-            APIPCamera* camera = requireCamera(request.camera_name);
-            ImageResponse& response = responses.at(i);
-            auto camera_pose = camera->getPose();
-            response.camera_position = camera_pose.position;
-            response.camera_orientation = camera_pose.orientation;
+    // ⚠ Poses come from camera_response_pairs, not from re-resolving names against `requests`.
+    // The pair list carries an absolute index into `responses`, which is what makes the identical
+    // callback correct for a single vehicle and for a fleet batch spanning several.
+    auto query_camera_pose_cb = [&camera_response_pairs, &responses]() {
+        for (const CameraResponsePair& pair : camera_response_pairs) {
+            if (pair.camera == nullptr || pair.response_idx >= responses.size()) continue;
+            const auto camera_pose = pair.camera->getPose();
+            responses[pair.response_idx].camera_position = camera_pose.position;
+            responses[pair.response_idx].camera_orientation = camera_pose.orientation;
         }
     };
     RenderRequest render_request{ gameViewport, std::move(query_camera_pose_cb) };
 
     render_request.getScreenshot(render_params.data(), render_results, render_params.size(), use_safe_method);
 
-    for (unsigned int i = 0; i < requests.size(); ++i) {
-        const ImageRequest& request = requests.at(i);
-        ImageResponse& response = responses.at(i);
+    const bool timing_on = AirSimImageTiming::ReportPeriodSeconds() > 0;
+    const AirSimImageTiming::Clock::time_point t_start =
+        timing_on ? AirSimImageTiming::Clock::now() : AirSimImageTiming::Clock::time_point{};
+    size_t assembled_bytes = 0;
 
-        response.camera_name = request.camera_name;
-        response.time_stamp = render_results[i]->time_stamp;
-        response.image_data_uint8 = std::vector<uint8_t>(render_results[i]->image_data_uint8.GetData(), render_results[i]->image_data_uint8.GetData() + render_results[i]->image_data_uint8.Num());
-        response.image_data_float = std::vector<float>(render_results[i]->image_data_float.GetData(), render_results[i]->image_data_float.GetData() + render_results[i]->image_data_float.Num());
+    for (unsigned int i = 0; i < requests.size() && i < render_results.size(); ++i) {
+        assembled_bytes += fillResponseFromResult(requests.at(i), *render_results[i], responses.at(i));
 
         if (use_safe_method) {
-            // Currently, we don't have a way to synthronize image capturing and camera pose when safe method is used,
-            APIPCamera* camera = requireCamera(request.camera_name);
-            msr::airlib::Pose pose = camera->getPose();
-            response.camera_position = pose.position;
-            response.camera_orientation = pose.orientation;
+            // Currently, we don't have a way to synchronize image capturing and camera pose when
+            // the safe method is used.
+            APIPCamera* camera = requireCamera(requests.at(i).camera_name);
+            const msr::airlib::Pose pose = camera->getPose();
+            responses.at(i).camera_position = pose.position;
+            responses.at(i).camera_orientation = pose.orientation;
         }
-        response.pixels_as_float = request.pixels_as_float;
-        response.compress = request.compress;
-        response.width = render_results[i]->width;
-        response.height = render_results[i]->height;
-        response.image_type = request.image_type;
-		response.annotation_name = request.annotation_name;
     }
+
+    if (timing_on)
+        noteAssembly(AirSimImageTiming::ToMs(AirSimImageTiming::Clock::now() - t_start),
+                     requests.size(), assembled_bytes);
 }
 
 bool UnrealImageCapture::updateCameraVisibility(APIPCamera* camera, const msr::airlib::ImageCaptureBase::ImageRequest& request)

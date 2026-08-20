@@ -128,4 +128,40 @@ namespace AirSimImageTiming
 
         void reset() { *this = Window(); }
     };
+
+    // ---- Response assembly, measured SEPARATELY from the getScreenshot segments -------------
+    //
+    // ⚠ Why its own window rather than a field on Window: the segment report fires at the END of
+    // getScreenshot, and assembly happens AFTER getScreenshot returns. Folding it into the same
+    // window would report each call's assembly against the NEXT call's segments — an off-by-one
+    // that averages away and is invisible in the output. A separate accumulator has no such
+    // ordering relationship to defend.
+    //
+    // This is the term Phase A1 could not attribute: at 1080p, 223 ms of a 303 ms call sits
+    // OUTSIDE getScreenshot, covering our copies + rpclib msgpack + the socket. This measures the
+    // first of those three, which is the only one we own.
+    struct AssemblyWindow
+    {
+        uint64 calls = 0, images = 0, bytes = 0;
+        double ms = 0.0, max_ms = 0.0;
+        Clock::time_point window_start{};
+        bool started = false;
+
+        void note(double elapsed_ms, size_t n_images, size_t n_bytes, Clock::time_point now)
+        {
+            if (!started) { window_start = now; started = true; }
+            ++calls;
+            images += n_images;
+            bytes += n_bytes;
+            ms += elapsed_ms;
+            max_ms = FMath::Max(max_ms, elapsed_ms);
+        }
+
+        bool shouldReport(Clock::time_point now, double period_s) const
+        {
+            return started && calls > 0 && ToMs(now - window_start) >= period_s * 1000.0;
+        }
+
+        void reset() { *this = AssemblyWindow(); }
+    };
 }

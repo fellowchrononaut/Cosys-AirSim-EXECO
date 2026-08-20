@@ -9,6 +9,8 @@
 #include "Runtime/Engine/Classes/Engine/Engine.h"
 #include "Misc/OutputDeviceNull.h"
 #include "ImageUtils.h"
+#include "UnrealImageCapture.h"   // D9 fleet batch: CameraResponsePair, collectRenderParams, fillResponseFromResult
+#include "RenderRequest.h"
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
@@ -1002,6 +1004,81 @@ std::vector<WorldSimApi::ImageCaptureBase::ImageResponse> WorldSimApi::getImages
     camera->getImages(requests, responses);
 
     return responses;
+}
+
+std::map<std::string, std::vector<WorldSimApi::ImageCaptureBase::ImageResponse>>
+WorldSimApi::getImagesAllVehicles(
+    const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const
+{
+    std::vector<std::shared_ptr<RenderRequest::RenderParams>> all_params;
+    std::vector<ImageCaptureBase::ImageResponse> all_responses;
+    std::vector<UnrealImageCapture::CameraResponsePair> camera_response_pairs;
+    UGameViewportClient* viewport = nullptr;
+
+    // Where each vehicle's responses begin, so they can be split back out afterwards. Recorded in
+    // the SAME pass that collects params, because the two must agree about ordering and deriving
+    // one from the other later is how they stop agreeing.
+    std::vector<std::pair<std::string, std::pair<size_t, size_t>>> layout;
+
+    for (const auto& kv : vehicle_requests) {
+        if (kv.second.empty()) continue;
+        const UnrealImageCapture* capture = simmode_->getImageCapture(kv.first);
+        if (capture == nullptr) continue;   // unknown vehicle: omitted from the result, not fatal
+
+        const size_t offset = all_responses.size();
+        // ⚠ SAME collectRenderParams the single-vehicle path uses. That is the point: the Phase 3b
+        // generic-camera rig (cube fisheye faces, raymap, the NativeGEER Scene exception) is built
+        // once and is therefore identical in batch mode. A second copy here would let batch-mode
+        // fisheye silently degrade to a pinhole render.
+        capture->collectRenderParams(kv.second, all_responses, all_params, camera_response_pairs,
+                                     viewport, /*use_safe_method=*/false);
+        layout.emplace_back(kv.first, std::make_pair(offset, all_responses.size() - offset));
+    }
+
+    if (viewport == nullptr || all_params.empty())
+        return {};
+
+    // ⚠ ONE RenderRequest for the whole fleet. This is the entire point of D9: segments (a) and (b)
+    // — the game-thread hop and the wait for the next rendered frame — are paid once here instead
+    // of once per vehicle. RenderRequest already branches PER PARAM between the pinhole and cube
+    // paths, so a batch mixing pinhole, cube-fisheye and NativeGEER cameras across vehicles uses
+    // exactly the mechanism a single vehicle's mixed batch already uses.
+    auto pose_cb = [&camera_response_pairs, &all_responses]() {
+        for (const UnrealImageCapture::CameraResponsePair& pair : camera_response_pairs) {
+            if (pair.camera == nullptr || pair.response_idx >= all_responses.size()) continue;
+            const auto camera_pose = pair.camera->getPose();
+            all_responses[pair.response_idx].camera_position = camera_pose.position;
+            all_responses[pair.response_idx].camera_orientation = camera_pose.orientation;
+        }
+    };
+
+    std::vector<std::shared_ptr<RenderRequest::RenderResult>> all_results;
+    RenderRequest render_request{ viewport, std::move(pose_cb) };
+    render_request.getScreenshot(all_params.data(), all_results, all_params.size(), false);
+
+    // Assemble in the SAME order the params were collected. all_results is index-parallel to
+    // all_params, and all_params is index-parallel to all_responses by construction above.
+    std::map<std::string, std::vector<ImageCaptureBase::ImageResponse>> out;
+    size_t assembled_bytes = 0;
+    for (const auto& entry : layout) {
+        const std::vector<ImageCaptureBase::ImageRequest>& reqs = vehicle_requests.at(entry.first);
+        const size_t offset = entry.second.first;
+        const size_t count = entry.second.second;
+
+        std::vector<ImageCaptureBase::ImageResponse> per_vehicle;
+        per_vehicle.reserve(count);
+        for (size_t j = 0; j < count; ++j) {
+            const size_t idx = offset + j;
+            if (idx < all_results.size() && j < reqs.size() && all_results[idx] != nullptr)
+                assembled_bytes += UnrealImageCapture::fillResponseFromResult(
+                    reqs[j], *all_results[idx], all_responses[idx]);
+            per_vehicle.push_back(all_responses[idx]);
+        }
+        out.emplace(entry.first, std::move(per_vehicle));
+    }
+    (void)assembled_bytes;
+
+    return out;
 }
 
 std::vector<uint8_t> WorldSimApi::getImage(ImageCaptureBase::ImageType image_type, const CameraDetails& camera_details, const std::string& annotation_name) const

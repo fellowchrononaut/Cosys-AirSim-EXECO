@@ -6,6 +6,7 @@
 
 #include "common/CommonStructs.hpp"
 #include "common/ImageCaptureBase.hpp"
+#include <map>   // D9 fleet batch: simGetImagesAllVehicles maps vehicle name -> images
 
 namespace msr
 {
@@ -121,6 +122,21 @@ namespace airlib
         virtual void setCameraFoV(float fov_degrees, const CameraDetails& camera_details) = 0;
         virtual void setDistortionParam(const std::string& param_name, float value, const CameraDetails& camera_details) = 0;
         virtual std::vector<float> getDistortionParams(const CameraDetails& camera_details) const = 0;
+
+        /// D9 fleet-synchronous capture: every camera on every named vehicle in ONE render pass.
+        ///
+        /// ⚠ WHY THIS EXISTS. Measured on CityParkLite 2026-08-20: a simGetImages call carries a
+        /// per-call floor of ~32.5 ms that is INDEPENDENT of resolution (32.37 ms at VGA, 32.55 ms
+        /// at 1080p — the two agreeing to 0.2 ms is what identifies it as fixed cost). That floor is
+        /// the game-thread hop plus the wait for the next rendered frame, and the ROS wrapper pays
+        /// it once PER VEHICLE per cycle. Batching pays it once for the fleet.
+        ///
+        /// ⚠ It also makes the fleet share ONE capture instant. Per-vehicle calls sample different
+        /// frames, so a multi-robot dataset has no common instant — which no timestamp can repair
+        /// afterwards.
+        virtual std::map<std::string, std::vector<ImageCaptureBase::ImageResponse>>
+        getImagesAllVehicles(
+            const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const = 0;
 
         virtual std::vector<ImageCaptureBase::ImageResponse> getImages(const std::vector<ImageCaptureBase::ImageRequest>& requests,
                                                                        const std::string& vehicle_name) const = 0;

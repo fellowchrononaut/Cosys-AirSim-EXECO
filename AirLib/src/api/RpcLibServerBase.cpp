@@ -165,6 +165,28 @@ namespace airlib
             return RpcLibAdaptorsBase::ImageResponse::from(response);
         });
 
+        // D9 fleet-synchronous capture. Bound on the BASE server DELIBERATELY, so it is reachable
+        // on every family port (41451/2/3/4) exactly as simGetImages is. It resolves through
+        // getWorldSimApi() and never static_casts to a vehicle family, so it cannot reach the
+        // wrong-family SIGSEGV that family-specific calls can.
+        //
+        // ⚠ It is NOT a new RPC server on a new port. The 2026-06 reference implementation put it
+        // on 41454, which is the urdfbot family port in this tree — that collision is the reason
+        // this is a base binding instead.
+        pimpl_->server.bind("simGetImagesAllVehicles", [&](const std::map<std::string, std::vector<RpcLibAdaptorsBase::ImageRequest>>& request_adapter)
+                            -> std::map<std::string, std::vector<RpcLibAdaptorsBase::ImageResponse>> {
+            std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>> requests;
+            for (const auto& kv : request_adapter)
+                requests[kv.first] = RpcLibAdaptorsBase::ImageRequest::to(kv.second);
+
+            const auto& responses = getWorldSimApi()->getImagesAllVehicles(requests);
+
+            std::map<std::string, std::vector<RpcLibAdaptorsBase::ImageResponse>> out;
+            for (const auto& kv : responses)
+                out[kv.first] = RpcLibAdaptorsBase::ImageResponse::from(kv.second);
+            return out;
+        });
+
         pimpl_->server.bind("simGetImage", [&](const std::string& camera_name, ImageCaptureBase::ImageType type, const std::string& vehicle_name, const std::string& annotation_name) -> vector<uint8_t> {
             return getWorldSimApi()->getImage(type, CameraDetails(camera_name, vehicle_name), annotation_name);
         });

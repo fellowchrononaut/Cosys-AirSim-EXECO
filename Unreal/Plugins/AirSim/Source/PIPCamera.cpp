@@ -1431,6 +1431,38 @@ void APIPCamera::ensureFaceRig(const ImageType type)
         capture->ProjectionType = ECameraProjectionMode::Perspective;
         capture->FOVAngle = 90.0f;
 
+        //⚠ LUMEN OFF FOR NON-COLOUR MODALITIES. Measured on CityParkLite 2026-08-20, 10 fisheye
+        //cameras at 1080p: a SUSTAINED DepthPlanar capture left the MAIN VIEW's frame time at
+        //28.5 ms permanently — 117 fps -> 35 fps — and it never decayed. ProfileGPU put the whole
+        //increase in Lumen (LumenScreenProbeGather +12.05 ms of +17.6, plus a MeshCardCapture
+        //surface-cache rebuild), and an ablation settled it: with r.Lumen.DiffuseIndirect.Allow 0
+        //the loss is not reduced but ABSENT, and depth capture itself runs 4x faster (12 cycles
+        //per 15 s against 3). A scene capture was perturbing the main view's Lumen caches.
+        //
+        //⚠ DEPTH AND SEGMENTATION ONLY, DELIBERATELY. Scene faces are left on Lumen because Scene
+        //capture does NOT produce the sustained drop, and disabling GI on it would visibly change
+        //the fisheye Scene image — paying a rendering cost to fix a problem that path does not
+        //have. Depth is a distance buffer and Segmentation is flat per-instance IDs; neither has
+        //any use for global illumination, so removing it cannot change what they return.
+        //
+        //⚠ Annotation, SurfaceNormals and Infrared are ALSO GI-independent by the same argument and
+        //are NOT included here, because they were not measured. Add them only with a measurement.
+        //
+        //⚠ WHY DEPTH AND NOT SCENE TRIGGERS IT AT ALL IS STILL UNEXPLAINED. All three modalities
+        //allocate the same six face captures; only depth produced the sustained loss. This change
+        //removes the cost, not the mystery — do not read it as an explanation.
+        const bool gi_independent_modality =
+            type == ImageType::DepthPlanar || type == ImageType::DepthPerspective ||
+            type == ImageType::DepthVis || type == ImageType::DisparityNormalized ||
+            type == ImageType::Segmentation;
+        if (gi_independent_modality) {
+            capture->PostProcessSettings.bOverride_DynamicGlobalIlluminationMethod = true;
+            capture->PostProcessSettings.DynamicGlobalIlluminationMethod =
+                EDynamicGlobalIlluminationMethod::None;
+            capture->PostProcessSettings.bOverride_ReflectionMethod = true;
+            capture->PostProcessSettings.ReflectionMethod = EReflectionMethod::None;
+        }
+
         //never per frame: re-rendering capture components every frame was the I-G defect
         capture->bCaptureEveryFrame = false;
         capture->bCaptureOnMovement = false;

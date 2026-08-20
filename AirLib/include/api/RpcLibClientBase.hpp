@@ -15,6 +15,7 @@
 #include "physics/Kinematics.hpp"
 #include "physics/Environment.hpp"
 #include "api/WorldSimApiBase.hpp"
+#include <map>   // D9 fleet batch: simGetImagesAllVehicles maps vehicle name -> images
 
 namespace msr
 {
@@ -139,6 +140,11 @@ namespace airlib
         void simSetTraceLine(const std::vector<float>& color_rgba, float thickness = 3.0f, const std::string& vehicle_name = "");
 
         vector<ImageCaptureBase::ImageResponse> simGetImages(vector<ImageCaptureBase::ImageRequest> request, const std::string& vehicle_name = "");
+
+        /// D9 fleet-synchronous capture: one render pass for every camera on every named vehicle.
+        /// Available on ANY family port — it resolves through the world API, never a vehicle family.
+        std::map<std::string, vector<ImageCaptureBase::ImageResponse>> simGetImagesAllVehicles(
+            const std::map<std::string, vector<ImageCaptureBase::ImageRequest>>& vehicle_requests);
         vector<uint8_t> simGetImage(const std::string& camera_name, ImageCaptureBase::ImageType type, const std::string& vehicle_name = "", const std::string& annotation_name = "");
 
         //CinemAirSim
