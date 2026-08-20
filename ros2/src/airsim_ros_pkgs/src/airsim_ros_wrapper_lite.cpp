@@ -2,6 +2,25 @@
 #include "common/AirSimSettings.hpp"
 #include <tf2_sensor_msgs/tf2_sensor_msgs.h>
 
+// ⚠ IMAGE AND CAMERA_INFO MUST SHARE ONE QUEUE DEPTH, AND THAT IS WHY THIS IS A CONSTANT.
+//
+// Upstream advertised /image with depth 1 and /camera_info with depth 10, and the two are published
+// back to back in the same loop iteration for the same index. Measured on CityParkLite 2026-08-20:
+// a DDS writer with KEEP_LAST(1) holds one outstanding sample PER READER, so a reader that has not
+// taken it before the next publish loses it. A rosbag2 recorder under 69-105 MB/s of disk I/O is
+// exactly such a reader; a fast in-process subscriber is not, and lost nothing in the same run.
+// The tiny depth-10 camera_info always survived.
+//
+// The symptom was NOT a missing image. It was STEREO DRIFT: with left and right dropping
+// independently, a consumer matching by nearest timestamp pairs a surviving frame against a
+// neighbouring cycle. At 7 Hz that is ~143 ms, and as few as 1-2 dropped frames per topic produced
+// 123-204 ms outliers while p50 stayed exactly 0.000 ms. Timestamps were never wrong.
+//
+// ⚠ Do not "optimise" this back to 1 for images. Latest-only semantics belong to a live viewer, not
+// to a recorder or a SLAM consumer, and the asymmetry is what made the fault invisible: the
+// camera_info stream looked perfect while its own image stream was short.
+static constexpr int kImagePubQueueDepth = 10;
+
 using namespace std::placeholders;
 
 constexpr char AirsimROSWrapperLite::CAM_YML_NAME[];
@@ -262,8 +281,8 @@ void AirsimROSWrapperLite::create_ros_pubs_from_settings_json()
         //                     const std::string camera_topic_prefix = topic_prefix + "/" + curr_camera_name + "_" + image_type_int_to_string_map_.at(capture_setting.image_type) + "_" + curr_annotation_element.name;
         //                     const std::string image_topic = camera_topic_prefix + "/image";
         //                     const std::string camera_info_topic = camera_topic_prefix + "/camera_info";
-        //                     image_pub_vec_.push_back(image_transporter.advertise(image_topic, 1));
-        //                     cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, 10));
+        //                     image_pub_vec_.push_back(image_transporter.advertise(image_topic, kImagePubQueueDepth));
+        //                     cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, kImagePubQueueDepth));
         //                     camera_info_msg_vec_.push_back(generate_cam_info(curr_camera_name, camera_setting, capture_setting));
         //                 }
         //             }else{
@@ -276,8 +295,8 @@ void AirsimROSWrapperLite::create_ros_pubs_from_settings_json()
         //                 const std::string camera_topic_prefix = topic_prefix + "/" + curr_camera_name + "_" + image_type_int_to_string_map_.at(capture_setting.image_type);
         //                 const std::string image_topic = camera_topic_prefix + "/image";
         //                 const std::string camera_info_topic = camera_topic_prefix + "/camera_info";
-        //                 image_pub_vec_.push_back(image_transporter.advertise(image_topic, 1));
-        //                 cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, 10));
+        //                 image_pub_vec_.push_back(image_transporter.advertise(image_topic, kImagePubQueueDepth));
+        //                 cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, kImagePubQueueDepth));
         //                 camera_info_msg_vec_.push_back(generate_cam_info(curr_camera_name, camera_setting, capture_setting));
         //             }                    
         //         }
@@ -310,8 +329,8 @@ void AirsimROSWrapperLite::create_ros_pubs_from_settings_json()
                             const std::string image_topic = camera_topic_prefix + "/image";
                             const std::string camera_info_topic = camera_topic_prefix + "/camera_info";
 
-                            image_pub_vec_.push_back(image_transporter.advertise(image_topic, 1));
-                            cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, 10));
+                            image_pub_vec_.push_back(image_transporter.advertise(image_topic, kImagePubQueueDepth));
+                            cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, kImagePubQueueDepth));
                             camera_info_msg_vec_.push_back(generate_cam_info(curr_camera_name, camera_setting, capture_setting));
                         }
                     } else {
@@ -325,8 +344,8 @@ void AirsimROSWrapperLite::create_ros_pubs_from_settings_json()
                         const std::string image_topic = camera_topic_prefix + "/image";
                         const std::string camera_info_topic = camera_topic_prefix + "/camera_info";
 
-                        image_pub_vec_.push_back(image_transporter.advertise(image_topic, 1));
-                        cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, 10));
+                        image_pub_vec_.push_back(image_transporter.advertise(image_topic, kImagePubQueueDepth));
+                        cam_info_pub_vec_.push_back(nh_->create_publisher<sensor_msgs::msg::CameraInfo>(camera_info_topic, kImagePubQueueDepth));
                         camera_info_msg_vec_.push_back(generate_cam_info(curr_camera_name, camera_setting, capture_setting));
                     }
                 }
