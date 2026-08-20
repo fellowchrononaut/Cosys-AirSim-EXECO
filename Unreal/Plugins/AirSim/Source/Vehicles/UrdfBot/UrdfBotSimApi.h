@@ -136,6 +136,19 @@ private:
 
     urdf::Robot model_;
     std::unique_ptr<urdf::UrdfRobotBackend> backend_;
+    /// Guards every RPC-thread read/write of backend_ against resetImplementation()'s
+    /// backend_->reset(), which destroys and rebuilds every Box3D body and joint (§6.4) rather than
+    /// rewriting poses in place. Without this, an RPC accessor mid-read of a body Box3D has just
+    /// freed is a use-after-free, not a stale value - confirmed from a crash dump: getJointStates()
+    /// reading through a destroyed body while the ROS wrapper's continuous /joint_states poll raced
+    /// a reset, 2026-08-20. UrdfBotApi is handed a pointer to this at construction and takes it for
+    /// the duration of every method that touches backend_.
+    ///
+    /// ⚠ Does NOT cover update() on the physics thread, which also calls backend_ directly every
+    /// step (drive-joint writes, step()). Reset only races update() if something can invoke it from
+    /// a thread other than the one update() runs on; deliberately left unaudited and unlocked here -
+    /// scope this in if that turns out to happen.
+    std::mutex backend_mutex_;
     /// The URDF exactly as read from disk, served to clients through getUrdfXml(). Held because
     /// a ROS client in a container generally cannot open UrdfFile itself.
     std::string urdf_xml_raw_;

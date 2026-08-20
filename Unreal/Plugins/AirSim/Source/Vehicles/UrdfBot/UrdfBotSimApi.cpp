@@ -55,8 +55,10 @@ namespace
     public:
         UrdfBotApi(const urdf::Robot* model, urdf::UrdfRobotBackend* backend,
                    const std::vector<urdf::MimicClassification>* mimic,
-                   const NedTransform* ned, msr::airlib::GeoPoint home)
-            : model_(model), backend_(backend), mimic_(mimic), ned_(ned), home_(home)
+                   const NedTransform* ned, msr::airlib::GeoPoint home,
+                   std::mutex* backend_mutex)
+            : model_(model), backend_(backend), mimic_(mimic), ned_(ned), home_(home),
+              backend_mutex_(backend_mutex)
         {
         }
 
@@ -116,6 +118,8 @@ namespace
                     "setJointTorques: " + std::to_string(joints.size()) + " joint name(s) but " +
                     std::to_string(values.size()) + " torque(s)");
 
+            std::lock_guard<std::mutex> lock(*backend_mutex_);
+
             // ⚠ RESOLVE EVERY NAME BEFORE APPLYING ANY TORQUE. A controller that gets eleven of
             // twelve legs actuated is worse than one that gets none: the robot moves, plausibly,
             // and the missing joint is invisible until something falls over. requireJoint throws on
@@ -131,16 +135,19 @@ namespace
         }
         void setJointPositionGains(const std::string& joint, double hertz, double ratio) override
         {
+            std::lock_guard<std::mutex> lock(*backend_mutex_);
             backend_->setPositionGains(static_cast<size_t>(requireJoint(joint)), hertz, ratio);
         }
 
         urdf::JointState getJointState(const std::string& joint) const override
         {
+            std::lock_guard<std::mutex> lock(*backend_mutex_);
             return backend_->getJointState(static_cast<size_t>(requireJoint(joint)));
         }
 
         std::vector<JointStateInfo> getJointStates() const override
         {
+            std::lock_guard<std::mutex> lock(*backend_mutex_);
             std::vector<JointStateInfo> out;
             out.reserve(model_->joints.size());
             for (size_t i = 0; i < model_->joints.size(); ++i) {
@@ -176,11 +183,16 @@ namespace
 
         LinkPoseInfo getLinkPose(const std::string& link) const override
         {
-            const int i = backend_->findLink(link);
-            if (i < 0) throw std::invalid_argument("no such link: '" + link + "'");
+            urdf::LinkPose p;
+            urdf::Twist t;
+            {
+                std::lock_guard<std::mutex> lock(*backend_mutex_);
+                const int i = backend_->findLink(link);
+                if (i < 0) throw std::invalid_argument("no such link: '" + link + "'");
 
-            const urdf::LinkPose p = backend_->getLinkPose(static_cast<size_t>(i));
-            const urdf::Twist t = backend_->getLinkTwist(static_cast<size_t>(i));
+                p = backend_->getLinkPose(static_cast<size_t>(i));
+                t = backend_->getLinkTwist(static_cast<size_t>(i));
+            }
 
             LinkPoseInfo out;
             out.name = link;
@@ -249,6 +261,7 @@ namespace
         }
         void command(const std::string& joint, urdf::ControlMode mode, double v)
         {
+            std::lock_guard<std::mutex> lock(*backend_mutex_);
             backend_->setJointTarget(static_cast<size_t>(requireJoint(joint)), mode, v);
         }
 
@@ -258,6 +271,7 @@ namespace
         const std::vector<urdf::MimicClassification>* mimic_;
         const NedTransform* ned_;
         msr::airlib::GeoPoint home_;
+        std::mutex* backend_mutex_;
         /// The owning sim api. Borrowed, not owned — it outlives this object, which is one of its
         /// members.
         const UrdfBotSimApi* sim_api_ = nullptr;
@@ -1245,7 +1259,8 @@ void UrdfBotSimApi::loadModelAndBackend()
 
     {
         auto api = std::make_unique<UrdfBotApi>(&model_, backend_.get(), mimic, &getNedTransform(),
-                                                getGroundTruthEnvironment()->getHomeGeoPoint());
+                                                getGroundTruthEnvironment()->getHomeGeoPoint(),
+                                                &backend_mutex_);
         // Hand over the raw URDF so clients that cannot see the file path can still obtain the
         // description — see UrdfBotApiBase::getUrdfXml.
         api->setUrdfXml(urdf_xml_raw_);
@@ -2010,6 +2025,12 @@ void UrdfBotSimApi::resetImplementation()
         // ⚠ Rebuilds the Box3D world rather than rewriting poses. Box3D has no rollback
         // determinism — contact caches, warm-start impulses and island state survive a pose write,
         // so a pose-restoring reset diverges silently from a fresh build (§6.4). Measured at 0.05 ms.
+        //
+        // backend_mutex_ held across the rebuild AND the snapshot refill: an RPC accessor is now
+        // blocked out for the ~0.05 ms this takes rather than reading a body mid-teardown. Without
+        // this an RPC thread reading backend_ (getJointStates, getLinkPose, ...) while this runs
+        // dereferences a body Box3D has already freed — confirmed from a crash dump, 2026-08-20.
+        std::lock_guard<std::mutex> backend_lock(backend_mutex_);
         backend_->reset();
         last_update_time_ = 0;
         steps_taken_ = 0;

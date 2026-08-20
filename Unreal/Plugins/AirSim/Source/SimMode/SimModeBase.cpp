@@ -12,6 +12,7 @@
 #include <memory>
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 #include "AirBlueprintLib.h"
 #include "Annotation/ObjectAnnotator.h"
 #include "LidarCamera.h"
@@ -1691,14 +1692,44 @@ void ASimModeBase::toggleTraceAll()
     }
 }
 
+namespace
+{
+    // getVehicleSimApi() is ApiProvider::findOrDefault(vehicle_name, nullptr) underneath, so an
+    // RPC client naming a vehicle this scene does not have (wrong name, stale settings file,
+    // typo'd default) gets a null PawnSimApi* back with no signal anything went wrong. Every
+    // caller here used to dereference that unchecked, which reads through address 0 and takes the
+    // whole editor down - confirmed from a crash dump, SimModeBase.cpp:1701, 2026-08-19. Same shape
+    // as UnrealImageCapture::requireCamera, one level up the lookup chain.
+    const PawnSimApi* requireVehicleSimApi(const ASimModeBase* sim_mode, const std::string& vehicle_name)
+    {
+        const PawnSimApi* sim_api = sim_mode->getVehicleSimApi(vehicle_name);
+        if (sim_api != nullptr)
+            return sim_api;
+
+        std::string available;
+        for (const auto& name : sim_mode->getApiProvider()->getVehicleSimApis().keys()) {
+            if (!available.empty())
+                available += ", ";
+            available += name.empty() ? "\"\" (default)" : "'" + name + "'";
+        }
+        if (available.empty())
+            available = "(none - no vehicles registered)";
+
+        throw std::invalid_argument(
+            "no vehicle named " +
+            (vehicle_name.empty() ? std::string("\"\" (the default vehicle)") : "'" + vehicle_name + "'") +
+            " in this scene; available: " + available);
+    }
+}
+
 const APIPCamera* ASimModeBase::getCamera(const msr::airlib::CameraDetails& camera_details) const
 {
-    return getVehicleSimApi(camera_details.vehicle_name)->getCamera(camera_details.camera_name);
+    return requireVehicleSimApi(this, camera_details.vehicle_name)->getCamera(camera_details.camera_name);
 }
 
 const UnrealImageCapture* ASimModeBase::getImageCapture(const std::string& vehicle_name) const
 {
-    return getVehicleSimApi(vehicle_name)->getImageCapture();
+    return requireVehicleSimApi(this, vehicle_name)->getImageCapture();
 }
 
 //API server start/stop
