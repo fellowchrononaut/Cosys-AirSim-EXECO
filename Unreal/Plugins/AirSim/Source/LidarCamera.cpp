@@ -46,10 +46,23 @@ TAutoConsoleVariable<int32> CVarLidarDeskew(   // non-static: also used by Unrea
 	TEXT("  1: Force ON  - whole sweep re-expressed in the frame at sweep completion"),
 	ECVF_Default);
 
-/** Resolve the LidarDeskew setting against the debug override. Shared by both LiDAR sensors. */
+/** Resolve the LidarDeskew setting against the debug override. Shared by both LiDAR sensors.
+ *
+ * ⚠ GetValueOnAnyThread, NOT GetValueOnGameThread. Both callers run on the ASYNC PHYSICS thread:
+ * UnrealLidarSensor::getPointCloud (via LidarSimple::update -> SensorCollection::update ->
+ * World::update) and LidarCamera. GetValueOnGameThread ensures on GetShadowIndex() == 0, which is
+ * false there. Observed on CityParkLite 2026-08-20 with the callstack
+ *   ShouldDeskewLidar -> UnrealLidarSensor::getPointCloud -> ... -> World::update
+ *
+ * ⚠ It is a HANDLED ensure, which is exactly why it lasted: the sweep still de-skews correctly and
+ * nothing visible breaks, so it costs nothing until someone reads the log. The same defect existed
+ * one call site away in UnrealLidarSensor.cpp and fixing only that one left THIS one firing —
+ * a reminder that a CVar helper shared by two sensors needs the thread-safe accessor at its
+ * DEFINITION, not at each call.
+ */
 bool ShouldDeskewLidar()
 {
-	const int32 Override = CVarLidarDeskew.GetValueOnGameThread();
+	const int32 Override = CVarLidarDeskew.GetValueOnAnyThread();
 	if (Override >= 0) {
 		return Override != 0;
 	}
@@ -398,7 +411,11 @@ bool ALidarCamera::Update(float delta_time, msr::airlib::vector<msr::airlib::rea
 			// instrumented separately in UnrealSensors/UnrealLidarSensor.cpp - both accumulate a
 			// sweep across ticks and share the same distortion.
 			if (refresh_pointcloud) {
-				if (CVarLogLidarSweep.GetValueOnGameThread() != 0) {
+				// ⚠ GetValueOnAnyThread: ALidarCamera::Update runs on the async physics thread,
+				// same as the raycast sensor. The ensure fires on the READ, not on the branch, so
+				// it would trip on every completed GPU sweep regardless of the CVar's value.
+				// Not caught by the 2026-08-20 test scene only because it has no GPU LiDAR.
+				if (CVarLogLidarSweep.GetValueOnAnyThread() != 0) {
 					const uint64 now_ns = msr::airlib::ClockFactory::get()->nowNanos();
 					// See the raycast sensor's equivalent: a second sweep completing inside the
 					// same Update() sees a reset counter, so report at least 1 and say so.

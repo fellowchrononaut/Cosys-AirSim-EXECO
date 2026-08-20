@@ -641,6 +641,19 @@ private:
     rosgraph_msgs::msg::Clock ros_clock_;
     bool publish_clock_;
 
+    /// D9 fleet-synchronous image capture: one simGetImagesAllVehicles call per tick instead of one
+    /// simGetImages per vehicle. Default TRUE.
+    ///
+    /// ⚠ Enabled by default because per-vehicle capture gives a multi-robot recording NO COMMON
+    /// INSTANT — measured 189 ms of spread across a 5-vehicle fleet, against 0.000 ms batched — and
+    /// that cannot be repaired after the fact by any timestamp.
+    ///
+    /// ⚠ It is a TRADE, not a strict improvement. Batching concentrates every camera's render work
+    /// into one frame: render-thread p95 measured 66 ms per-vehicle against 234 ms batched on the
+    /// same rig. Set batch_image_capture:=false when frame pacing matters more than a shared
+    /// capture instant.
+    bool batch_image_capture_;
+
     rclcpp::Subscription<airsim_interfaces::msg::GimbalAngleQuatCmd>::SharedPtr  gimbal_angle_quat_cmd_sub_;
     rclcpp::Subscription<airsim_interfaces::msg::GimbalAngleEulerCmd>::SharedPtr gimbal_angle_euler_cmd_sub_;
 

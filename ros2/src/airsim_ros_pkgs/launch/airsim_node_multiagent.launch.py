@@ -19,6 +19,14 @@ def generate_launch_description():
         "publish_clock",
         default_value='True')
 
+    # D9 fleet-synchronous capture. Default ON: per-vehicle capture leaves a multi-robot recording
+    # with no common instant (measured 189 ms of fleet spread vs 0.000 ms batched). ⚠ It costs a
+    # larger worst-case frame stall (render p95 66 ms -> 234 ms), so set false when frame pacing
+    # matters more than a shared capture instant.
+    batch_image_capture = DeclareLaunchArgument(
+        "batch_image_capture",
+        default_value='True')
+
     is_vulkan = DeclareLaunchArgument(
         "is_vulkan",
         default_value='True')
@@ -48,6 +56,7 @@ def generate_launch_description():
                 'update_gpulidar_every_n_sec': 0.01,
                 'update_echo_every_n_sec': 0.01,
                 'publish_clock': LaunchConfiguration('publish_clock'),
+                'batch_image_capture': LaunchConfiguration('batch_image_capture'),
                 'host_ip': LaunchConfiguration('host_ip'),
                 'enable_api_control': LaunchConfiguration('enable_api_control'),
                 'enable_object_transforms_list': LaunchConfiguration('enable_object_transforms_list')
@@ -57,6 +66,7 @@ def generate_launch_description():
 
     ld.add_action(output)
     ld.add_action(publish_clock)
+    ld.add_action(batch_image_capture)
     ld.add_action(is_vulkan)
     ld.add_action(host_ip)
     ld.add_action(enable_api_control)

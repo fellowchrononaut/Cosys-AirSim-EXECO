@@ -106,6 +106,7 @@ AirsimROSWrapperMultiAgent::AirsimROSWrapperMultiAgent(
     , nh_echo_(nh_echo)
     , cb_(callbackGroup)
     , publish_clock_(false)
+    , batch_image_capture_(true)
     , has_gimbal_cmd_(false)
 {
     ros_clock_.clock = rclcpp::Time(0);
@@ -270,6 +271,15 @@ void AirsimROSWrapperMultiAgent::initialize_ros()
     nh_->get_parameter("is_vulkan", is_vulkan_);
     nh_->get_parameter("update_airsim_control_every_n_sec", update_airsim_control_every_n_sec);
     nh_->get_parameter("publish_clock", publish_clock_);
+    // ⚠ GUARDED. The launch file passes batch_image_capture in its parameters dict, which DECLARES
+    // it — declaring it again throws "parameter has already been declared" and kills the node at
+    // start-up. publish_clock above is only get_parameter for exactly this reason. The guard keeps
+    // the node runnable standalone as well, where nothing has declared it.
+    if (!nh_->has_parameter("batch_image_capture"))
+        nh_->declare_parameter("batch_image_capture", rclcpp::ParameterValue(true));
+    nh_->get_parameter("batch_image_capture", batch_image_capture_);
+    RCLCPP_INFO(nh_->get_logger(), "batch_image_capture = %s (one render pass for the whole fleet)",
+                batch_image_capture_ ? "TRUE" : "false");
     nh_->get_parameter_or("world_frame_id", world_frame_id_, world_frame_id_);
     nh_->get_parameter_or("odom_frame_id", odom_frame_id_, odom_frame_id_);
     vel_cmd_duration_ = 0.05;
@@ -1281,14 +1291,56 @@ void AirsimROSWrapperMultiAgent::echo_timer_cb()
 void AirsimROSWrapperMultiAgent::img_response_timer_cb()
 {
     try {
+        // ⚠ THE PUBLISHER VECTORS ARE FLAT AND INDEXED BY ACCUMULATION ORDER.
+        // image_pub_vec_ / cam_info_pub_vec_ were filled while walking
+        // airsim_img_request_vehicle_name_pair_vec_ in order, so responses MUST be dispatched in
+        // that same order with a running index. Both branches below iterate that vector; the batch
+        // branch only changes where the responses come from, never the order they are consumed in.
+        // Dispatching a map's iteration order instead would publish each vehicle's images on
+        // another vehicle's topics - well-formed, correctly stamped, and attributed to the wrong
+        // robot.
         int image_response_idx = 0;
-        for (const auto& pair : airsim_img_request_vehicle_name_pair_vec_) {
-            auto& img_client = get_images_client(pair.mode);
-            const std::vector<ImageResponse>& img_response = img_client.simGetImages(pair.requests, pair.vehicle_name);
 
-            if (img_response.size() == pair.requests.size()) {
-                process_and_publish_img_response(img_response, image_response_idx, pair.vehicle_name);
-                image_response_idx += img_response.size();
+        if (batch_image_capture_) {
+            // D9 fleet-synchronous capture: ONE render pass for every camera on every vehicle.
+            //
+            // Why this matters more than speed: per-vehicle calls sample DIFFERENT FRAMES, so a
+            // multi-robot recording has no common capture instant. Measured on a 5-vehicle rig,
+            // 2026-08-20: four separate calls spread the fleet across 189 ms of simulated time,
+            // against 0.000 ms for the batch. No timestamp can repair that afterwards - the frames
+            // genuinely were taken at different instants.
+            //
+            // ⚠ IT IS NOT A FREE WIN. Batching concentrates every camera's render work into ONE
+            // frame instead of spreading it over N, and the worst-case frame stall grows with it:
+            // render-thread p95 measured 66 ms per-vehicle against 234 ms batched on that same rig.
+            // Set batch_image_capture:=false if frame pacing matters more than a common instant.
+            std::map<std::string, std::vector<ImageRequest>> batch;
+            for (const auto& pair : airsim_img_request_vehicle_name_pair_vec_)
+                batch[pair.vehicle_name] = pair.requests;
+
+            // ⚠ ANY family client works. simGetImagesAllVehicles is bound on the BASE RPC server
+            // and resolves through the world API, so - unlike getCarState or getMultirotorState -
+            // it never casts to a vehicle family and cannot reach the wrong-family SIGSEGV.
+            auto& client = get_images_client(airsim_img_request_vehicle_name_pair_vec_.front().mode);
+            const auto& all = client.simGetImagesAllVehicles(batch);
+
+            for (const auto& pair : airsim_img_request_vehicle_name_pair_vec_) {
+                const auto it = all.find(pair.vehicle_name);
+                // ⚠ ADVANCE THE INDEX EVEN WHEN A VEHICLE IS MISSING OR SHORT. Skipping without
+                // advancing would slide every later vehicle's images onto the wrong publishers.
+                if (it != all.end() && it->second.size() == pair.requests.size())
+                    process_and_publish_img_response(it->second, image_response_idx, pair.vehicle_name);
+                image_response_idx += pair.requests.size();
+            }
+        }
+        else {
+            for (const auto& pair : airsim_img_request_vehicle_name_pair_vec_) {
+                auto& img_client = get_images_client(pair.mode);
+                const std::vector<ImageResponse>& img_response = img_client.simGetImages(pair.requests, pair.vehicle_name);
+
+                if (img_response.size() == pair.requests.size())
+                    process_and_publish_img_response(img_response, image_response_idx, pair.vehicle_name);
+                image_response_idx += pair.requests.size();
             }
         }
     }

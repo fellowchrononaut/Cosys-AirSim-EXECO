@@ -314,7 +314,15 @@ bool UnrealLidarSensor::getPointCloud(const msr::airlib::Pose& lidar_pose, const
 			// cloud with one clock()->nowNanos() and one pose - but its points were measured in
 			// the vehicle frame as it was on each contributing tick. The span below is how much
 			// vehicle motion the cloud straddles, i.e. how stale the oldest points' frame is.
-			if (CVarLogLidarSweep.GetValueOnGameThread() != 0) {
+			// ⚠ GetValueOnAnyThread, NOT GetValueOnGameThread. getPointCloud runs on the ASYNC
+			// PHYSICS thread (World::update -> SensorCollection::update -> LidarSimple::update),
+			// and GetValueOnGameThread ensures on GetShadowIndex() == 0, which is false there.
+			// Observed firing on CityParkLite 2026-08-20:
+			//   Ensure condition failed: GetShadowIndex() == 0 [IConsoleManager.h:1699]
+			//   UnrealLidarSensor::getPointCloud -> LidarSimple::updateOutput -> ... -> World::update
+			// It is a HANDLED ensure, so it degrades a diagnostic rather than the run — which is
+			// exactly why it survived: it costs nothing visible until someone reads the log.
+			if (CVarLogLidarSweep.GetValueOnAnyThread() != 0) {
 				const uint64 now_ns = msr::airlib::ClockFactory::get()->nowNanos();
 				// sweep_tick_count_ is reset on each completion, so a SECOND sweep finishing inside
 				// the same getPointCloud call sees 0 - which reads as "0 ticks" and is impossible.

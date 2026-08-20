@@ -1296,7 +1296,14 @@ void ASimModeBase::updateAnnotation(FString annotation_name) {
         UAirBlueprintLib::RunCommandOnGameThread([this, &cameras_found]() {
             UGameplayStatics::GetAllActorsOfClass(this, APIPCamera::StaticClass(), cameras_found);
             }, true);
-        UAirBlueprintLib::FindAllActor<APIPCamera>(this, cameras_found);
+        // ⚠ A second, UNMARSHALLED GetAllActorsOfClass used to run here
+        // (UAirBlueprintLib::FindAllActor<APIPCamera>). It was an exact duplicate of the
+        // RunCommandOnGameThread call above - GetAllActorsOfClass Resets the output array, so the
+        // marshalled call already leaves cameras_found fully populated - but it ran on whichever
+        // thread called us. Over RPC that is the rpclib thread, and TActorIterator's ctor asserts
+        // check(IsInGameThread()) (EngineUtils.h:183), which killed the editor on the FIRST
+        // simSetAnnotationObjectID call. updateInstanceSegmentationAnnotation() a few lines up is
+        // the same function without the duplicate, which is why Segmentation never crashed.
         if (cameras_found.Num() >= 0) {
             for (auto camera_actor : cameras_found) {
                 APIPCamera* cur_camera = static_cast<APIPCamera*>(camera_actor);
@@ -1307,7 +1314,7 @@ void ASimModeBase::updateAnnotation(FString annotation_name) {
         UAirBlueprintLib::RunCommandOnGameThread([this, &lidar_cameras_found]() {
             UGameplayStatics::GetAllActorsOfClass(this, ALidarCamera::StaticClass(), lidar_cameras_found);
             }, true);
-        UAirBlueprintLib::FindAllActor<ALidarCamera>(this, lidar_cameras_found);
+        // Same duplicate as above, for ALidarCamera. Removed for the same reason.
         if (cameras_found.Num() >= 0) {
             for (auto lidar_camera_actor : lidar_cameras_found) {
                 ALidarCamera* cur_lidar_camera = static_cast<ALidarCamera*>(lidar_camera_actor);
