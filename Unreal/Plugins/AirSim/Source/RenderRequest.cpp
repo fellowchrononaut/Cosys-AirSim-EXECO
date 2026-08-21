@@ -79,6 +79,30 @@ static TAutoConsoleVariable<int32> CVarGpuReadback(
     TEXT(" 2: deferred - submit, free the render thread, drain at a later frame (DEFAULT)"),
     ECVF_Default);
 
+/** B2 step 3. Which OnEndDraw registration a capture uses. Default 1 (the pump).
+ *
+ *   1 = ONE process-wide registration owned by the pump, drained per drawn frame  <- DEFAULT
+ *   0 = LEGACY: every request adds its own handler and removes it from inside that handler's own
+ *       broadcast. Kept, and kept working, so this is an A/B in one build rather than a rewrite.
+ *
+ *  ⚠ WHY THE DEFAULT IS 1 RATHER THAN 0. Mode 0 is not a safe fallback that happens to be slower -
+ *  it is undefined behaviour that survives only while exactly one request is ever in flight. It is
+ *  the direct cause of the airsim.StreamCaptureInFlight > 1 SIGSEGV. Mode 1 is a bug fix, and the
+ *  switch exists to make the fix falsifiable, not because mode 0 is a supported configuration.
+ *
+ *  ⚠ WHAT DOES NOT CHANGE, EITHER WAY. Both modes run the SAME onDrawnOnGameThread() body: same
+ *  capture instant, same pose snapshot, same completion command, same results. simGetImages is
+ *  unaffected in signature, in semantics and in returned bytes; classic RPC clients cannot tell the
+ *  two modes apart on a single in-flight request, which is the pre-B2 case. The step-3 exit
+ *  criterion checks exactly that. */
+static TAutoConsoleVariable<int32> CVarEndDrawPump(
+    TEXT("airsim.EndDrawPump"),
+    1,
+    TEXT("B2: OnEndDraw registration.\n")
+    TEXT(" 0: legacy - one delegate per request, removed from inside its own broadcast (UB with >1)\n")
+    TEXT(" 1: pump - one registration for the process, drained per drawn frame (DEFAULT)"),
+    ECVF_Default);
+
 /** B3. Whether mode 2 also defers CUBE (fisheye) requests. Default ON.
  *
  *  This was briefly gated OFF, on the belief that deferral corrupted fisheye SurfaceNormals. That
@@ -231,11 +255,22 @@ void RenderRequest::cancelRegisteredOnGameThread()
 {
     check(IsInGameThread());
 
+    // ⚠ Which path registered this request is recorded by whether it holds a delegate handle, NOT by
+    // re-reading airsim.EndDrawPump. The CVar can be flipped between enrol and cancel, and a request
+    // must always be cancelled the way it was registered - otherwise a legacy request leaks its
+    // delegate and a pumped one leaks its share of the refcounted viewport flag.
     if (game_viewport_ != nullptr && end_draw_handle_.IsValid()) {
         game_viewport_->OnEndDraw().Remove(end_draw_handle_);
         end_draw_handle_.Reset();
         game_viewport_->bDisableWorldRendering = saved_DisableWorldRendering_;
+        return;
     }
+
+    // B2 step 3. A pumped request owns no delegate - it owns a slot in the waiting list and a share
+    // of the refcounted viewport flag. Withdrawing returns both, and does nothing at all if the
+    // broadcast already drained this gate (in which case the request is Drawing, not Registered, and
+    // cancelAllPending will not have called us).
+    endDrawPumpWithdraw(gate_);
 }
 
 void RenderRequest::cancelAllPending()
@@ -285,6 +320,166 @@ void RenderRequest::cancelAllPending()
         UE_LOG(LogTemp, Warning,
                TEXT("[AirSim] shutdown: cancelled %d queued and %d registered image request(s), flushed %d already drawing"),
                pending, registered, drawing);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// B2 step 3. ONE OnEndDraw registration for the whole process. See the block comment above
+// endDrawPumpEnroll in RenderRequest.h for what was wrong with the per-request one.
+//
+// Thread rules, all of them load-bearing:
+//   * enrol / withdraw / broadcast / shutdown are GAME THREAD ONLY. The mutex is not there to make
+//     them cross-thread safe - it is there because the waiting list and the refcount are touched
+//     from several places on that thread and a half-updated pair leaks the viewport flag.
+//   * the delegate is added and removed only in enrol and shutdown, i.e. NEVER from inside the
+//     broadcast. That single property is the whole bug fix.
+namespace
+{
+    FCriticalSection g_pump_mutex;
+    UGameViewportClient* g_pump_viewport = nullptr;
+    FDelegateHandle g_pump_handle;
+    TArray<std::shared_ptr<RenderRequest::CancelGate>> g_pump_waiting;
+
+    // How many enrolled requests are currently borrowing bDisableWorldRendering, and what it was
+    // before the first of them borrowed it.
+    int32 g_pump_render_refs = 0;
+    bool g_pump_saved_disable_world_rendering = false;
+
+    /** Give the viewport flag back once the last borrower is gone. Caller holds g_pump_mutex. */
+    void pumpReleaseRenderFlag_Locked()
+    {
+        if (g_pump_render_refs <= 0)
+            return;
+        if (--g_pump_render_refs == 0 && g_pump_viewport != nullptr)
+            g_pump_viewport->bDisableWorldRendering = g_pump_saved_disable_world_rendering ? 1 : 0;
+    }
+}
+
+void RenderRequest::endDrawPumpEnroll(UGameViewportClient* viewport, const std::shared_ptr<CancelGate>& gate)
+{
+    check(IsInGameThread());
+    if (viewport == nullptr || !gate)
+        return;
+
+    FScopeLock lock(&g_pump_mutex);
+
+    // A new PIE session builds a new viewport client. Rebind here - on the game thread and outside
+    // any broadcast, the only place it is safe to mutate the delegate list.
+    if (g_pump_viewport != viewport) {
+        if (g_pump_viewport != nullptr && g_pump_handle.IsValid())
+            g_pump_viewport->OnEndDraw().Remove(g_pump_handle);
+        g_pump_viewport = viewport;
+        g_pump_handle = viewport->OnEndDraw().AddStatic(&RenderRequest::endDrawPumpBroadcast);
+        // The previous viewport's borrowers died with it; there is nothing to give back to a
+        // destroyed object, and the count must not carry over into the new one.
+        g_pump_render_refs = 0;
+    }
+
+    if (g_pump_render_refs == 0) {
+        g_pump_saved_disable_world_rendering = viewport->bDisableWorldRendering != 0;
+        viewport->bDisableWorldRendering = 0;
+    }
+    ++g_pump_render_refs;
+
+    g_pump_waiting.Add(gate);
+}
+
+void RenderRequest::endDrawPumpWithdraw(const std::shared_ptr<CancelGate>& gate)
+{
+    check(IsInGameThread());
+    if (!gate)
+        return;
+
+    FScopeLock lock(&g_pump_mutex);
+    // ⚠ Release the flag ONLY if this gate was still waiting. A gate the broadcast already drained
+    // is gone from the list and its refcount share was returned in bulk there; decrementing again
+    // would restore bDisableWorldRendering underneath a request still using it. Remove()'s return
+    // count is what keeps the two paths mutually exclusive.
+    if (g_pump_waiting.Remove(gate) > 0)
+        pumpReleaseRenderFlag_Locked();
+}
+
+void RenderRequest::endDrawPumpBroadcast()
+{
+    check(IsInGameThread());
+
+    TArray<std::shared_ptr<CancelGate>> drawing;
+    {
+        FScopeLock lock(&g_pump_mutex);
+        if (g_pump_waiting.Num() == 0)
+            return;   // the common case while nothing is capturing: one lock and out
+
+        // ⚠ Swap the list out under the lock and dispatch OUTSIDE it. Dispatch runs a caller-
+        // supplied pose callback and an ENQUEUE_RENDER_COMMAND; holding a lock across either is how
+        // a capture-time deadlock gets built.
+        drawing = MoveTemp(g_pump_waiting);
+        g_pump_waiting.Reset();
+
+        // Every enrolled request is dispatched by this one broadcast, so the flag they collectively
+        // borrowed goes back now - once, not once per request.
+        if (g_pump_viewport != nullptr && g_pump_render_refs > 0)
+            g_pump_viewport->bDisableWorldRendering = g_pump_saved_disable_world_rendering ? 1 : 0;
+        g_pump_render_refs = 0;
+    }
+
+    for (const std::shared_ptr<CancelGate>& gate : drawing) {
+        // Registered -> Drawing. Past this point the request belongs to the render thread and can
+        // only be flushed, never abandoned. Both sides of this CAS run on the game thread, so it
+        // cannot lose the race; a failure means cancelAllPending already claimed the request.
+        uint8 expected = CancelGate::Registered;
+        if (!gate->state.compare_exchange_strong(expected, CancelGate::Drawing))
+            continue;
+
+        if (gate->owner != nullptr)
+            gate->owner->onDrawnOnGameThread();
+    }
+}
+
+void RenderRequest::endDrawPumpShutdown()
+{
+    check(IsInGameThread());
+
+    FScopeLock lock(&g_pump_mutex);
+    if (g_pump_viewport != nullptr) {
+        if (g_pump_handle.IsValid())
+            g_pump_viewport->OnEndDraw().Remove(g_pump_handle);
+        if (g_pump_render_refs > 0)
+            g_pump_viewport->bDisableWorldRendering = g_pump_saved_disable_world_rendering ? 1 : 0;
+    }
+    g_pump_handle.Reset();
+    g_pump_viewport = nullptr;
+    g_pump_waiting.Reset();
+    g_pump_render_refs = 0;
+}
+
+// ⚠ ONE COPY, called by BOTH the pump and the legacy path. This is the body that used to be inline
+// in getScreenshot's OnEndDraw lambda, moved verbatim - which is what makes airsim.EndDrawPump a
+// genuine A/B of the REGISTRATION and nothing else.
+void RenderRequest::onDrawnOnGameThread()
+{
+    check(IsInGameThread());
+
+    // I-G Step 0a: end of segment (b) - the wait for the next rendered frame. This is the boundary
+    // that decides latency-bound vs readback-bound.
+    if (timing_enabled_)
+        timing_.t_end_draw = AirSimImageTiming::Clock::now();
+
+    // Capture instant for the whole batch, taken with the poses so time and pose agree. This is the
+    // moment every image in the batch actually corresponds to; the serial GPU render and readback
+    // that follow add latency, not temporal skew.
+    batch_time_stamp_ = msr::airlib::ClockFactory::get()->nowNanos();
+
+    // capture CameraPose for this frame
+    query_camera_pose_cb_();
+
+    // The completion is called immediately after GameThread sends the rendering commands to
+    // RenderThread. Hence our ExecuteTask will execute *immediately* after RenderThread renders the
+    // scene.
+    RenderRequest* This = this;
+    ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)
+    (
+        [This](FRHICommandListImmediate& RHICmdList) {
+            This->ExecuteTask();
+        });
 }
 
 // read pixels from render target using render thread, then compress the result into PNG
@@ -377,46 +572,38 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
             if (timing_on)
                 timing_.t_game_task = AirSimImageTiming::Clock::now();
 
-            saved_DisableWorldRendering_ = game_viewport_->bDisableWorldRendering;
-            game_viewport_->bDisableWorldRendering = 0;
-            end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this, timing_on, gate] {
-                check(IsInGameThread());
+            timing_enabled_ = timing_on;
 
-                // Past this point the request belongs to the render thread and can no longer be
-                // abandoned - only flushed. Both sides of this CAS run on the game thread, so it
-                // cannot lose the race; it is here to make the ownership handover explicit.
-                uint8 draw_expected = CancelGate::Registered;
-                if (!gate->state.compare_exchange_strong(draw_expected, CancelGate::Drawing))
-                    return;
+            if (CVarEndDrawPump.GetValueOnGameThread() != 0) {
+                // B2 step 3. Enrol with the process-wide pump. It performs the Registered ->
+                // Drawing CAS and calls onDrawnOnGameThread() on the next drawn frame.
+                endDrawPumpEnroll(game_viewport_, gate);
+            }
+            else {
+                // ⚠ LEGACY (airsim.EndDrawPump 0). Preserved verbatim, self-removal and all, so the
+                // pump can be A/B'd in one build. It is UNSAFE with more than one request in flight
+                // - the Remove below runs inside this very delegate's broadcast. Do not "clean this
+                // up": the fault IS the point of keeping it.
+                saved_DisableWorldRendering_ = game_viewport_->bDisableWorldRendering;
+                game_viewport_->bDisableWorldRendering = 0;
+                end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this, gate] {
+                    check(IsInGameThread());
 
-                // I-G Step 0a: end of segment (b) - the wait for the next rendered frame. This is
-                // the boundary that decides latency-bound vs readback-bound.
-                if (timing_on)
-                    timing_.t_end_draw = AirSimImageTiming::Clock::now();
+                    // Past this point the request belongs to the render thread and can no longer be
+                    // abandoned - only flushed. Both sides of this CAS run on the game thread, so it
+                    // cannot lose the race; it is here to make the ownership handover explicit.
+                    uint8 draw_expected = CancelGate::Registered;
+                    if (!gate->state.compare_exchange_strong(draw_expected, CancelGate::Drawing))
+                        return;
 
-                // Capture instant for the whole batch, taken with the poses so time and pose agree.
-                // This is the moment every image in the batch actually corresponds to; the serial
-                // GPU render and readback that follow add latency, not temporal skew.
-                batch_time_stamp_ = msr::airlib::ClockFactory::get()->nowNanos();
+                    onDrawnOnGameThread();
 
-                // capture CameraPose for this frame
-                query_camera_pose_cb_();
+                    game_viewport_->bDisableWorldRendering = saved_DisableWorldRendering_;
 
-                // The completion is called immeidately after GameThread sends the
-                // rendering commands to RenderThread. Hence, our ExecuteTask will
-                // execute *immediately* after RenderThread renders the scene!
-                RenderRequest* This = this;
-                ENQUEUE_RENDER_COMMAND(SceneDrawCompletion)
-                (
-                    [This](FRHICommandListImmediate& RHICmdList) {
-                        This->ExecuteTask();
-                    });
-
-                game_viewport_->bDisableWorldRendering = saved_DisableWorldRendering_;
-
-                assert(end_draw_handle_.IsValid());
-                game_viewport_->OnEndDraw().Remove(end_draw_handle_);
-            });
+                    assert(end_draw_handle_.IsValid());
+                    game_viewport_->OnEndDraw().Remove(end_draw_handle_);
+                });
+            }
 
             // while we're still on GameThread, enqueue request for capture the scene!
             for (unsigned int i = 0; i < req_size_; ++i) {

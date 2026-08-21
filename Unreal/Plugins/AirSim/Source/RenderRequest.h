@@ -106,7 +106,50 @@ public:
     // getScreenshot. Releases every waiter it is safe to release and flushes the rest.
     static void cancelAllPending();
 
+    // ⚠ GAME THREAD ONLY. B2 step 3. Drops the process-wide OnEndDraw registration and restores the
+    // viewport flag it borrowed. Call it when the viewport is about to die (PIE EndPlay): the pump
+    // holds a RAW UGameViewportClient* and must not outlive it. Idempotent, and a later enrol
+    // re-registers against whatever viewport the next PIE session builds. Harmless with the pump
+    // switched off - there is simply nothing registered to drop.
+    static void endDrawPumpShutdown();
+
 private:
+    // ─── B2 step 3: the OnEndDraw pump ───────────────────────────────────────────────────────────
+    //
+    // ⚠ WHAT WAS WRONG. getScreenshot registered a per-request OnEndDraw handler that did, in
+    // effect:
+    //
+    //     end_draw_handle_ = viewport->OnEndDraw().AddLambda([this, gate]{
+    //         ... ;
+    //         viewport->OnEndDraw().Remove(end_draw_handle_);   // <- FROM INSIDE ITS OWN BROADCAST
+    //     });
+    //
+    // Removing a delegate from inside the multicast that is currently iterating it is the classic
+    // UE mutate-during-broadcast fault. With ONE request in flight it survives; with two it does
+    // not, and that is exactly why airsim.StreamCaptureInFlight > 1 SIGSEGV'd reading address 0
+    // (the note on CVarStreamCaptureInFlight in SimModeBase.cpp records the measurement: 7.1 fps and
+    // then a crash). Two concurrent requests ALSO raced on the single shared viewport flag
+    // bDisableWorldRendering, each saving and restoring it without knowing about the other.
+    //
+    // WHAT THE PUMP DOES. One registration per viewport, never touched from inside its own
+    // broadcast - the broadcast only drains a list of enrolled gates. bDisableWorldRendering is
+    // REFCOUNTED, so N concurrent requests borrow and return it once between them. Requests enrol in
+    // the Registered state and are all dispatched by the next drawn frame's single broadcast, which
+    // is also what lets several batches share one frame instead of each waiting for its own.
+    //
+    // ⚠ IT IS A SWITCH, NOT A REPLACEMENT: airsim.EndDrawPump 0 restores the legacy per-request
+    // registration exactly, the same way airsim.GpuReadback 0 restores the legacy readback. What
+    // decides which path CANCELS a request is whether it holds a delegate handle, never a re-read of
+    // the CVar - see cancelRegisteredOnGameThread.
+    static void endDrawPumpEnroll(UGameViewportClient* viewport, const std::shared_ptr<CancelGate>& gate);
+    static void endDrawPumpWithdraw(const std::shared_ptr<CancelGate>& gate);
+    static void endDrawPumpBroadcast();
+
+    // The per-request half of what the OnEndDraw handler does: stamp, snapshot poses, enqueue the
+    // completion command. Game thread only, and only in the Drawing state. BOTH paths call it, so
+    // there is exactly one copy of this body and the two arms of the A/B cannot drift.
+    void onDrawnOnGameThread();
+
     static FReadSurfaceDataFlags setupRenderResource(const FTextureRenderTargetResource* rt_resource, const RenderParams* params, RenderResult* result, FIntPoint& size);
 
     // Phase 3b step 4. Cube faces -> generic camera image, into the existing output target, at
@@ -163,10 +206,17 @@ private:
     // and not a member value: after cancellation the RenderRequest itself is gone.
     std::shared_ptr<CancelGate> gate_;
 
+    // ⚠ These two are the LEGACY path's state (airsim.EndDrawPump 0) and are deliberately kept.
+    // Under the pump they stay untouched - end_draw_handle_ never becomes valid - and that is
+    // precisely what cancelRegisteredOnGameThread uses to tell the two paths apart.
     bool saved_DisableWorldRendering_ = false;
     UGameViewportClient * const game_viewport_;
     FDelegateHandle end_draw_handle_;
     std::function<void()> query_camera_pose_cb_;
+
+    // Whether I-G timing was on when this request entered getScreenshot. Was a lambda capture; it
+    // has to be a member now that onDrawnOnGameThread is shared between the two paths.
+    bool timing_enabled_ = false;
 
     // Instant the whole batch was captured, sampled on the game thread in OnEndDraw next to
     // query_camera_pose_cb_ (the same instant the camera poses are snapshotted). Every capture in

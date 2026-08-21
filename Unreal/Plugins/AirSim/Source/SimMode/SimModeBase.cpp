@@ -1403,27 +1403,30 @@ static TAutoConsoleVariable<FString> CVarStreamCaptureTopics(
 
 /** How many full batches may be IN FLIGHT at once.
  *
- *  ⚠⚠ DEFAULT 1, AND >1 IS KNOWN UNSAFE. Tried 2026-08-21 to lift the serial driver's 3.25 Hz cap
- *  at 19 streams. It does not work at this layer, and the failure is structural, not tuning:
+ *  ⚠ HISTORY, because the default staying at 1 is now a CHOICE and not a limitation.
  *
- *    RenderRequest::getScreenshot registers an OnEndDraw handler and then REMOVES IT FROM INSIDE
- *    THAT HANDLER'S OWN BROADCAST (RenderRequest.cpp:259 and :288). With two concurrent requests
- *    both registered, each removes itself while the multicast delegate is still iterating - the
- *    classic UE mutate-during-broadcast crash. Two instances also race on the shared
- *    game_viewport_->bDisableWorldRendering save/restore.
+ *  >1 used to SIGSEGV. The cause was structural, not tuning: RenderRequest::getScreenshot registered
+ *  an OnEndDraw handler and then REMOVED IT FROM INSIDE THAT HANDLER'S OWN BROADCAST, and two
+ *  concurrent requests therefore mutated the multicast delegate while it was iterating. They also
+ *  raced on the single shared game_viewport_->bDisableWorldRendering save/restore. Measured before
+ *  it died: 7.1 fps at 2 Hz against the serial driver's 106.1 fps, then a crash reading address 0.
  *
- *  Measured before it died: 7.1 fps at 2 Hz against the SERIAL driver's 106.1 fps at the same rate,
- *  then SIGSEGV reading address 0. A 15x frame-rate regression and a crash, not a speed-up.
+ *  B2 step 3 removed both races. There is now ONE process-wide OnEndDraw registration owned by the
+ *  pump in RenderRequest.cpp, it is never touched from inside its own broadcast, and the viewport
+ *  flag is refcounted across concurrent borrowers. See endDrawPumpEnroll in RenderRequest.h.
  *
- *  ⚠ The cap is real and worth lifting - but the fix belongs in B2, where ONE scheduled render
- *  serves every consumer from a single OnEndDraw registration. Overlapping independent
- *  RenderRequests cannot be made safe by a driver-side knob. Kept at 1 so the finding is recorded
- *  rather than rediscovered. */
+ *  ⚠ THAT FIX IS CONDITIONAL ON airsim.EndDrawPump 1 (its default). With the pump switched OFF this
+ *  CVar is back to being a crash, because the legacy registration it restores is the original UB.
+ *  Anything above 1 here requires the pump.
+ *
+ *  ⚠ THE DEFAULT STAYS 1 UNTIL THE SOAK PASSES. Raise it deliberately and measure; do not assume a
+ *  higher number is better. Each worker is a whole extra batch of GPU work in the same frame, and
+ *  §4's numbers say this rig is render-thread bound, not latency bound, above about 3.5 Hz. */
 static TAutoConsoleVariable<int32> CVarStreamCaptureInFlight(
     TEXT("airsim.StreamCaptureInFlight"),
     1,
     TEXT("Phase E: concurrent full-batch captures. 1 = serial (default).\n")
-    TEXT("⚠ >1 CRASHES: concurrent RenderRequests race on OnEndDraw. Needs B2, not this knob."),
+    TEXT("Safe for >1 since B2 step 3 (single OnEndDraw registration); measure before raising."),
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarStreamCaptureHz(
@@ -1431,6 +1434,96 @@ static TAutoConsoleVariable<float> CVarStreamCaptureHz(
     0.0f,
     TEXT("Phase E: capture rate for the stream driver. 0 = off (default)."),
     ECVF_Default);
+
+// ---------------------------------------------------------------------------------------------
+// B2 step 2 - the capture scheduler skeleton.
+//
+// WHAT IT WILL BE: one scheduled render per frame whose results are served to every consumer, so
+// that the RPC path and the stream driver stop each triggering their own render of the same camera,
+// and so that the OnEndDraw registration is owned by ONE party (step 3) instead of by every request.
+//
+// WHAT IT IS AT STEP 2: the clock, and nothing else. It renders nothing. This exists as its own
+// step because the first thing that has to be proved about a scheduler is that turning it OFF costs
+// nothing - and that is only checkable against a baseline that the scheduler code is already
+// compiled into.
+//
+// ⚠ A CVAR, NOT A SETTING - and this is a decision, not an oversight. PHASE-B-PLAN §2 proposed the
+// period come from settings.json as CaptureScheduler.Hz. A settings file can only be chosen at PIE
+// START and never from the command line, so every A/B of scheduler-on against scheduler-off would
+// cost a PIE restart, and the two arms would not share a warmed scene, a warmed shader cache or a
+// warmed DDC - which is exactly the class of difference that has produced misleading numbers in
+// this project before. The CVar can be flipped over RPC in the middle of one run. If a settings key
+// is wanted later for archived provenance, it should be ADDED with the CVar overriding it, the same
+// arrangement airsim.BatchImageTimestamp already has with ImageTimestampAtCapture.
+static TAutoConsoleVariable<float> CVarCaptureSchedulerHz(
+    TEXT("airsim.CaptureSchedulerHz"),
+    0.0f,
+    TEXT("B2: capture scheduler rate in Hz. 0 = off (default).\n")
+    TEXT("Step 2 is the clock only - it counts periods and renders nothing."),
+    ECVF_Default);
+
+/** B2. Print what the scheduler has done since it was last turned on. */
+static FAutoConsoleCommand CmdCaptureSchedulerStats(
+    TEXT("airsim.CaptureSchedulerStats"),
+    TEXT("B2: print the capture scheduler's period count and configured rate."),
+    FConsoleCommandDelegate::CreateLambda([]() {
+        UE_LOG(LogTemp, Log, TEXT("[AirSim][b2] scheduler hz=%.2f"),
+               CVarCaptureSchedulerHz.GetValueOnGameThread());
+    }));
+
+void ASimModeBase::captureSchedulerTick(float delta_seconds)
+{
+    // ⚠ OFF MUST COST NOTHING, and "nothing" is meant literally: one CVar read, one float compare,
+    // and a return. No allocation, no lock, no map lookup, no log. The step-2 exit criterion is
+    // that the 19-stream numbers in NEXT-SESSION-B2 §4 reproduce within run-to-run noise with this
+    // code compiled in and hz at 0 - if anything expensive creeps above this line, that check stops
+    // measuring what it claims to measure and the whole B2 baseline is worthless.
+    const float hz = CVarCaptureSchedulerHz.GetValueOnGameThread();
+    if (hz <= 0.0f) {
+        if (capture_scheduler_active_) {
+            capture_scheduler_active_ = false;
+            UE_LOG(LogTemp, Log, TEXT("[AirSim][b2] capture scheduler stopped after %llu period(s)"),
+                   (unsigned long long)capture_scheduler_periods_);
+        }
+        return;
+    }
+
+    if (!capture_scheduler_active_) {
+        capture_scheduler_active_ = true;
+        capture_scheduler_accum_ = 0.0;
+        capture_scheduler_last_report_ = 0.0;
+        capture_scheduler_periods_ = 0;
+        UE_LOG(LogTemp, Log, TEXT("[AirSim][b2] capture scheduler started at %.2f Hz (skeleton: renders nothing)"), hz);
+    }
+
+    const double period = 1.0 / (double)hz;
+    capture_scheduler_accum_ += (double)delta_seconds;
+    capture_scheduler_last_report_ += (double)delta_seconds;
+
+    // ⚠ Drop missed periods rather than accumulating them. If the scheduler falls behind - and at
+    // 19 x 1080p it will - catching up means firing a burst of back-to-back captures at exactly the
+    // moment the frame is already over budget. That is the 287 ms cluster in §4 made worse on
+    // purpose. A late period is skipped; the rate is a ceiling, never a debt.
+    int fired = 0;
+    while (capture_scheduler_accum_ >= period) {
+        capture_scheduler_accum_ -= period;
+        ++fired;
+    }
+    if (fired > 1)
+        capture_scheduler_accum_ = 0.0;
+    capture_scheduler_periods_ += (uint64)(fired > 0 ? 1 : 0);
+
+    // Step 2 fires nothing. Step 4 replaces this comment with the collect-and-submit pass.
+
+    if (capture_scheduler_last_report_ >= 5.0) {
+        UE_LOG(LogTemp, Log, TEXT("[AirSim][b2] scheduler: %llu period(s) in %.1f s (want %.2f Hz, got %.2f Hz)"),
+               (unsigned long long)capture_scheduler_periods_, capture_scheduler_last_report_, hz,
+               (double)capture_scheduler_periods_ / capture_scheduler_last_report_);
+        capture_scheduler_periods_ = 0;
+        capture_scheduler_last_report_ = 0.0;
+    }
+}
+
 
 void ASimModeBase::startStreamCapture()
 {
@@ -1443,6 +1536,13 @@ void ASimModeBase::startStreamCapture()
     //Fixed at start: changing the worker count at runtime would mean joining live threads
     //mid-capture. The rate CVar is the runtime knob; this one is a restart-scoped choice.
     const int workers = FMath::Clamp(CVarStreamCaptureInFlight.GetValueOnAnyThread(), 1, 8);
+
+    // ⚠ Log the count that was ACTUALLY used. The CVar is read once, here, at BeginPlay - setting it
+    // over RPC during a PIE session changes nothing until the next Stop/Play, and a soak that
+    // believes it is testing 2 workers while running 1 proves nothing. This line is how the harness
+    // confirms which arm it measured.
+    UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] capture driver starting with %d worker(s) in flight"), workers);
+
     for (int k = 0; k < workers; ++k)
         stream_capture_threads_.emplace_back([this, k, workers]() { this->streamCaptureLoop(k, workers); });
 }
@@ -1579,6 +1679,12 @@ void ASimModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
     // rebuilds the segments at the new scene's sizes.
     // ⚠ Stop the driver BEFORE world_sim_api_ is reset below - it dereferences it every cycle.
     stopStreamCapture();
+
+    // ⚠ B2 step 3. The pump holds a RAW UGameViewportClient* and a delegate handle into it. This
+    // PIE session's viewport is about to be destroyed, so the registration has to go with it -
+    // AFTER stopStreamCapture, so that anything still enrolled has already been cancelled or
+    // flushed, and BEFORE the world tears down. A later PIE session re-registers on first enrol.
+    RenderRequest::endDrawPumpShutdown();
 
     msr::airlib::SensorStream::singleton().setSink(nullptr);
     msr::airlib::SensorStream::singleton().resetStats();
@@ -1755,6 +1861,10 @@ void ASimModeBase::setupPhysicsLoopPeriod()
 
 void ASimModeBase::Tick(float DeltaSeconds)
 {
+    // B2. First in the tick so its period is measured against the frame boundary and not against
+    // whatever the rest of this function happens to cost today. A no-op while the scheduler is off.
+    captureSchedulerTick(DeltaSeconds);
+
     if (isRecording())
         ++record_tick_count;
 

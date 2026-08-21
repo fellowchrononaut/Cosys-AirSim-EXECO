@@ -340,6 +340,21 @@ private:
     void streamCaptureLoop(int worker_index, int worker_count);
     std::vector<std::thread> stream_capture_threads_;
     std::atomic<bool> stream_capture_run_{ false };
+
+    // B2 - the capture scheduler. GAME THREAD ONLY; driven from ASimModeBase::Tick.
+    //
+    // ⚠ Unlike the Phase E driver above, this one MAY live on the game thread, because it never
+    // blocks on a capture: it decides *when* a capture is due and nothing else. The moment it is
+    // given something that waits on RenderRequest::getScreenshot, that stops being true and the
+    // self-deadlock in the note above comes straight back.
+    //
+    // Step 2 is the skeleton only: it counts periods and reports them. Default OFF, and off is one
+    // CVar read plus a return - see captureSchedulerTick for why that matters.
+    void captureSchedulerTick(float delta_seconds);
+    bool capture_scheduler_active_ = false;
+    double capture_scheduler_accum_ = 0.0;
+    double capture_scheduler_last_report_ = 0.0;
+    uint64 capture_scheduler_periods_ = 0;
     std::unique_ptr<msr::airlib::ApiProvider> api_provider_;
     //std::unique_ptr<msr::airlib::ApiServerBase> api_server_;
     std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> api_servers_;
