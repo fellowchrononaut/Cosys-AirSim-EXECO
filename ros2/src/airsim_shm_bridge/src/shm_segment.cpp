@@ -1,4 +1,5 @@
 #include "airsim_shm_bridge/shm_segment.hpp"
+#include <string>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -54,6 +55,19 @@ Segment * Segment::open(const std::string & path, std::string & error)
   std::memcpy(&hdr, addr, sizeof(hdr));
   if (hdr.magic != kMagic) {
     error = "bad magic - not an AirSim stream segment";
+    ::munmap(addr, st.st_size);
+    ::close(fd);
+    return nullptr;
+  }
+  // ⚠ THERE WAS NO VERSION CHECK UNTIL 2026-08-21, and magic alone is not enough. Wire version 2
+  // appended intrinsics to StreamFrameMeta (96 -> 152 bytes), which moved EVERY payload offset. A
+  // reader built against version 1 finds the right magic, computes the old offset, and returns
+  // pixels from the middle of the previous field — a well-formed, completely wrong image, with
+  // nothing to indicate anything went wrong. Refusing loudly is the entire point.
+  if (hdr.version != kSupportedVersion) {
+    error = "wire version " + std::to_string(hdr.version) + ", this build speaks " +
+      std::to_string(kSupportedVersion) +
+      " - rebuild the bridge against the sim it is reading";
     ::munmap(addr, st.st_size);
     ::close(fd);
     return nullptr;

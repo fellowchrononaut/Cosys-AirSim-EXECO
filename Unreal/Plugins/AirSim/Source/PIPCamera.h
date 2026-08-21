@@ -12,6 +12,7 @@
 #include <Engine/StaticMesh.h>
 #include "common/AirSimSettings.hpp"
 #include "NedTransform.h"
+#include <limits>
 #include "DetectionComponent.h"
 #include "CubeResample.h"
 
@@ -105,6 +106,27 @@ public:
     // component or render target is ever constructed. The face-orientation convention is stated
     // in full above getCubeFaceRotation() in PIPCamera.cpp - read it before consuming a face.
     bool hasCameraModel() const;
+
+    /// The declared camera model. Type is CameraModelType::None when no CameraModel block was
+    /// present, which is deliberately distinguishable from "pinhole with defaults" - a consumer
+    /// must be able to tell "nobody said" from "somebody said pinhole".
+    const msr::airlib::cameras::CameraModelParams& cameraModelParams() const
+    {
+        return sensor_params_.camera_model.model;
+    }
+
+    /// Horizontal FOV in degrees for one image type, or NaN if that type has no capture setting.
+    /// ⚠ For a camera with NO CameraModel block this is the ONLY description of its projection.
+    /// The sim renders it as an ideal pinhole at exactly this FOV, so fx is not a guess or a fit —
+    /// it is derivable in closed form, and refusing to publish it would leave 16 of 19 streams with
+    /// no intrinsics at all while the information sat right here.
+    double fovDegreesFor(int image_type) const
+    {
+        const auto it = sensor_params_.capture_settings.find(image_type);
+        return it == sensor_params_.capture_settings.end()
+                   ? std::numeric_limits<double>::quiet_NaN()
+                   : it->second.fov_degrees;
+    }
     bool usesNativeGeerBackend() const;
     int getCubeFaceCount() const;
     int getCubeFaceResolution() const;

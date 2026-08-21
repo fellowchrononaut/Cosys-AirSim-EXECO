@@ -11,6 +11,7 @@
 #include "ImageUtils.h"
 #include "UnrealImageCapture.h"   // D9 fleet batch: CameraResponsePair, collectRenderParams, fillResponseFromResult
 #include "RenderRequest.h"
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
@@ -1082,8 +1083,84 @@ static FAutoConsoleCommand CmdStreamStats(
 
 namespace
 {
+    /// Fill the intrinsics that travel with the frame. Leaves type 0 (None) when the camera
+    /// declared no CameraModel block — "nobody said" must stay distinguishable from "pinhole with
+    /// defaults", because a consumer can reasonably refuse the former and cannot detect the latter.
+    void fillCameraModel(const UnrealImageCapture* capture,
+                         const std::string& camera_name,
+                         int image_type,
+                         uint32_t frame_width,
+                         uint32_t frame_height,
+                         msr::airlib::StreamCameraModel& out)
+    {
+        if (capture == nullptr)
+            return;
+        const auto* m = capture->cameraModelFor(camera_name);
+
+        //⚠ MOST CAMERAS DECLARE NO CameraModel BLOCK. They are configured with FOV_Degrees in
+        //CaptureSettings, and the sim renders them as an ideal pinhole at exactly that FOV — so
+        //fx = (w/2) / tan(fov/2) is closed-form, not a fit and not a guess. Without this, 16 of
+        //the 19 streams on the standard rig would carry no intrinsics at all while the information
+        //needed to produce them sat one lookup away. `reserved` bit 0 marks the result as DERIVED,
+        //so a consumer can still tell it apart from an explicitly calibrated block.
+        if (m == nullptr || m->type == msr::airlib::cameras::CameraModelType::None) {
+            const double fov = capture->fovDegreesFor(camera_name, image_type);
+            if (!std::isfinite(fov) || fov <= 0.0 || fov >= 180.0 ||
+                frame_width == 0 || frame_height == 0)
+                return;
+            const double fx = (frame_width * 0.5) / std::tan(fov * M_PI / 360.0);
+            out.type = static_cast<uint8_t>(msr::airlib::cameras::CameraModelType::Pinhole);
+            out.param_count = 0;
+            out.reserved = 1;                       //bit 0: derived from FOV_Degrees
+            out.model_width = static_cast<uint16_t>(frame_width);
+            out.model_height = static_cast<uint16_t>(frame_height);
+            out.fx = static_cast<float>(fx);
+            out.fy = static_cast<float>(fx);        //square pixels: UE renders with one FOV axis
+            out.cx = static_cast<float>(frame_width * 0.5);
+            out.cy = static_cast<float>(frame_height * 0.5);
+            return;
+        }
+
+        out.type = static_cast<uint8_t>(m->type);
+        out.model_width = static_cast<uint16_t>(m->width);
+        out.model_height = static_cast<uint16_t>(m->height);
+
+        //⚠ NaN means "not supplied" in CameraModelParams (Pinhole then derives fx/fy from
+        //fov_degrees). Publishing a NaN intrinsic would produce a CameraInfo that poisons every
+        //projection downstream, so an unresolved model is published as type None instead — a
+        //consumer that gets nothing knows it got nothing.
+        if (!(std::isfinite(m->fx) && std::isfinite(m->fy) &&
+              std::isfinite(m->cx) && std::isfinite(m->cy))) {
+            out.type = 0;
+            return;
+        }
+        out.fx = static_cast<float>(m->fx);
+        out.fy = static_cast<float>(m->fy);
+        out.cx = static_cast<float>(m->cx);
+        out.cy = static_cast<float>(m->cy);
+
+        switch (m->type) {
+        case msr::airlib::cameras::CameraModelType::DoubleSphere:
+            out.param_count = 2;
+            out.params[0] = static_cast<float>(m->xi);
+            out.params[1] = static_cast<float>(m->alpha);
+            break;
+        case msr::airlib::cameras::CameraModelType::KannalaBrandt:
+            out.param_count = 4;
+            out.params[0] = static_cast<float>(m->k1);
+            out.params[1] = static_cast<float>(m->k2);
+            out.params[2] = static_cast<float>(m->k3);
+            out.params[3] = static_cast<float>(m->k4);
+            break;
+        default:
+            out.param_count = 0;   //Pinhole and Raymap carry no distortion parameters here
+            break;
+        }
+    }
+
     void publishToSensorStream(const std::string& vehicle_name,
-                               const msr::airlib::ImageCaptureBase::ImageResponse& response)
+                               const msr::airlib::ImageCaptureBase::ImageResponse& response,
+                               const UnrealImageCapture* capture)
     {
         auto& stream = msr::airlib::SensorStream::singleton();
         if (!stream.enabled())
@@ -1111,6 +1188,9 @@ namespace
         meta.pixels_as_float = response.pixels_as_float ? 1 : 0;
         meta.channels = response.pixels_as_float ? 1 : 3;
         meta.setNames(vehicle_name, response.camera_name);
+        fillCameraModel(capture, response.camera_name,
+                        msr::airlib::Utils::toNumeric(response.image_type),
+                        meta.width, meta.height, meta.camera_model);
         //after setNames: the topic is derived from the names, and the sequence is per topic
         meta.sequence = stream.nextSequence(msr::airlib::LoopbackSink::topicOf(meta));
 
@@ -1127,9 +1207,21 @@ std::vector<WorldSimApi::ImageCaptureBase::ImageResponse> WorldSimApi::getImages
     camera->getImages(requests, responses);
 
     for (const auto& response : responses)
-        publishToSensorStream(vehicle_name, response);
+        publishToSensorStream(vehicle_name, response, camera);
 
     return responses;
+}
+
+void WorldSimApi::ensureCaptureTypesEnabled(
+    const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const
+{
+    check(IsInGameThread());
+    for (const auto& kv : vehicle_requests) {
+        if (kv.second.empty()) continue;
+        const UnrealImageCapture* capture = simmode_->getImageCapture(kv.first);
+        if (capture != nullptr)
+            capture->ensureCameraTypesEnabled(kv.second);
+    }
 }
 
 std::map<std::string, std::vector<WorldSimApi::ImageCaptureBase::ImageResponse>>
@@ -1198,7 +1290,8 @@ WorldSimApi::getImagesAllVehicles(
             if (idx < all_results.size() && j < reqs.size() && all_results[idx] != nullptr)
                 assembled_bytes += UnrealImageCapture::fillResponseFromResult(
                     reqs[j], *all_results[idx], all_responses[idx]);
-            publishToSensorStream(entry.first, all_responses[idx]);
+            publishToSensorStream(entry.first, all_responses[idx],
+                                  simmode_->getImageCapture(entry.first));
             per_vehicle.push_back(all_responses[idx]);
         }
         out.emplace(entry.first, std::move(per_vehicle));

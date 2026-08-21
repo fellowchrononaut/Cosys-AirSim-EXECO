@@ -36,6 +36,27 @@ struct ShmHeader
   uint64_t newest_index;   // monotonic frame count, NOT a ring index; slot = (n-1) % slot_count
 };
 
+/// Mirror of msr::airlib::StreamCameraModel. Intrinsics travel WITH the frame so the stream is
+/// self-describing and cannot disagree with the pixels it accompanies.
+///
+/// `params` is model-specific, which is what lets a new model cost an enum value instead of another
+/// wire break:  DoubleSphere -> [xi, alpha];  KannalaBrandt -> [k1..k4];  Pinhole -> none.
+struct StreamCameraModel
+{
+  uint8_t type;            // 0 None, 1 Pinhole, 2 KannalaBrandt, 3 DoubleSphere, 4 Raymap
+  uint8_t param_count;
+  uint16_t model_width;    // the resolution the INTRINSICS were authored at, not the frame's
+  uint16_t model_height;
+  uint16_t reserved;
+  float fx, fy, cx, cy;
+  float params[8];
+};
+
+enum : uint8_t
+{
+  kModelNone = 0, kModelPinhole = 1, kModelKannalaBrandt = 2, kModelDoubleSphere = 3, kModelRaymap = 4
+};
+
 struct StreamFrameMeta
 {
   uint64_t timestamp_ns;   // CAPTURE instant, sampled with the camera poses - not publish time
@@ -49,11 +70,17 @@ struct StreamFrameMeta
   uint8_t reserved;
   char vehicle[32];
   char camera[32];
+  StreamCameraModel camera_model;   // appended in wire version 2
 };
 #pragma pack(pop)
 
 static_assert(sizeof(ShmHeader) == 32, "ShmHeader layout drifted from the sim's");
-static_assert(sizeof(StreamFrameMeta) == 96, "StreamFrameMeta layout drifted from the sim's");
+static_assert(sizeof(StreamCameraModel) == 56, "StreamCameraModel layout drifted from the sim's");
+// ⚠ 96 -> 152 in wire version 2 (intrinsics appended). Every payload offset moved with it, which is
+// why Segment::open must REFUSE a version it does not know rather than read pixels from the wrong
+// place. AirLib/include/stream/SensorStream.hpp carries the matching asserts at the other end.
+static_assert(sizeof(StreamFrameMeta) == 152, "StreamFrameMeta layout drifted from the sim's");
+constexpr uint32_t kSupportedVersion = 2;
 
 /// msr::airlib::ImageCaptureBase::ImageType
 inline const char * imageTypeName(uint8_t t)

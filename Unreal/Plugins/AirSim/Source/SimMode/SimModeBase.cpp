@@ -1589,6 +1589,10 @@ void ASimModeBase::streamCaptureLoop(int worker_index, int worker_count)
     std::string last_spec;
     std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>> requests;
 
+    // ⚠ Set false on every spec change; no capture runs until the game thread has enabled the
+    // components the new spec needs. See the block comment where it is used.
+    std::shared_ptr<std::atomic<bool>> warmed = std::make_shared<std::atomic<bool>>(false);
+
     while (stream_capture_run_.load()) {
         const float hz = CVarStreamCaptureHz.GetValueOnAnyThread();
         if (hz <= 0.0f || world_sim_api_ == nullptr) {
@@ -1624,6 +1628,7 @@ void ASimModeBase::streamCaptureLoop(int worker_index, int worker_count)
                 requests[veh].push_back(ImageCaptureBase::ImageRequest(
                     cam, Utils::toEnum<ImageCaptureBase::ImageType>(type), wantsFloat(type), false));
             }
+            warmed->store(false);   //the new spec may need components nobody has enabled yet
             if (worker_index == 0)
             UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] capture driver: %d vehicle(s), %d topic(s) at %.1f Hz"),
                    (int)requests.size(),
@@ -1634,6 +1639,34 @@ void ASimModeBase::streamCaptureLoop(int worker_index, int worker_count)
 
         if (requests.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        // ⚠ ENABLE CAPTURE COMPONENTS ON THE GAME THREAD BEFORE CAPTURING ANYTHING.
+        //
+        // collectRenderParams enables any component a request needs that is not already on, and
+        // that ends in UActorComponent::Activate() -> FTickFunction::SetTickFunctionEnable, which
+        // mutates UE's TICK TASK MANAGER. That is game-thread-only state, and this loop is a worker
+        // thread. Measured 2026-08-21: SIGSEGV in FTickTaskLevel::RemoveTickFunction, writing to
+        // address 0x3, the first time the driver requested a type that was not yet enabled. It was
+        // invisible for a long time only because everything gets enabled once early and stays on -
+        // it bites when airsim.StreamCaptureTopics introduces something new.
+        //
+        // ⚠ NON-BLOCKING BY DESIGN. The obvious fix - dispatch and wait - rebuilds the PIE-stop
+        // deadlock that §10.2 records: the game thread joins these workers inside EndPlay while a
+        // worker waits on the game thread. So the worker simply does not capture until the flag is
+        // set, and if teardown starts first, stream_capture_run_ drops and it exits instead.
+        if (!warmed->load()) {
+            auto flag = warmed;
+            auto spec_copy = requests;
+            ASimModeBase* self = this;
+            AsyncTask(ENamedThreads::GameThread, [self, flag, spec_copy]() {
+                if (self->world_sim_api_ != nullptr)
+                    static_cast<WorldSimApi*>(self->world_sim_api_.get())
+                        ->ensureCaptureTypesEnabled(spec_copy);
+                flag->store(true);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
         }
 

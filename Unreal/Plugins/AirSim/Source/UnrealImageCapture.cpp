@@ -1,4 +1,5 @@
 #include "UnrealImageCapture.h"
+#include <limits>
 #include "Engine/World.h"
 #include "ImageUtils.h"
 
@@ -67,6 +68,25 @@ APIPCamera* UnrealImageCapture::requireCamera(const std::string& camera_name) co
         "no camera named " +
         (camera_name.empty() ? std::string("\"\" (the default camera)") : "'" + camera_name + "'") +
         " on this vehicle; available: " + available);
+}
+
+const msr::airlib::cameras::CameraModelParams* UnrealImageCapture::cameraModelFor(
+    const std::string& camera_name) const
+{
+    const auto& map = cameras_->getMap();
+    const auto it = map.find(camera_name);
+    if (it == map.end() || it->second == nullptr)
+        return nullptr;
+    return &it->second->cameraModelParams();
+}
+
+double UnrealImageCapture::fovDegreesFor(const std::string& camera_name, int image_type) const
+{
+    const auto& map = cameras_->getMap();
+    const auto it = map.find(camera_name);
+    if (it == map.end() || it->second == nullptr)
+        return std::numeric_limits<double>::quiet_NaN();
+    return it->second->fovDegreesFor(image_type);
 }
 
 void UnrealImageCapture::collectRenderParams(
@@ -341,6 +361,30 @@ void UnrealImageCapture::getSceneCaptureImage(const std::vector<msr::airlib::Ima
                      requests.size(), assembled_bytes);
 }
 
+void UnrealImageCapture::ensureCameraTypesEnabled(
+    const std::vector<msr::airlib::ImageCaptureBase::ImageRequest>& requests) const
+{
+    check(IsInGameThread());
+    for (const auto& request : requests) {
+        const auto& map = cameras_->getMap();
+        const auto it = map.find(request.camera_name);
+        if (it == map.end() || it->second == nullptr)
+            continue;                       //unknown camera: reported elsewhere, not fatal here
+        APIPCamera* camera = it->second;
+        if (request.image_type == ImageType::Annotation &&
+            !camera->GetAnnotationNameExist(request.annotation_name))
+            continue;
+        if (!camera->getCameraTypeEnabled(request.image_type, request.annotation_name))
+            camera->setCameraTypeEnabled(request.image_type, true, request.annotation_name);
+    }
+}
+
+/// ⚠ CALLED FROM NON-GAME THREADS (capture workers, RPC handlers). setCameraTypeEnabled ends in
+/// UActorComponent::Activate(), which mutates the tick task manager and is game-thread-only — so
+/// reaching that branch off-thread is a race that SIGSEGV'd the editor on 2026-08-21. The driver
+/// path now pre-enables on the game thread (see ensureCameraTypesEnabled) so this early-outs.
+/// ⚠ THE RPC PATH IS STILL EXPOSED: a simGetImages for a (camera, type) never requested before can
+/// still reach the Activate branch from an RPC thread. Narrow, pre-existing, and not fixed here.
 bool UnrealImageCapture::updateCameraVisibility(APIPCamera* camera, const msr::airlib::ImageCaptureBase::ImageRequest& request)
 {
     bool visibilityChanged = false;

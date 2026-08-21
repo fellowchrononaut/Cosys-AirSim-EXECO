@@ -119,6 +119,11 @@ public:
     virtual std::vector<float> getDistortionParams(const CameraDetails& camera_details) const override;
 
     virtual std::vector<ImageCaptureBase::ImageResponse> getImages(const std::vector<ImageCaptureBase::ImageRequest>& requests, const std::string& vehicle_name) const override;
+    /// ⚠ GAME THREAD ONLY. Enable the capture components these requests need, before any worker
+    /// thread asks for them. See UnrealImageCapture::ensureCameraTypesEnabled.
+    void ensureCaptureTypesEnabled(
+        const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const;
+
     virtual std::map<std::string, std::vector<ImageCaptureBase::ImageResponse>>
     getImagesAllVehicles(const std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>>& vehicle_requests) const override;
     virtual std::vector<uint8_t> getImage(ImageCaptureBase::ImageType image_type, const CameraDetails& camera_details, const std::string& annotation_name) const override;

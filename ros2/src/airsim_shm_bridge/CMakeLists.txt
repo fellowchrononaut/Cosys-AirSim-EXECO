@@ -19,7 +19,17 @@ target_include_directories(shm_bridge PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 ament_target_dependencies(shm_bridge rclcpp sensor_msgs)
 
-install(TARGETS shm_bridge DESTINATION lib/${PROJECT_NAME})
+# ⚠ The verifier is C++ for the same reason the bridge is: a Python subscriber cannot keep up with
+# 1080p at rate, and its drops would produce FALSE FAILURES on the stereo-pairing check, which works
+# by intersecting timestamp sets across two topics.
+add_executable(shm_verify
+  src/verify_node.cpp
+  src/shm_segment.cpp)
+target_include_directories(shm_verify PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+ament_target_dependencies(shm_verify rclcpp sensor_msgs)
+
+install(TARGETS shm_bridge shm_verify DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 ament_package()

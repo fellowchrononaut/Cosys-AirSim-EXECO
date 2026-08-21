@@ -72,7 +72,10 @@ namespace airlib
     struct ShmHeader
     {
         static constexpr uint32_t kMagic = 0x41535348u; //'ASSH'
-        static constexpr uint32_t kVersion = 1u;
+        //⚠ 2 since 2026-08-21: StreamFrameMeta gained camera_model (StreamCameraModel), which
+        //moves every payload offset. A version-1 consumer MUST refuse a version-2 segment rather
+        //than read pixels from the wrong place.
+        static constexpr uint32_t kVersion = 2u;
 
         uint32_t magic;
         uint32_t version;

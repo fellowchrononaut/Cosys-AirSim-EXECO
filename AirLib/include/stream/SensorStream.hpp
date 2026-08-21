@@ -38,6 +38,40 @@ namespace airlib
 {
     /** What a consumer needs to interpret the bytes, with no pointers and no heap: a sink may write
      *  this straight into shared memory, so it has to stay trivially copyable and fixed-size. */
+    /** Intrinsics travelling WITH the frame, so the stream is self-describing.
+     *
+     *  ⚠ WHY IN THE SEGMENT rather than read from settings.json by the consumer. A consumer that
+     *  parses settings itself can silently describe a DIFFERENT camera than the one that produced
+     *  the pixels — wrong file, edited since launch, or a resolution override in CaptureSettings —
+     *  and the result is intrinsics that look entirely plausible and reproject subtly wrong. That
+     *  is invisible to every integrity check we have. Carrying them beside the payload makes the
+     *  two impossible to disagree.
+     *
+     *  ⚠ TYPE-TAGGED AND FIXED-WIDTH ON PURPOSE. `params` is model-specific, so a new model costs
+     *  an enum value rather than another wire break:
+     *      Pinhole        -> param_count 0 (or 5 for radtan k1,k2,p1,p2,k3 if ever needed)
+     *      KannalaBrandt  -> param_count 4, params = k1..k4
+     *      DoubleSphere   -> param_count 2, params = [xi, alpha]
+     *
+     *  ⚠ model_width/model_height are the resolution the INTRINSICS WERE AUTHORED AT, which is not
+     *  necessarily the frame's. If CaptureSettings renders at another size, fx/fy/cx/cy must be
+     *  scaled by the consumer — and it can only know to do that if both sizes are present. */
+    struct StreamCameraModel
+    {
+        //mirrors msr::airlib::cameras::CameraModelType; 0 = None means "no model was declared",
+        //which is NOT the same as pinhole-with-defaults and must stay distinguishable.
+        uint8_t type = 0;
+        uint8_t param_count = 0;
+        uint16_t model_width = 0;
+        uint16_t model_height = 0;
+        uint16_t reserved = 0;
+
+        //float, not double: these are camera intrinsics, where float carries ~7 significant digits
+        //and a 1920-px sensor needs 4. Halving the struct matters more than digits nobody has.
+        float fx = 0.0f, fy = 0.0f, cx = 0.0f, cy = 0.0f;
+        float params[8] = {};
+    };
+
     struct StreamFrameMeta
     {
         static constexpr int kNameLen = 32;
@@ -54,6 +88,11 @@ namespace airlib
         char vehicle[kNameLen] = {};
         char camera[kNameLen] = {};
 
+        //⚠ Appended at the END, and ShmHeader::kVersion bumped to 2 alongside it. A consumer built
+        //against version 1 reads a struct 56 bytes shorter; the version check is what stops it
+        //reading pixels at the wrong offset rather than merely missing the intrinsics.
+        StreamCameraModel camera_model{};
+
         void setNames(const std::string& vehicle_name, const std::string& camera_name)
         {
             copyName(vehicle, vehicle_name);
@@ -68,6 +107,12 @@ namespace airlib
             dst[n] = '\0';
         }
     };
+
+    //⚠ Pinned at BOTH ends. ros2/src/airsim_shm_bridge/include/airsim_shm_bridge/shm_segment.hpp
+    //carries the mirror of these structs and its own matching asserts; a change here that is not
+    //made there is a silent wire break, and the symptom is pixels read at the wrong offset.
+    static_assert(sizeof(StreamCameraModel) == 56, "StreamCameraModel layout changed - update the ROS bridge mirror");
+    static_assert(sizeof(StreamFrameMeta) == 152, "StreamFrameMeta layout changed - update the ROS bridge mirror and bump kVersion");
 
     /** A destination for published frames. Phase D adds a shared-memory implementation; Phase C
      *  ships only the loopback below, which is enough to prove the seam without a dependency. */

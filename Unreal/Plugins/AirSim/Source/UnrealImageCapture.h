@@ -45,6 +45,27 @@ public:
                              UGameViewportClient*& gameViewport,
                              bool use_safe_method) const;
 
+    /// The declared camera model for one camera, or nullptr if that camera does not exist.
+    /// ⚠ Does not throw: the publish seam runs for every image on every path, including ones where
+    /// a missing camera is already being reported some other way, and an exception there would take
+    /// down a capture that had otherwise succeeded.
+    const msr::airlib::cameras::CameraModelParams* cameraModelFor(const std::string& camera_name) const;
+
+    /// Horizontal FOV for one camera/image-type, or NaN. Used to derive pinhole intrinsics for a
+    /// camera that declared no CameraModel block.
+    double fovDegreesFor(const std::string& camera_name, int image_type) const;
+
+    /// ⚠ GAME THREAD ONLY. Enable every capture component these requests will need, so that the
+    /// later collectRenderParams finds them already on and never activates one off-thread.
+    ///
+    /// WHY THIS EXISTS: enabling a capture component calls UActorComponent::Activate(), which
+    /// mutates UE's TICK TASK MANAGER — game-thread-only state. collectRenderParams runs on capture
+    /// worker threads AND on RPC handler threads, so the first request for a not-yet-enabled
+    /// (camera, type) raced the game thread and SIGSEGV'd in FTickTaskLevel::RemoveTickFunction
+    /// (measured 2026-08-21). Doing it once, up front, on the right thread removes the race for the
+    /// driver path.
+    void ensureCameraTypesEnabled(const std::vector<ImageRequest>& requests) const;
+
     /// Copy one render result into one response. Returns the bytes copied, for the assembly timer.
     static size_t fillResponseFromResult(const ImageRequest& request,
                                          const RenderRequest::RenderResult& result,
