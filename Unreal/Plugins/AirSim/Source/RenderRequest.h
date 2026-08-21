@@ -90,6 +90,9 @@ private:
     void submitGpuReadbacks();
     bool drainGpuReadbacks(TArray<msr::airlib::TTimePoint>& readback_stamps, bool force_blocking);
 
+    // B5. One image's copy out of mapped staging memory. Safe to run concurrently for distinct i.
+    void copyReadbackImage(unsigned int i, const void* raw, int32 row_pitch_in_pixels);
+
     // Post-readback tail: stamps, diagnostics, and the signal that releases getScreenshot.
     void finishTask(const TArray<msr::airlib::TTimePoint>& readback_stamps);
 

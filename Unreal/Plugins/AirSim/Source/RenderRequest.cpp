@@ -52,17 +52,31 @@ TAutoConsoleVariable<int32> CVarLogImageTiming(
 
 /** I-G design #4 A/B switch. Both readback paths are compiled in so one build answers the
  *  question; flipping this needs no rebuild, which matters because a rebuild here is expensive.
- *   0 = legacy per-image blocking RHICmdList.ReadSurfaceData (current shipped behaviour)
+ *   0 = legacy per-image blocking RHICmdList.ReadSurfaceData (the original shipped behaviour)
  *   1 = batched FRHIGPUTextureReadback: all EnqueueCopy submitted, then Lock each
- *   2 = B3 DEFERRED: submit, release the render thread, drain in a later frame
- *  Default 0 so behaviour is unchanged until the measurement says otherwise. */
+ *   2 = B3 DEFERRED: submit, release the render thread, drain in a later frame  <- DEFAULT
+ *
+ *  ⚠ DEFAULT CHANGED 0 -> 2 on 2026-08-21. It was 0 because mode 1 was an unproven experiment and
+ *  mode 2 was new; a readback path stays off until measured. It has now been measured
+ *  (PHASE-A1-RESULTS §23, §24, §26):
+ *
+ *    - sim frame rate under a 16 x 1080p ROS load: 5.6 -> 75.7 fps
+ *    - GPU fence wait on the render thread: ~11 ms -> 0.03 ms
+ *    - output pixel-identical to mode 0 for every modality, pinhole AND cube, verified with the
+ *      sim paused so byte comparison means something
+ *    - clean under 4 concurrent clients on 3 RPC ports, and under simPause
+ *
+ *  The ONE semantic difference: a call now costs about one extra rendered frame of latency,
+ *  because the pixels are collected at the next frame boundary instead of inside the frame that
+ *  drew them. Content is still the CAPTURE instant, not the drain instant, and the timestamp is
+ *  unchanged - both verified. Set airsim.GpuReadback 0 to restore the old path exactly. */
 static TAutoConsoleVariable<int32> CVarGpuReadback(
     TEXT("airsim.GpuReadback"),
-    0,
+    2,
     TEXT("I-G: image readback path.\n")
-    TEXT(" 0: legacy ReadSurfaceData per image, one GPU sync point each (default)\n")
+    TEXT(" 0: legacy ReadSurfaceData per image, one GPU sync point each\n")
     TEXT(" 1: batched FRHIGPUTextureReadback - submit all copies, then drain\n")
-    TEXT(" 2: deferred - submit, free the render thread, drain at a later frame boundary"),
+    TEXT(" 2: deferred - submit, free the render thread, drain at a later frame (DEFAULT)"),
     ECVF_Default);
 
 /** B3. Whether mode 2 also defers CUBE (fisheye) requests. Default ON.
@@ -83,6 +97,23 @@ static TAutoConsoleVariable<int32> CVarLogCubeResample(
     TEXT("airsim.LogCubeResample"),
     0,
     TEXT("B3 test: log the output/face textures each cube resample binds, and whether it ran."),
+    ECVF_Default);
+
+/** B5. Parallelise the staging->CPU copy across the images in a batch.
+ *
+ *  Measured 2026-08-21 at 16 x 1080p: the copy is 80 ms of a ~380 ms c+d under ROS saturation and
+ *  ~52 ms of ~171 ms with a light client - the single largest REMOVABLE term left, now that B3 has
+ *  taken the GPU fence wait to 0.03 ms. It is a plain memcpy out of staging memory, per image and
+ *  independent, so it parallelises the same way airsim.ParallelImageDecode already does (4.2x on
+ *  its own segment). Serialising 16 independent memcpys on the render thread is pure waste.
+ *
+ *  ⚠ Only the COPY is parallel. Lock and Unlock stay serial on the render thread: they touch RHI
+ *  state and the fence, and nothing about this change is worth a threading bug in the RHI. */
+static TAutoConsoleVariable<int32> CVarParallelReadbackCopy(
+    TEXT("airsim.ParallelReadbackCopy"),
+    1,
+    TEXT("B5: 1 = copy the batch's images out of staging memory in parallel (default)\n")
+    TEXT("    0 = serial, one image at a time"),
     ECVF_Default);
 
 /** B3. How many rendered frames a deferred batch may wait for its GPU fence before the drain
@@ -594,6 +625,77 @@ void RenderRequest::submitGpuReadbacks()
 
 }
 
+// B5. The per-image copy out of staging memory, lifted out of the drain loop so it can run
+// either serially or inside a ParallelFor. Touches only results_[i] and the mapped pointer for
+// image i, so concurrent invocations for different i share nothing.
+void RenderRequest::copyReadbackImage(unsigned int i, const void* raw, int32 row_pitch_in_pixels)
+{
+    if (raw == nullptr)
+        return;
+
+    const int32 w = results_[i]->width;
+    const int32 h = results_[i]->height;
+
+    // ⚠ BOTH the GPU format AND the client's request matter, and they DISAGREE routinely.
+    //
+    // The old code dispatched on the GPU format alone, with a comment claiming that
+    // trusting the request "is how you get garbage pixels". The opposite was true. A
+    // SurfaceNormals target is created with auto_format + force_linear_gamma, which
+    // resolves to PF_FloatRGBA, while the client asks for uint8. The format-only dispatch
+    // then filled bmp_float and left bmp EMPTY - and the uint8 formatter in getScreenshot
+    // reads results[i]->bmp unconditionally, walking off an empty TArray.
+    //
+    // That out-of-bounds read is why a SurfaceNormals request came back holding the
+    // PREVIOUS capture's pixels: measured 2026-08-21 with the sim paused, SurfaceNormals
+    // returned mean 225.14 against Segmentation's 225.04 on the cube path, and 253.33
+    // against 253.38 on the pinhole path. Plausible images, entirely wrong content. The
+    // legacy path never had this because RHIReadSurfaceData converts float -> FColor
+    // itself.
+    //
+    // So: convert whenever the pair disagrees. RCM_UNorm + SetLinearToGamma(false) is what
+    // setupRenderResource asks the legacy path for, and ToFColor(false) is its equivalent.
+    const bool want_float = (params_ != nullptr && params_[i] != nullptr)
+                                ? params_[i]->pixels_as_float
+                                : (formats_[(int32)i] == PF_FloatRGBA);
+
+    if (formats_[(int32)i] == PF_B8G8R8A8) {
+        const FColor* src = static_cast<const FColor*>(raw);
+        if (!want_float) {
+            results_[i]->bmp.SetNumUninitialized(w * h, false);
+            FColor* dst = results_[i]->bmp.GetData();
+            for (int32 y = 0; y < h; ++y)
+                FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FColor));
+        }
+        else {
+            results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+            FFloat16Color* dst = results_[i]->bmp_float.GetData();
+            for (int32 y = 0; y < h; ++y)
+                for (int32 x = 0; x < w; ++x)
+                    dst[y * w + x] = FFloat16Color(FLinearColor(src[y * row_pitch_in_pixels + x]));
+        }
+    }
+    else { //PF_FloatRGBA, guaranteed by phase 1
+        const FFloat16Color* src = static_cast<const FFloat16Color*>(raw);
+        if (want_float) {
+            results_[i]->bmp_float.SetNumUninitialized(w * h, false);
+            FFloat16Color* dst = results_[i]->bmp_float.GetData();
+            for (int32 y = 0; y < h; ++y)
+                FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FFloat16Color));
+        }
+        else {
+            results_[i]->bmp.SetNumUninitialized(w * h, false);
+            FColor* dst = results_[i]->bmp.GetData();
+            for (int32 y = 0; y < h; ++y) {
+                for (int32 x = 0; x < w; ++x) {
+                    const FFloat16Color& c = src[y * row_pitch_in_pixels + x];
+                    dst[y * w + x] = FLinearColor(c.R.GetFloat(), c.G.GetFloat(),
+                                                  c.B.GetFloat(), c.A.GetFloat()).ToFColor(false);
+                }
+            }
+        }
+    }
+}
+
 // B3 phase 2. Drain the submitted copies into results_.
 //
 // force_blocking=true  - mode 1 and the deferred fallback: Lock unconditionally, which waits on
@@ -612,96 +714,48 @@ bool RenderRequest::drainGpuReadbacks(TArray<msr::airlib::TTimePoint>& readback_
         }
     }
 
-    // The first Lock waits on its fence; later ones usually return immediately because their
-    // copies were submitted alongside the first.
+    const bool split_on = AirSimImageTiming::ReportPeriodSeconds() > 0;
+
+    // B5 phase 1 - Lock every image first, serially. Lock/Unlock touch RHI state and the GPU
+    // fence, so they stay on the render thread alone; only the memcpy that follows is parallel.
+    // After B3 the fence is already signalled, so these Locks cost ~0.03 ms for the whole batch.
+    TArray<const void*> mapped;
+    TArray<int32> pitches;
+    mapped.SetNumZeroed((int32)req_size_);
+    pitches.SetNumZeroed((int32)req_size_);
+
+    const auto t_lock0 = AirSimImageTiming::Clock::now();
     for (unsigned int i = 0; i < req_size_; ++i) {
-        if (!enqueued_[(int32)i] || results_[i]->width <= 0 || results_[i]->height <= 0) {
-            readback_stamps[(int32)i] = msr::airlib::ClockFactory::get()->nowNanos();
+        if (!enqueued_[(int32)i] || results_[i]->width <= 0 || results_[i]->height <= 0)
             continue;
-        }
-
-        // I-G diagnosis: separate the GPU-completion wait from the CPU copy. Design #4 is dead as
-        // an optimisation, but this is the only place the two are separable, and they want
-        // opposite fixes - a wait cannot be parallelised away, a copy can.
-        const bool split_on = AirSimImageTiming::ReportPeriodSeconds() > 0;
-        const auto t_lock0 = AirSimImageTiming::Clock::now();
-
         int32 row_pitch_in_pixels = 0;
-        void* raw = readbacks_[(int32)i]->Lock(row_pitch_in_pixels);
+        mapped[(int32)i] = readbacks_[(int32)i]->Lock(row_pitch_in_pixels);
+        pitches[(int32)i] = row_pitch_in_pixels;
+    }
+    if (split_on)
+        timing_.lock_ms += AirSimImageTiming::ToMs(AirSimImageTiming::Clock::now() - t_lock0);
 
-        const auto t_lock1 = AirSimImageTiming::Clock::now();
-        if (split_on) {
-            timing_.lock_ms += AirSimImageTiming::ToMs(t_lock1 - t_lock0);
-            timing_.have_split = true;
-        }
+    // B5 phase 2 - the copies. Independent per image: each writes only its own results_[i] buffer.
+    const auto t_copy0 = AirSimImageTiming::Clock::now();
+    const bool parallel = CVarParallelReadbackCopy.GetValueOnRenderThread() != 0 && req_size_ > 1;
+    if (parallel) {
+        ParallelFor((int32)req_size_, [this, &mapped, &pitches](int32 i) {
+            copyReadbackImage((unsigned int)i, mapped[i], pitches[i]);
+        });
+    }
+    else {
+        for (unsigned int i = 0; i < req_size_; ++i)
+            copyReadbackImage(i, mapped[(int32)i], pitches[(int32)i]);
+    }
+    if (split_on)
+        timing_.copy_ms += AirSimImageTiming::ToMs(AirSimImageTiming::Clock::now() - t_copy0);
+    if (split_on)
+        timing_.have_split = true;
 
-        if (raw != nullptr) {
-            const int32 w = results_[i]->width;
-            const int32 h = results_[i]->height;
-
-            // ⚠ BOTH the GPU format AND the client's request matter, and they DISAGREE routinely.
-            //
-            // The old code dispatched on the GPU format alone, with a comment claiming that
-            // trusting the request "is how you get garbage pixels". The opposite was true. A
-            // SurfaceNormals target is created with auto_format + force_linear_gamma, which
-            // resolves to PF_FloatRGBA, while the client asks for uint8. The format-only dispatch
-            // then filled bmp_float and left bmp EMPTY - and the uint8 formatter in getScreenshot
-            // reads results[i]->bmp unconditionally, walking off an empty TArray.
-            //
-            // That out-of-bounds read is why a SurfaceNormals request came back holding the
-            // PREVIOUS capture's pixels: measured 2026-08-21 with the sim paused, SurfaceNormals
-            // returned mean 225.14 against Segmentation's 225.04 on the cube path, and 253.33
-            // against 253.38 on the pinhole path. Plausible images, entirely wrong content. The
-            // legacy path never had this because RHIReadSurfaceData converts float -> FColor
-            // itself.
-            //
-            // So: convert whenever the pair disagrees. RCM_UNorm + SetLinearToGamma(false) is what
-            // setupRenderResource asks the legacy path for, and ToFColor(false) is its equivalent.
-            const bool want_float = (params_ != nullptr && params_[i] != nullptr)
-                                        ? params_[i]->pixels_as_float
-                                        : (formats_[(int32)i] == PF_FloatRGBA);
-
-            if (formats_[(int32)i] == PF_B8G8R8A8) {
-                const FColor* src = static_cast<const FColor*>(raw);
-                if (!want_float) {
-                    results_[i]->bmp.SetNumUninitialized(w * h, false);
-                    FColor* dst = results_[i]->bmp.GetData();
-                    for (int32 y = 0; y < h; ++y)
-                        FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FColor));
-                }
-                else {
-                    results_[i]->bmp_float.SetNumUninitialized(w * h, false);
-                    FFloat16Color* dst = results_[i]->bmp_float.GetData();
-                    for (int32 y = 0; y < h; ++y)
-                        for (int32 x = 0; x < w; ++x)
-                            dst[y * w + x] = FFloat16Color(FLinearColor(src[y * row_pitch_in_pixels + x]));
-                }
-            }
-            else { //PF_FloatRGBA, guaranteed by phase 1
-                const FFloat16Color* src = static_cast<const FFloat16Color*>(raw);
-                if (want_float) {
-                    results_[i]->bmp_float.SetNumUninitialized(w * h, false);
-                    FFloat16Color* dst = results_[i]->bmp_float.GetData();
-                    for (int32 y = 0; y < h; ++y)
-                        FMemory::Memcpy(dst + y * w, src + y * row_pitch_in_pixels, w * sizeof(FFloat16Color));
-                }
-                else {
-                    results_[i]->bmp.SetNumUninitialized(w * h, false);
-                    FColor* dst = results_[i]->bmp.GetData();
-                    for (int32 y = 0; y < h; ++y) {
-                        for (int32 x = 0; x < w; ++x) {
-                            const FFloat16Color& c = src[y * row_pitch_in_pixels + x];
-                            dst[y * w + x] = FLinearColor(c.R.GetFloat(), c.G.GetFloat(),
-                                                          c.B.GetFloat(), c.A.GetFloat()).ToFColor(false);
-                        }
-                    }
-                }
-            }
-        }
-        if (split_on)
-            timing_.copy_ms += AirSimImageTiming::ToMs(AirSimImageTiming::Clock::now() - t_lock1);
-
-        readbacks_[(int32)i]->Unlock();
+    // B5 phase 3 - Unlock, serial again, and stamp.
+    for (unsigned int i = 0; i < req_size_; ++i) {
+        if (mapped[(int32)i] != nullptr)
+            readbacks_[(int32)i]->Unlock();
         readback_stamps[(int32)i] = msr::airlib::ClockFactory::get()->nowNanos();
     }
 
