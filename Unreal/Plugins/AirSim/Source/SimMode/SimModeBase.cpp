@@ -16,6 +16,7 @@
 #include "AirBlueprintLib.h"
 #include "Annotation/ObjectAnnotator.h"
 #include "LidarCamera.h"
+#include "RenderRequest.h"   // stopStreamCapture must cancel in-flight captures before it joins
 #include "api/VehicleApiBase.hpp"
 #include "common/AirSimSettings.hpp"
 #include "common/ScalableClock.hpp"
@@ -43,6 +44,9 @@
 //it to AirLib and directly implement WorldSimApiBase interface
 #include "WorldSimApi.h"
 #include "stream/SensorStream.hpp"
+#include <chrono>
+#include <numeric>
+#include <thread>
 
 ASimModeBase* ASimModeBase::SIMMODE = nullptr;
 
@@ -105,6 +109,10 @@ void ASimModeBase::toggleLoadingScreen(bool is_visible)
 void ASimModeBase::BeginPlay()
 {
     Super::BeginPlay();
+
+    // Phase E: the driver starts here but IDLES until airsim.StreamCaptureHz > 0, so a scene that
+    // never streams pays a thread doing a 50 ms poll and nothing else.
+    startStreamCapture();
 
     debug_reporter_.initialize(false);
     debug_reporter_.reset();
@@ -1374,6 +1382,189 @@ bool ASimModeBase::SetWorldLightIntensity(const std::string& light_name, float i
     return false;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Phase E - the capture driver. Turns the publish seam from PULL into PUSH.
+//
+// ⚠ Topics are LISTED EXPLICITLY rather than inferred. AirLib's capture_settings map contains ALL
+// twelve ImageTypes for every camera by default (initializeCaptureSettings), so "what the user
+// declared" is not recoverable from it, and PublishToRos is a ROS-wrapper concept that never
+// reaches AirLib. Guessing here would render cameras nobody wants - and at ~10.7 ms per 1080p
+// image (§26.1) a wrong guess is expensive. Explicit also matches the plan's rule: a camera absent
+// from any subscription does not render.
+//
+//   airsim.StreamCaptureTopics "Husky1/cam_left/0,Husky1/cam_left/1,Go2_1/fisheye/0"
+//   airsim.StreamCaptureHz 5
+static TAutoConsoleVariable<FString> CVarStreamCaptureTopics(
+    TEXT("airsim.StreamCaptureTopics"),
+    TEXT(""),
+    TEXT("Phase E: comma-separated vehicle/camera/imagetype to capture on a clock."),
+    ECVF_Default);
+
+/** How many full batches may be IN FLIGHT at once.
+ *
+ *  ⚠⚠ DEFAULT 1, AND >1 IS KNOWN UNSAFE. Tried 2026-08-21 to lift the serial driver's 3.25 Hz cap
+ *  at 19 streams. It does not work at this layer, and the failure is structural, not tuning:
+ *
+ *    RenderRequest::getScreenshot registers an OnEndDraw handler and then REMOVES IT FROM INSIDE
+ *    THAT HANDLER'S OWN BROADCAST (RenderRequest.cpp:259 and :288). With two concurrent requests
+ *    both registered, each removes itself while the multicast delegate is still iterating - the
+ *    classic UE mutate-during-broadcast crash. Two instances also race on the shared
+ *    game_viewport_->bDisableWorldRendering save/restore.
+ *
+ *  Measured before it died: 7.1 fps at 2 Hz against the SERIAL driver's 106.1 fps at the same rate,
+ *  then SIGSEGV reading address 0. A 15x frame-rate regression and a crash, not a speed-up.
+ *
+ *  ⚠ The cap is real and worth lifting - but the fix belongs in B2, where ONE scheduled render
+ *  serves every consumer from a single OnEndDraw registration. Overlapping independent
+ *  RenderRequests cannot be made safe by a driver-side knob. Kept at 1 so the finding is recorded
+ *  rather than rediscovered. */
+static TAutoConsoleVariable<int32> CVarStreamCaptureInFlight(
+    TEXT("airsim.StreamCaptureInFlight"),
+    1,
+    TEXT("Phase E: concurrent full-batch captures. 1 = serial (default).\n")
+    TEXT("⚠ >1 CRASHES: concurrent RenderRequests race on OnEndDraw. Needs B2, not this knob."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarStreamCaptureHz(
+    TEXT("airsim.StreamCaptureHz"),
+    0.0f,
+    TEXT("Phase E: capture rate for the stream driver. 0 = off (default)."),
+    ECVF_Default);
+
+void ASimModeBase::startStreamCapture()
+{
+    if (stream_capture_run_.load())
+        return;
+    // A previous session that tore down abnormally could have left this set; the flag is process
+    // scoped, not PIE scoped, and while it is set every capture is refused.
+    RenderRequest::setShuttingDown(false);
+    stream_capture_run_.store(true);
+    //Fixed at start: changing the worker count at runtime would mean joining live threads
+    //mid-capture. The rate CVar is the runtime knob; this one is a restart-scoped choice.
+    const int workers = FMath::Clamp(CVarStreamCaptureInFlight.GetValueOnAnyThread(), 1, 8);
+    for (int k = 0; k < workers; ++k)
+        stream_capture_threads_.emplace_back([this, k, workers]() { this->streamCaptureLoop(k, workers); });
+}
+
+void ASimModeBase::stopStreamCapture()
+{
+    if (stream_capture_threads_.empty())
+        return;
+
+    stream_capture_run_.store(false);
+
+    // ⚠ ORDER IS LOAD-BEARING - joining first is a guaranteed deadlock, measured 2026-08-21.
+    //
+    // This runs on the GAME thread, inside EndPlay. A worker parked in RenderRequest::getScreenshot
+    // is waiting for the game thread to service its capture; joining before releasing it means the
+    // game thread waits for the worker while the worker waits for the game thread, and the editor
+    // freezes with every thread in a futex wait and nothing left to write the log. The earlier
+    // "teardown is clean" result missed this because it ran with the driver IDLE, and an idle
+    // worker has no outstanding request to be released from.
+    //
+    // setShuttingDown must precede cancelAllPending so that a worker which slipped past its
+    // stop-flag check cannot enqueue a fresh request behind the cancellation sweep.
+    RenderRequest::setShuttingDown(true);
+    RenderRequest::cancelAllPending();
+
+    for (std::thread& t : stream_capture_threads_) {
+        if (t.joinable())
+            t.join();
+    }
+    stream_capture_threads_.clear();
+
+    // Cleared only after the join: until every worker is gone, a late request must still be
+    // refused rather than allowed to register a gate nobody will cancel.
+    RenderRequest::setShuttingDown(false);
+}
+
+void ASimModeBase::streamCaptureLoop(int worker_index, int worker_count)
+{
+    using namespace msr::airlib;
+    bool staggered = false;
+    // float depth: the ROS wrapper asks for these as float, so match it or the bytes differ
+    auto wantsFloat = [](int t) { return t == 1 || t == 2 || t == 3 || t == 4; };
+
+    std::string last_spec;
+    std::map<std::string, std::vector<ImageCaptureBase::ImageRequest>> requests;
+
+    while (stream_capture_run_.load()) {
+        const float hz = CVarStreamCaptureHz.GetValueOnAnyThread();
+        if (hz <= 0.0f || world_sim_api_ == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        //re-parse only when the spec actually changes; this runs at capture rate
+        const std::string spec = TCHAR_TO_UTF8(*CVarStreamCaptureTopics.GetValueOnAnyThread());
+        if (spec != last_spec) {
+            last_spec = spec;
+            requests.clear();
+            size_t i = 0;
+            while (i < spec.size()) {
+                size_t j = spec.find(',', i);
+                if (j == std::string::npos) j = spec.size();
+                std::string tok = spec.substr(i, j - i);
+                i = j + 1;
+                while (!tok.empty() && (tok.front() == ' ')) tok.erase(tok.begin());
+                while (!tok.empty() && (tok.back() == ' ')) tok.pop_back();
+                if (tok.empty()) continue;
+                const size_t a = tok.find('/');
+                const size_t b = (a == std::string::npos) ? std::string::npos : tok.find('/', a + 1);
+                if (a == std::string::npos || b == std::string::npos) {
+                    UE_LOG(LogTemp, Warning,
+                           TEXT("[AirSim][stream] bad topic '%s' - want vehicle/camera/imagetype"),
+                           UTF8_TO_TCHAR(tok.c_str()));
+                    continue;
+                }
+                const std::string veh = tok.substr(0, a);
+                const std::string cam = tok.substr(a + 1, b - a - 1);
+                const int type = std::atoi(tok.substr(b + 1).c_str());
+                requests[veh].push_back(ImageCaptureBase::ImageRequest(
+                    cam, Utils::toEnum<ImageCaptureBase::ImageType>(type), wantsFloat(type), false));
+            }
+            if (worker_index == 0)
+            UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] capture driver: %d vehicle(s), %d topic(s) at %.1f Hz"),
+                   (int)requests.size(),
+                   (int)std::accumulate(requests.begin(), requests.end(), (size_t)0,
+                                        [](size_t n, const auto& kv) { return n + kv.second.size(); }),
+                   hz);
+        }
+
+        if (requests.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            //publishToSensorStream fires inside this, for every image, on both paths
+            world_sim_api_->getImagesAllVehicles(requests);
+        }
+        catch (const std::exception& e) {
+            UE_LOG(LogTemp, Warning, TEXT("[AirSim][stream] capture driver: %s"), UTF8_TO_TCHAR(e.what()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        //Each worker paces to worker_count/hz, so the COMBINED rate is hz. Workers are staggered
+        //by one period on first pass, otherwise they would all fire together and pipeline nothing.
+        //If a batch already took longer than its slot, run flat out rather than accumulate lag -
+        //at that point the sim is the limit and the requested rate is fiction (§24.5).
+        const auto period = std::chrono::microseconds((long long)(1e6 * worker_count / hz));
+        if (!staggered) {
+            staggered = true;
+            std::this_thread::sleep_for(
+                std::chrono::microseconds((long long)(1e6 * worker_index / hz)));
+            continue;
+        }
+        const auto spent = std::chrono::steady_clock::now() - t0;
+        if (spent < period)
+            std::this_thread::sleep_for(period - spent);
+    }
+}
+
 void ASimModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     // ⚠ Phase C/D teardown. SensorStream::singleton() is a function-local static, so it lives for
@@ -1386,6 +1577,9 @@ void ASimModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
     // Dropping the sink runs SharedMemorySink::clear(), which munmaps and shm_unlinks each
     // segment. The airsim.StreamSink CVar keeps its value, so re-entering PIE and capturing
     // rebuilds the segments at the new scene's sizes.
+    // ⚠ Stop the driver BEFORE world_sim_api_ is reset below - it dereferences it every cycle.
+    stopStreamCapture();
+
     msr::airlib::SensorStream::singleton().setSink(nullptr);
     msr::airlib::SensorStream::singleton().resetStats();
 

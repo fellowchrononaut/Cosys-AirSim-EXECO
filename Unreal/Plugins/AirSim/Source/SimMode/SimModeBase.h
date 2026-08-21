@@ -21,6 +21,8 @@
 #include "UnrealImageCapture.h"
 #include "Beacons/TemplateBeacon.h"
 #include "Beacons/FiducialBeacon.h"
+#include <atomic>
+#include <thread>
 #include "SimModeBase.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FLevelLoaded);
@@ -323,6 +325,21 @@ private:
 
     std::unique_ptr<NedTransform> global_ned_transform_;
     std::unique_ptr<msr::airlib::WorldSimApiBase> world_sim_api_;
+
+    // Phase E. Drives capture on a clock so the publish seam is genuinely PUSH.
+    //
+    // ⚠ Without this the seam is pull-triggered: publishToSensorStream is hooked on the RPC
+    // response, so with no client calling simGetImages the shared-memory segments never advance
+    // (measured 2026-08-21: frame counter frozen at 3 across 8 s idle). A ROS wrapper reading
+    // shared memory would have read one stale frame forever.
+    //
+    // ⚠ MUST be a worker thread, never the game thread: getScreenshot posts an AsyncTask TO the
+    // game thread and blocks on its signal, so driving it from the game thread self-deadlocks.
+    void startStreamCapture();
+    void stopStreamCapture();
+    void streamCaptureLoop(int worker_index, int worker_count);
+    std::vector<std::thread> stream_capture_threads_;
+    std::atomic<bool> stream_capture_run_{ false };
     std::unique_ptr<msr::airlib::ApiProvider> api_provider_;
     //std::unique_ptr<msr::airlib::ApiServerBase> api_server_;
     std::vector<std::unique_ptr<msr::airlib::ApiServerBase>> api_servers_;

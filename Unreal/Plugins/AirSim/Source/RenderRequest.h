@@ -6,6 +6,7 @@
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/GameViewportClient.h"
 #include <memory>
+#include <atomic>
 #include "common/Common.hpp"
 #include "ImageTiming.h"
 #include "CubeResample.h"
@@ -71,6 +72,40 @@ public:
         msr::airlib::TTimePoint time_stamp;
     };
 
+    // ⚠ Shutdown cancellation. One request passes through three states, and they are NOT
+    // interchangeable - each is cancellable by a different party, and one is not cancellable at
+    // all. Collapsing them is what deadlocked the editor (see RenderRequest.cpp).
+    //
+    //   Pending    - the game-thread AsyncTask has not run. Nothing outside getScreenshot's own
+    //                stack references the request, so ANY thread may abandon it.
+    //   Registered - the AsyncTask ran and added an OnEndDraw handler. Cancellable, but only from
+    //                the GAME thread, because cancelling means removing that delegate.
+    //   Drawing    - OnEndDraw fired and the completion command is queued on the render thread.
+    //                NOT cancellable; it must be flushed to completion.
+    //   Abandoned  - terminal; the waiter has gone and no one may touch the request again.
+    struct CancelGate
+    {
+        enum EState : uint8
+        {
+            Pending = 0,
+            Registered,
+            Drawing,
+            Abandoned
+        };
+
+        std::atomic<uint8> state{ Pending };
+        RenderRequest* owner = nullptr;
+        std::shared_ptr<msr::airlib::WorkerThreadSignal> signal;
+    };
+
+    // Set while a PIE session is tearing down. While true, getScreenshot refuses new requests and
+    // gives up on outstanding ones instead of waiting forever.
+    static void setShuttingDown(bool value);
+
+    // ⚠ GAME THREAD ONLY, and it must be called BEFORE joining any thread that can be inside
+    // getScreenshot. Releases every waiter it is safe to release and flushes the rest.
+    static void cancelAllPending();
+
 private:
     static FReadSurfaceDataFlags setupRenderResource(const FTextureRenderTargetResource* rt_resource, const RenderParams* params, RenderResult* result, FIntPoint& size);
 
@@ -100,6 +135,14 @@ private:
     static void drainPendingDeferredReadbacks();
     static void ensureDeferredDrainHook();
 
+    // Shutdown variant: drains EVERY deferred batch blocking, in one pass. The ordinary drain
+    // waits for OnEndFrameRT, which never fires again once teardown has begun.
+    static void drainPendingDeferredReadbacksForced();
+
+    // Removes this request's OnEndDraw handler and restores the viewport flag it changed.
+    // Game thread only; valid only in the Registered state.
+    void cancelRegisteredOnGameThread();
+
     // Batched-readback scratch. Under mode 2 these OUTLIVE the submitting call and stay valid
     // until the deferred drain consumes them, so nothing here may be reset by the submit path.
     TArray<TUniquePtr<class FRHIGPUTextureReadback>> readbacks_;
@@ -115,6 +158,10 @@ private:
     unsigned int req_size_;
 
     std::shared_ptr<msr::airlib::WorkerThreadSignal> wait_signal_;
+
+    // Lives as long as the deferred lambdas that reference it, which is why it is a shared_ptr
+    // and not a member value: after cancellation the RenderRequest itself is gone.
+    std::shared_ptr<CancelGate> gate_;
 
     bool saved_DisableWorldRendering_ = false;
     UGameViewportClient * const game_viewport_;

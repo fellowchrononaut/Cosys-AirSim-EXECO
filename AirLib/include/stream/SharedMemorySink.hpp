@@ -13,7 +13,18 @@
 //
 // DESIGN - one segment per topic, seqlock, latest-wins.
 //
-//   /dev/shm/<prefix>_<vehicle>_<camera>_<type>
+//   <dir>/<prefix>_<vehicle>_<camera>_<type>          default dir /dev/shm
+//
+// ⚠ FILE-BACKED mmap, NOT POSIX shm_open. They are the same thing on Linux - /dev/shm IS tmpfs, so
+// a file there is RAM at RAM speed - but shm_open hardcodes /dev/shm, and that is wrong in three
+// situations this fork actually meets:
+//   * a container WITHOUT the host's shm: Docker gives each container a private 64 MB /dev/shm
+//     unless --ipc=host or -v /dev/shm:/dev/shm. (This project's sad_vio_dense happens to bind
+//     /dev:/dev, so it sees the host's - but that is incidental, not a design guarantee.)
+//   * Windows, which has no /dev/shm and no shm_open at all.
+//   * any deployment that wants the segments on a specific shared volume.
+// A directory is a parameter; /dev/shm is only the default. Point it at a bind-mounted volume and
+// a container with no /dev sharing works, at the cost of that volume's backing store.
 //     [Header][Slot 0][Slot 1] ... [Slot N-1]
 //
 // Each slot is guarded by its own SEQLOCK: the writer makes the sequence ODD, writes meta and
@@ -86,11 +97,17 @@ namespace airlib
     class SharedMemorySink : public StreamSink
     {
     public:
-        explicit SharedMemorySink(std::string prefix = "airsim", uint32_t slots = 3,
+        explicit SharedMemorySink(std::string dir = "/dev/shm", std::string prefix = "airsim",
+                                  uint32_t slots = 3,
                                   uint32_t max_payload = 8u * 1024u * 1024u)
-            : prefix_(std::move(prefix)), slots_(slots < 2 ? 2 : slots), max_payload_(max_payload)
+            : dir_(std::move(dir)), prefix_(std::move(prefix)),
+              slots_(slots < 2 ? 2 : slots), max_payload_(max_payload)
         {
+            while (dir_.size() > 1 && dir_.back() == '/')
+                dir_.pop_back();
         }
+
+        const std::string& directory() const { return dir_; }
 
         ~SharedMemorySink() override { clear(); }
 
@@ -112,6 +129,19 @@ namespace airlib
             std::lock_guard<std::mutex> wlock(seg->write_mutex);
 
             ShmHeader* hdr = seg->header();
+
+            //⚠ REJECT STALE FRAMES. Harmless while captures were serial; required the moment they
+            //overlap (Phase E pipelining). Two in-flight batches finish in whatever order the GPU
+            //and the RPC threads decide, so an OLDER frame can arrive after a newer one - and with
+            //latest-wins it would overwrite it, handing the consumer a picture that goes backwards
+            //in time. Timestamps are the capture instant, so comparing them is exactly right.
+            if (hdr->newest_index > 0) {
+                const uint32_t prev = static_cast<uint32_t>((hdr->newest_index - 1) % hdr->slot_count);
+                const uint64_t prev_ts = seg->slot(prev)->meta.timestamp_ns;
+                if (meta.timestamp_ns != 0 && prev_ts != 0 && meta.timestamp_ns < prev_ts)
+                    return false;   //counted as a drop by SensorStream, which is what it is
+            }
+
             const uint32_t idx = static_cast<uint32_t>(hdr->newest_index % hdr->slot_count);
             ShmSlotHeader* slot = seg->slot(idx);
 
@@ -141,7 +171,7 @@ namespace airlib
             for (const auto& kv : segments_) {
                 const Segment& s = *kv.second;
                 const ShmHeader* h = const_cast<Segment&>(s).header();
-                out.push_back(kv.first + "  /dev/shm" + s.name + "  " +
+                out.push_back(kv.first + "  " + s.name + "  " +
                               std::to_string(h->slot_count) + " slots x " +
                               std::to_string(h->payload_capacity) + " B  frames=" +
                               std::to_string(h->newest_index));
@@ -158,7 +188,7 @@ namespace airlib
                 if (s.base != nullptr && s.base != MAP_FAILED)
                     ::munmap(s.base, s.bytes);
                 if (!s.name.empty())
-                    ::shm_unlink(s.name.c_str());
+                    ::unlink(s.name.c_str());
             }
             segments_.clear();
         }
@@ -184,17 +214,17 @@ namespace airlib
             }
         };
 
-        /** POSIX shm names: one leading '/', no others, and short. */
-        std::string shmNameFor(const std::string& topic) const
+        /** A topic maps to one file. '/' and spaces become '_' so a topic never escapes dir_. */
+        std::string pathFor(const std::string& topic) const
         {
-            std::string s = "/" + prefix_ + "_" + topic;
-            for (size_t i = 1; i < s.size(); ++i) {
-                if (s[i] == '/' || s[i] == ' ')
-                    s[i] = '_';
+            std::string leaf = prefix_ + "_" + topic;
+            for (char& c : leaf) {
+                if (c == '/' || c == ' ' || c == '\\')
+                    c = '_';
             }
-            if (s.size() > 200)
-                s.resize(200);
-            return s;
+            if (leaf.size() > 200)
+                leaf.resize(200);
+            return dir_ + "/" + leaf;
         }
 
         Segment* openOrCreate(const std::string& topic, uint32_t payload_bytes)
@@ -213,19 +243,19 @@ namespace airlib
             const size_t total = sizeof(ShmHeader) + static_cast<size_t>(stride) * slots_;
 
             auto seg = std::unique_ptr<Segment>(new Segment());
-            seg->name = shmNameFor(topic);
+            seg->name = pathFor(topic);
             seg->bytes = total;
             seg->slot_stride = stride;
 
             //a stale segment from a crashed run would otherwise be reused at the wrong size
-            ::shm_unlink(seg->name.c_str());
+            ::unlink(seg->name.c_str());
 
-            const int fd = ::shm_open(seg->name.c_str(), O_CREAT | O_RDWR, 0666);
+            const int fd = ::open(seg->name.c_str(), O_CREAT | O_RDWR, 0666);
             if (fd < 0)
                 return nullptr;
             if (::ftruncate(fd, static_cast<off_t>(total)) != 0) {
                 ::close(fd);
-                ::shm_unlink(seg->name.c_str());
+                ::unlink(seg->name.c_str());
                 return nullptr;
             }
             seg->base = ::mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -256,6 +286,7 @@ namespace airlib
 
         mutable std::mutex mutex_;
         std::map<std::string, std::unique_ptr<Segment>> segments_;
+        std::string dir_;
         std::string prefix_;
         uint32_t slots_;
         uint32_t max_payload_;

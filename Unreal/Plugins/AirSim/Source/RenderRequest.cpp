@@ -194,6 +194,99 @@ RenderRequest::~RenderRequest()
 {
 }
 
+// ⚠ Shutdown cancellation registry.
+//
+// WHY THIS EXISTS. getScreenshot used to wait on wait_signal_ in an unbounded loop, with a comment
+// explaining that walking away would free objects the render thread still references. That is true
+// of ONE of the three states a request can be in, and the loop did not distinguish them. The cost,
+// measured 2026-08-21 with the Phase E capture driver running: pressing Stop froze the editor
+// permanently, with 159 threads parked in futex waits. Both halves of the cycle, from gdb:
+//
+//   Thread 1 (game)   std::thread::join()  <- ASimModeBase::stopStreamCapture <- EndPlay
+//   Thread 169        WorkerThreadSignal::waitFor <- RenderRequest::getScreenshot
+//                                                 <- getImagesAllVehicles <- streamCaptureLoop
+//
+// The worker waits for the game thread to service its AsyncTask; the game thread waits for the
+// worker to exit. Neither can move. A pump-and-join inside EndPlay cannot fix it either: the
+// worker is ultimately waiting for OnEndDraw, which only fires when a FRAME IS DRAWN, and EndPlay
+// runs inside UEditorEngine::Tick (EditorEngine.cpp:2430) - no further frame can be drawn until
+// that Tick returns. FlushRenderingCommands does not help, because the completion command is
+// enqueued INSIDE OnEndDraw; if OnEndDraw has not fired there is nothing queued to flush.
+//
+// So cancellation is per-state (see CancelGate in the header), and the transitions are CAS'd
+// because the waiter races the game thread for the right to abandon.
+namespace
+{
+    std::atomic<bool> g_shutting_down{ false };
+    FCriticalSection g_gate_mutex;
+    TArray<std::shared_ptr<RenderRequest::CancelGate>> g_live_gates;
+}
+
+void RenderRequest::setShuttingDown(bool value)
+{
+    g_shutting_down.store(value, std::memory_order_release);
+}
+
+void RenderRequest::cancelRegisteredOnGameThread()
+{
+    check(IsInGameThread());
+
+    if (game_viewport_ != nullptr && end_draw_handle_.IsValid()) {
+        game_viewport_->OnEndDraw().Remove(end_draw_handle_);
+        end_draw_handle_.Reset();
+        game_viewport_->bDisableWorldRendering = saved_DisableWorldRendering_;
+    }
+}
+
+void RenderRequest::cancelAllPending()
+{
+    check(IsInGameThread());
+
+    TArray<std::shared_ptr<CancelGate>> gates;
+    {
+        FScopeLock lock(&g_gate_mutex);
+        gates = g_live_gates;
+    }
+
+    int32 pending = 0, registered = 0, drawing = 0;
+    for (const std::shared_ptr<CancelGate>& gate : gates) {
+        // Pending: the AsyncTask has not run. It will find the gate Abandoned and return without
+        // dereferencing the request, so releasing the waiter now is safe.
+        uint8 expected = CancelGate::Pending;
+        if (gate->state.compare_exchange_strong(expected, CancelGate::Abandoned)) {
+            ++pending;
+            gate->signal->signal();
+            continue;
+        }
+
+        // Registered: an OnEndDraw handler is installed and no frame has drawn. Removing that
+        // delegate is exactly what the handler would have done, and this IS the game thread, so
+        // it cannot race the handler.
+        expected = CancelGate::Registered;
+        if (gate->state.compare_exchange_strong(expected, CancelGate::Abandoned)) {
+            ++registered;
+            if (gate->owner != nullptr)
+                gate->owner->cancelRegisteredOnGameThread();
+            gate->signal->signal();
+            continue;
+        }
+
+        ++drawing;
+    }
+
+    // Drawing requests already have SceneDrawCompletion queued; the flush below runs it. Under
+    // airsim.GpuReadback 2 that call only SUBMITS the copies and parks the batch for OnEndFrameRT,
+    // which will not fire again - hence the forced drain, enqueued after it so it runs after it.
+    ENQUEUE_RENDER_COMMAND(AirSimCancelDrainDeferred)
+    ([](FRHICommandListImmediate&) { RenderRequest::drainPendingDeferredReadbacksForced(); });
+    FlushRenderingCommands();
+
+    if (pending + registered + drawing > 0)
+        UE_LOG(LogTemp, Warning,
+               TEXT("[AirSim] shutdown: cancelled %d queued and %d registered image request(s), flushed %d already drawing"),
+               pending, registered, drawing);
+}
+
 // read pixels from render target using render thread, then compress the result into PNG
 // argument on the thread that calls this method.
 void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::vector<std::shared_ptr<RenderResult>>& results, unsigned int req_size, bool use_safe_method)
@@ -207,6 +300,22 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
         else
             results[i]->bmp_float.Reset();
         results[i]->time_stamp = 0;
+
+        // ⚠ RenderResult leaves these uninitialised. Every normal path overwrites them in
+        // setupRenderResource, but the cancellation path below returns without ever reaching it,
+        // and the formatting loop at the tail keys off `width != 0`. Garbage here would size a
+        // SetNumUninitialized from a stack value.
+        results[i]->width = 0;
+        results[i]->height = 0;
+    }
+
+    // Refuse outright once teardown has begun. Without this, a worker that passed its own
+    // stop-flag check a microsecond before cancelAllPending ran would register a gate that
+    // nothing will ever cancel, and the join would hang exactly as before.
+    if (g_shutting_down.load(std::memory_order_acquire)) {
+        UE_LOG(LogTemp, Warning,
+               TEXT("[AirSim] image request of %d refused: the session is shutting down"), (int)req_size);
+        return;
     }
 
     //make sure we are not on the rendering thread
@@ -246,9 +355,23 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
         results_ = results.data();
         req_size_ = req_size;
 
+        gate_ = std::make_shared<CancelGate>();
+        gate_->owner = this;
+        gate_->signal = wait_signal_;
+        {
+            FScopeLock lock(&g_gate_mutex);
+            g_live_gates.Add(gate_);
+        }
+
         // Queue up the task of querying camera pose in the game thread and synchronizing render thread with camera pose
-        AsyncTask(ENamedThreads::GameThread, [this, timing_on]() {
+        // ⚠ `gate` is captured BY VALUE and every access before the CAS goes through it, never
+        // through `this`: if the request was abandoned, `this` is a destroyed stack object.
+        AsyncTask(ENamedThreads::GameThread, [this, timing_on, gate = gate_]() {
             check(IsInGameThread());
+
+            uint8 expected = CancelGate::Pending;
+            if (!gate->state.compare_exchange_strong(expected, CancelGate::Registered))
+                return; // Abandoned while queued - the waiter is gone and owns nothing here.
 
             // I-G Step 0a: end of segment (a) - how long the game thread took to pick this up.
             if (timing_on)
@@ -256,8 +379,15 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
 
             saved_DisableWorldRendering_ = game_viewport_->bDisableWorldRendering;
             game_viewport_->bDisableWorldRendering = 0;
-            end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this, timing_on] {
+            end_draw_handle_ = game_viewport_->OnEndDraw().AddLambda([this, timing_on, gate] {
                 check(IsInGameThread());
+
+                // Past this point the request belongs to the render thread and can no longer be
+                // abandoned - only flushed. Both sides of this CAS run on the game thread, so it
+                // cannot lose the race; it is here to make the ownership handover explicit.
+                uint8 draw_expected = CancelGate::Registered;
+                if (!gate->state.compare_exchange_strong(draw_expected, CancelGate::Drawing))
+                    return;
 
                 // I-G Step 0a: end of segment (b) - the wait for the next rendered frame. This is
                 // the boundary that decides latency-bound vs readback-bound.
@@ -313,11 +443,45 @@ void RenderRequest::getScreenshot(std::shared_ptr<RenderParams> params[], std::v
         });
 
         // wait for this task to complete
-        while (!wait_signal_->waitFor(5)) {
-            // log a message and continue wait
-            // lamda function still references a few objects for which there is no refcount.
-            // Walking away will cause memory corruption, which is much more difficult to debug.
+        //
+        // The original loop here was unbounded, because "the lambda still references a few objects
+        // for which there is no refcount - walking away will cause memory corruption". That holds
+        // only once the request reaches Drawing. Before that, the gate lets us leave safely, and
+        // cancelAllPending signals us so we do not sit out the 5 s timeout to find that out.
+        bool cancelled = false;
+        for (;;) {
+            const bool signalled = wait_signal_->waitFor(5);
+            if (signalled) {
+                cancelled = gate_->state.load(std::memory_order_acquire) == CancelGate::Abandoned;
+                break;
+            }
+
+            // Timed out. If we are tearing down and nobody has picked the request up yet, claim it
+            // and leave; if it is already Registered or Drawing, cancelAllPending owns the outcome
+            // and will either release us or flush the request to completion.
+            if (g_shutting_down.load(std::memory_order_acquire)) {
+                uint8 expected = CancelGate::Pending;
+                if (gate_->state.compare_exchange_strong(expected, CancelGate::Abandoned)) {
+                    cancelled = true;
+                    break;
+                }
+            }
+
             UE_LOG(LogTemp, Warning, TEXT("Failed: timeout waiting for screenshot"));
+        }
+
+        {
+            FScopeLock lock(&g_gate_mutex);
+            g_live_gates.Remove(gate_);
+        }
+
+        if (cancelled) {
+            // Results keep their zeroed width/height, so callers see empty images rather than a
+            // half-formatted buffer. Nothing below this point may run: the render targets are
+            // being torn down.
+            UE_LOG(LogTemp, Warning,
+                   TEXT("[AirSim] image request of %d cancelled during shutdown"), (int)req_size);
+            return;
         }
     }
 
@@ -876,6 +1040,23 @@ void RenderRequest::drainPendingDeferredReadbacks()
             g_deferred_pending.RemoveAt(i);
             req->finishTask(req->deferred_stamps_);
         }
+    }
+}
+
+// Shutdown counterpart of the above. The ordinary drain retries across frames and only forces the
+// blocking Lock after CVarGpuReadbackMaxFrames; during teardown there are no more frames, so every
+// batch drains blocking in this one pass. Each finishTask signals a caller still parked in
+// getScreenshot, which is the whole point - they are what stopStreamCapture is about to join.
+void RenderRequest::drainPendingDeferredReadbacksForced()
+{
+    check(IsInRenderingThread());
+    for (int32 i = g_deferred_pending.Num() - 1; i >= 0; --i) {
+        RenderRequest* req = g_deferred_pending[i];
+        g_deferred_pending.RemoveAt(i);
+        if (req == nullptr)
+            continue;
+        req->drainGpuReadbacks(req->deferred_stamps_, /*force_blocking=*/true);
+        req->finishTask(req->deferred_stamps_);
     }
 }
 

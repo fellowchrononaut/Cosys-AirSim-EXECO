@@ -1016,6 +1016,16 @@ std::vector<float> WorldSimApi::getDistortionParams(const CameraDetails& camera_
  *  session to be trustworthy.
  *    0 = off      1 = loopback (Phase C validation; keeps the latest frame per topic, goes nowhere)
  */
+/** Where Phase D writes its segments. /dev/shm is tmpfs - RAM speed - and is the right default on
+ *  Linux. Point it at a bind-mounted volume when the consumer is a container that does NOT share
+ *  the host's /dev/shm (Docker gives each container a private 64 MB one unless --ipc=host or
+ *  -v /dev/shm:/dev/shm). Any directory works; the cost is that volume's backing store. */
+static TAutoConsoleVariable<FString> CVarStreamDir(
+    TEXT("airsim.StreamDir"),
+    TEXT("/dev/shm"),
+    TEXT("Phase D: directory for shared-memory segments. Set BEFORE airsim.StreamSink 2."),
+    ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarStreamSink(
     TEXT("airsim.StreamSink"),
     0,
@@ -1033,8 +1043,13 @@ static TAutoConsoleVariable<int32> CVarStreamSink(
         }
 #if AIRSIM_SHM_SUPPORTED
         else if (mode == 2) {
-            stream.setSink(std::make_shared<msr::airlib::SharedMemorySink>());
-            UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] shared-memory sink installed (/dev/shm/airsim_*)"));
+            //Directory is a setting, not a constant: /dev/shm is tmpfs and therefore the fast
+            //default, but a container without the host's shm needs a bind-mounted volume instead.
+            const FString dir = CVarStreamDir.GetValueOnGameThread();
+            auto sink = std::make_shared<msr::airlib::SharedMemorySink>(
+                std::string(TCHAR_TO_UTF8(*dir)));
+            stream.setSink(sink);
+            UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] shared-memory sink installed at %s/airsim_*"), *dir);
         }
 #endif
         else {
@@ -1089,7 +1104,6 @@ namespace
 
         msr::airlib::StreamFrameMeta meta;
         meta.timestamp_ns = response.time_stamp;   //CAPTURE instant, not publish instant
-        meta.sequence = stream.nextSequence();
         meta.width = static_cast<uint32_t>(response.width);
         meta.height = static_cast<uint32_t>(response.height);
         meta.payload_bytes = static_cast<uint32_t>(bytes);
@@ -1097,6 +1111,8 @@ namespace
         meta.pixels_as_float = response.pixels_as_float ? 1 : 0;
         meta.channels = response.pixels_as_float ? 1 : 3;
         meta.setNames(vehicle_name, response.camera_name);
+        //after setNames: the topic is derived from the names, and the sequence is per topic
+        meta.sequence = stream.nextSequence(msr::airlib::LoopbackSink::topicOf(meta));
 
         stream.publish(meta, payload, bytes);
     }

@@ -142,6 +142,13 @@ void ACarPawn::setupVehicleMovementComponent()
     // Disable reverse as brake, this is needed for SetBreakInput() to take effect
     movement->bReverseAsBrake = false;
 
+    // ⚠ Without this, ONLY THE POSSESSED VEHICLE CAN DRIVE - Chaos discards input on an
+    // unpossessed pawn (ChaosVehicleMovementComponent.cpp:1177, bRequiresControllerForInputs
+    // defaults to true). In a MultiAgent scene only one pawn is possessed, chosen by the
+    // alphabetical order of the Vehicles std::map, so a rename decides whether a car can move.
+    // See the long note in SkidVehiclePawn::setupVehicleMovementComponent for the measurement.
+    movement->SetRequiresControllerForInputs(false);
+
     // Physics settings
     // Adjust the center of mass - the buggy is quite low
     UPrimitiveComponent* primitive = Cast<UPrimitiveComponent>(movement->UpdatedComponent);

@@ -1,0 +1,112 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+Visualization Manager:
+  Class: ""
+  Name: root
+  Displays:
+    # ⚠ Every Image display below sets Reliability Policy: Best Effort. The bridge publishes
+    # BEST_EFFORT (RELIABLE delivery of ~1 MB images collapses the rate 8 Hz -> 0.4 Hz), and a
+    # RELIABLE subscriber silently shows an empty topic instead of an error. This config exists so
+    # that is not something anyone has to rediscover by hand.
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Go2_1 scene
+      Value: true
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /airsim_shm/Go2_1/fisheye/scene
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Go2_1 segmentation
+      Value: true
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /airsim_shm/Go2_1/fisheye/segmentation
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Go2_1 depth
+      Value: true
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /airsim_shm/Go2_1/fisheye/depth_planar
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Husky1 scene
+      Value: true
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /airsim_shm/Husky1/fisheye/scene
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Husky1 segmentation
+      Value: true
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /airsim_shm/Husky1/fisheye/segmentation
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: Husky1 depth
+      Value: true
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /airsim_shm/Husky1/fisheye/depth_planar
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 10
+      Name: Current View
+      Target Frame: <Fixed Frame>
+Window Geometry:
+  Height: 1000
+  Width: 1700
+  Displays:
+    collapsed: false

@@ -139,6 +139,27 @@ void ASkidVehiclePawn::setupVehicleMovementComponent()
 	// Disable reverse as brake, this is needed for SetBreakInput() to take effect
 	movement->bReverseAsBrake = false;
 
+	// ⚠ Without this, ONLY THE POSSESSED VEHICLE CAN DRIVE. Chaos gates all input processing on
+	// ChaosVehicleMovementComponent.cpp:1177:
+	//
+	//     bool bProcessLocally = bRequiresControllerForInputs
+	//                                ? (Controller && Controller->IsLocalController()) : true;
+	//
+	// and the flag defaults to true. An unpossessed pawn has Controller == nullptr, so every
+	// SetThrottleInput / SetYawInput / SetBrakeInput lands in the component and is then silently
+	// discarded - the engine never leaves idle and the gearbox never leaves neutral.
+	//
+	// In a MultiAgent scene exactly one pawn is possessed, and which one it is comes from the
+	// alphabetical order of the Vehicles map (a std::map, so "Go2_1" < "Husky1"). Renaming a robot
+	// therefore decided whether it could move: measured 2026-08-21, Husky1 + Go2_1 was inert at
+	// gear 0 / 20 rpm, and renaming it AHusky1 - one character, nothing else changed - made it
+	// drive at gear 1 / 259 rpm.
+	//
+	// AirSim drives these vehicles from the API and the sim, never from a PlayerController, so
+	// requiring one is wrong for every vehicle here, possessed or not. The possessed vehicle is
+	// unaffected: bProcessLocally was already true for it.
+	movement->SetRequiresControllerForInputs(false);
+
 	// Physics settings
 	// Adjust the center of mass - the buggy is quite low
 	UPrimitiveComponent* primitive = Cast<UPrimitiveComponent>(movement->UpdatedComponent);

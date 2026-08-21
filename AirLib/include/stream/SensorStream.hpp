@@ -148,7 +148,16 @@ namespace airlib
             return ok;
         }
 
-        uint64_t nextSequence() { return sequence_.fetch_add(1, std::memory_order_relaxed); }
+        /** PER-TOPIC sequence. ⚠ It was one global counter, which made the drop detection this
+         *  design advertises meaningless: with 5 topics live, consecutive frames on one topic
+         *  differ by 5, so a healthy stream reported a gap on EVERY frame (measured: "gaps seen:
+         *  50" over 51 frames). A consumer can only tell it missed something if the numbering is
+         *  per-topic and contiguous. */
+        uint64_t nextSequence(const std::string& topic)
+        {
+            std::lock_guard<std::mutex> lock(seq_mutex_);
+            return topic_sequence_[topic]++;
+        }
 
         Stats stats() const
         {
@@ -174,7 +183,8 @@ namespace airlib
         mutable std::mutex mutex_;
         std::shared_ptr<StreamSink> sink_;
         std::atomic<bool> enabled_{ false };
-        std::atomic<uint64_t> sequence_{ 0 };
+        mutable std::mutex seq_mutex_;
+        std::map<std::string, uint64_t> topic_sequence_;
         std::atomic<uint64_t> stats_frames_{ 0 };
         std::atomic<uint64_t> stats_bytes_{ 0 };
         std::atomic<uint64_t> stats_drops_{ 0 };
