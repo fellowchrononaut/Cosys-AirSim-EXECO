@@ -42,6 +42,7 @@
 //in future we should consider moving SimMode not derived from AActor and move
 //it to AirLib and directly implement WorldSimApiBase interface
 #include "WorldSimApi.h"
+#include "stream/SensorStream.hpp"
 
 ASimModeBase* ASimModeBase::SIMMODE = nullptr;
 
@@ -1375,6 +1376,19 @@ bool ASimModeBase::SetWorldLightIntensity(const std::string& light_name, float i
 
 void ASimModeBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    // ⚠ Phase C/D teardown. SensorStream::singleton() is a function-local static, so it lives for
+    // the lifetime of the EDITOR PROCESS, not the PIE session. Without this, pressing Stop leaves
+    // every /dev/shm/airsim_* segment mapped and resident (measured 2026-08-21: 2 segments, 37 MB,
+    // still there after PIE ended) - and, worse, leaves the sink's segment map keyed to the OLD
+    // scene. The next PIE session with different camera resolutions would then find a cached
+    // segment sized for the previous run and silently drop every frame too large for it.
+    //
+    // Dropping the sink runs SharedMemorySink::clear(), which munmaps and shm_unlinks each
+    // segment. The airsim.StreamSink CVar keeps its value, so re-entering PIE and capturing
+    // rebuilds the segments at the new scene's sizes.
+    msr::airlib::SensorStream::singleton().setSink(nullptr);
+    msr::airlib::SensorStream::singleton().resetStats();
+
     FRecordingThread::stopRecording();
     FRecordingThread::killRecording();
     world_sim_api_.reset();

@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+#include "stream/SensorStream.hpp"
+#include "stream/SharedMemorySink.hpp"
 
 WorldSimApi::WorldSimApi(ASimModeBase* simmode)
     : simmode_(simmode) {}
@@ -995,6 +997,111 @@ std::vector<float> WorldSimApi::getDistortionParams(const CameraDetails& camera_
     return param_values;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Phase C - the publish seam, hooked at the API boundary.
+//
+// WHY HERE and not in UnrealImageCapture: this is the layer that knows the VEHICLE name, and it is
+// the point where a payload is finished and about to leave the sim. Assembly is a different job.
+// Both the per-vehicle path and the D9 fleet path pass through here, so one hook covers both.
+//
+// ⚠ COSTS NOTHING WHEN OFF. enabled() is a relaxed atomic bool load, checked before any copy. With
+// no sink installed - the default - this is the entire added cost on the classic RPC path.
+//
+// ⚠ This publishes ALONGSIDE the RPC response, it does not replace it. simGetImages returns exactly
+// what it always returned. That is the D2 constraint: classic AirSim clients keep working.
+/** Phase C control surface. Default 0 - NO sink, so the seam is inert and the RPC path is
+ *  bit-identical to before. Changing this installs or removes a sink at runtime; no rebuild and no
+ *  PIE restart, which matters because every A/B in this workstream has needed both arms in one
+ *  session to be trustworthy.
+ *    0 = off      1 = loopback (Phase C validation; keeps the latest frame per topic, goes nowhere)
+ */
+static TAutoConsoleVariable<int32> CVarStreamSink(
+    TEXT("airsim.StreamSink"),
+    0,
+    TEXT("Phase C publish seam.\n")
+    TEXT(" 0: no sink - seam inert, one atomic load per image (default)\n")
+    TEXT(" 1: loopback sink - validates metadata/threading, transports nothing\n")
+    TEXT(" 2: shared memory - one /dev/shm segment per topic, seqlock, latest-wins"),
+    FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* var) {
+        auto& stream = msr::airlib::SensorStream::singleton();
+        const int32 mode = var->GetInt();
+        stream.resetStats();
+        if (mode == 1) {
+            stream.setSink(std::make_shared<msr::airlib::LoopbackSink>());
+            UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] loopback sink installed"));
+        }
+#if AIRSIM_SHM_SUPPORTED
+        else if (mode == 2) {
+            stream.setSink(std::make_shared<msr::airlib::SharedMemorySink>());
+            UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] shared-memory sink installed (/dev/shm/airsim_*)"));
+        }
+#endif
+        else {
+            //dropping the last reference unmaps and unlinks every segment
+            stream.setSink(nullptr);
+            UE_LOG(LogTemp, Log, TEXT("[AirSim][stream] sink removed"));
+        }
+    }),
+    ECVF_Default);
+
+/** Report what the seam has carried, and for the loopback, what it is currently holding. */
+static FAutoConsoleCommand CmdStreamStats(
+    TEXT("airsim.StreamStats"),
+    TEXT("Phase C: print publish-seam counters and the loopback's live topics."),
+    FConsoleCommandDelegate::CreateLambda([]() {
+        auto& stream = msr::airlib::SensorStream::singleton();
+        const auto st = stream.stats();
+        UE_LOG(LogTemp, Log,
+               TEXT("[AirSim][stream] sink=%s frames=%llu bytes=%.1f MB drops=%llu"),
+               stream.enabled() ? UTF8_TO_TCHAR(stream.sink()->name()) : TEXT("none"),
+               (unsigned long long)st.frames, st.bytes / 1e6, (unsigned long long)st.drops);
+        // ⚠ No downcast: UE builds RTTI-off, so dynamic_pointer_cast does not link. The sink
+        // reports its own contents through describe().
+        auto sink = stream.sink();
+        if (sink) {
+            for (const std::string& line : sink->describe())
+                UE_LOG(LogTemp, Log, TEXT("[AirSim][stream]   %s"), UTF8_TO_TCHAR(line.c_str()));
+        }
+    }));
+
+namespace
+{
+    void publishToSensorStream(const std::string& vehicle_name,
+                               const msr::airlib::ImageCaptureBase::ImageResponse& response)
+    {
+        auto& stream = msr::airlib::SensorStream::singleton();
+        if (!stream.enabled())
+            return;
+
+        const uint8_t* payload = nullptr;
+        size_t bytes = 0;
+        if (response.pixels_as_float) {
+            payload = reinterpret_cast<const uint8_t*>(response.image_data_float.data());
+            bytes = response.image_data_float.size() * sizeof(float);
+        }
+        else {
+            payload = response.image_data_uint8.data();
+            bytes = response.image_data_uint8.size();
+        }
+        if (payload == nullptr || bytes == 0)
+            return;
+
+        msr::airlib::StreamFrameMeta meta;
+        meta.timestamp_ns = response.time_stamp;   //CAPTURE instant, not publish instant
+        meta.sequence = stream.nextSequence();
+        meta.width = static_cast<uint32_t>(response.width);
+        meta.height = static_cast<uint32_t>(response.height);
+        meta.payload_bytes = static_cast<uint32_t>(bytes);
+        meta.image_type = static_cast<uint8_t>(msr::airlib::Utils::toNumeric(response.image_type));
+        meta.pixels_as_float = response.pixels_as_float ? 1 : 0;
+        meta.channels = response.pixels_as_float ? 1 : 3;
+        meta.setNames(vehicle_name, response.camera_name);
+
+        stream.publish(meta, payload, bytes);
+    }
+}
+
 std::vector<WorldSimApi::ImageCaptureBase::ImageResponse> WorldSimApi::getImages(
     const std::vector<ImageCaptureBase::ImageRequest>& requests, const std::string& vehicle_name) const
 {
@@ -1002,6 +1109,9 @@ std::vector<WorldSimApi::ImageCaptureBase::ImageResponse> WorldSimApi::getImages
 
     const UnrealImageCapture* camera = simmode_->getImageCapture(vehicle_name);
     camera->getImages(requests, responses);
+
+    for (const auto& response : responses)
+        publishToSensorStream(vehicle_name, response);
 
     return responses;
 }
@@ -1072,6 +1182,7 @@ WorldSimApi::getImagesAllVehicles(
             if (idx < all_results.size() && j < reqs.size() && all_results[idx] != nullptr)
                 assembled_bytes += UnrealImageCapture::fillResponseFromResult(
                     reqs[j], *all_results[idx], all_responses[idx]);
+            publishToSensorStream(entry.first, all_responses[idx]);
             per_vehicle.push_back(all_responses[idx]);
         }
         out.emplace(entry.first, std::move(per_vehicle));
