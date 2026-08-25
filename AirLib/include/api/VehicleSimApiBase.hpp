@@ -11,6 +11,14 @@
 #include "physics/Environment.hpp"
 #include "common/AirSimSettings.hpp"
 
+/// Forward-declared on purpose: references need no definition, so the generic vehicle
+/// interface does not acquire a dependency on the URDF model for the sake of one debug hook.
+namespace urdf {
+struct CollisionDebugFilter;
+struct CollisionDebugSnapshot;
+struct PhysicsColliderSet;
+} // namespace urdf
+
 namespace msr
 {
 namespace airlib
@@ -35,6 +43,34 @@ namespace airlib
             //derived class should override if needed
         }
         //called when render changes are required at every render tick
+        /// Describe this vehicle's links as registerable MPM colliders (plan §11.1).
+        /// Returns false when the vehicle cannot say.
+        ///
+        /// ⚠ AN INPUT, unlike collisionDebugGeometry below. A Newton MPM sidecar registers
+        /// colliders from these numbers and pushes sand with them, so being wrong here deforms
+        /// terrain in the wrong place rather than merely drawing a wrong picture.
+        ///
+        /// Declared on the generic vehicle for the same reason as the debug hook: a caller holding
+        /// `VehicleSimApiBase*` cannot ask "are you a urdfbot?" in a build with RTTI off.
+        virtual bool describeColliders(urdf::PhysicsColliderSet& /*out*/) const { return false; }
+
+        /// Collision geometry as THIS vehicle's solver holds it, for the debug overlay.
+        /// Returns false when the vehicle cannot say, which is the honest default.
+        ///
+        /// ⚠ Declared here, on the generic vehicle, rather than on the URDF sim api — because a
+        /// caller holding `VehicleSimApiBase*` cannot ask "are you a urdfbot?" in this build.
+        /// Unreal compiles with RTTI off, so `dynamic_cast` does not exist and a `static_cast` to
+        /// the wrong sim api is silent UB. A virtual that every vehicle can answer is the only
+        /// safe discriminator, and it leaves room for the Chaos and FastPhysics vehicles to answer
+        /// it too once they have a shared scene.
+        ///
+        /// ⚠ A VIEW, NEVER AN INPUT. Nothing in the simulation may branch on what this returns.
+        virtual bool collisionDebugGeometry(const urdf::CollisionDebugFilter& /*filter*/,
+                                            urdf::CollisionDebugSnapshot& /*out*/) const
+        {
+            return false;
+        }
+
         virtual void updateRendering(float dt)
         {
             unused(dt);

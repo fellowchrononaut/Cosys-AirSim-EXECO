@@ -5,10 +5,12 @@
 #define airsim_core_World_hpp
 
 #include <functional>
+#include <stdexcept>
 #include "common/Common.hpp"
 #include "common/UpdatableContainer.hpp"
 #include "PhysicsEngineBase.hpp"
 #include "PhysicsBody.hpp"
+#include "PhysicsSceneCoordinator.hpp"
 #include "common/common_utils/ScheduledExecutor.hpp"
 #include "common/ClockFactory.hpp"
 
@@ -25,15 +27,45 @@ namespace airlib
         {
             World::clear();
             setName("World");
-            physics_engine_->setParent(this);
-            if (physics_engine)
-                physics_engine_->clear();
+            if (physics_engine_ != nullptr)
+                physics_engine_->setParent(this);
         }
+
+        /** Make one authoritative fixed timestep the solver's dt for every subsequent tick.
+         *
+         * ⚠ This deliberately decouples simulation time from the executor's measured wall period.
+         * Under load the executor falls behind and the sim runs slower than real time; it never
+         * integrates a longer, incidental interval to catch up, because a dt that depends on
+         * machine load makes a run irreproducible. Legacy mode never calls this and keeps deriving
+         * dt from the clock exactly as before.
+         *
+         * The coordinator pointer is borrowed. Its owner must outlive this World, which
+         * ASimModeWorldBase guarantees by destroying the physics world first.
+         */
+        void enableFixedStep(TTimeDelta fixed_step_seconds, PhysicsSceneCoordinator* coordinator,
+                             const PhysicsResetPolicy& reset_policy)
+        {
+            if (!(fixed_step_seconds > 0))
+                throw std::invalid_argument("World: fixed step must be positive");
+            fixed_step_seconds_ = fixed_step_seconds;
+            coordinator_ = coordinator;
+            reset_policy_ = reset_policy;
+        }
+
+        bool isFixedStep() const { return fixed_step_seconds_ > 0; }
+        TTimeDelta getFixedStep() const { return fixed_step_seconds_; }
 
         //override updatable interface so we can synchronize physics engine
         //*** Start: UpdatableState implementation ***//
         virtual void resetImplementation() override
         {
+            // The coordinator's global transaction runs FIRST and as one barrier: it advances the
+            // reset epoch, rebuilds every shared scene from the frozen manifest, and performs the
+            // approved pre-settle with nothing published. Only then may the members restore
+            // themselves, because a vehicle api reads the state that transaction produced.
+            if (coordinator_ != nullptr && coordinator_->enabled())
+                coordinator_->reset("world-reset", reset_policy_);
+
             UpdatableContainer::resetImplementation();
 
             if (physics_engine_)
@@ -42,6 +74,23 @@ namespace airlib
 
         virtual void update(float delta = 0) override
         {
+            if (fixed_step_seconds_ > 0) {
+                // One dt, chosen once, propagated everywhere: the clock advances by exactly this
+                // amount, the coordinator commits a step of exactly this length, and every member
+                // is handed the same value instead of measuring elapsed time for itself.
+                ClockFactory::get()->stepBy(fixed_step_seconds_);
+                const float fixed_delta = static_cast<float>(fixed_step_seconds_);
+
+                if (coordinator_ != nullptr && coordinator_->enabled())
+                    coordinator_->step(fixed_step_seconds_);
+
+                UpdatableContainer::update(fixed_delta);
+
+                if (physics_engine_)
+                    physics_engine_->update(fixed_delta);
+                return;
+            }
+
             ClockFactory::get()->step();
 
             //first update our objects
@@ -146,6 +195,9 @@ namespace airlib
     private:
         bool worldUpdatorAsync(uint64_t dt_nanos)
         {
+            // ⚠ The executor's measured period is diagnostic, never the solver's dt. In fixed-step
+            // mode update() uses the configured timestep; in legacy mode every consumer still
+            // derives its own dt from the clock, which is what this path has always done.
             unused(dt_nanos);
 
             try {
@@ -166,6 +218,13 @@ namespace airlib
     private:
         std::unique_ptr<PhysicsEngineBase> physics_engine_ = nullptr;
         common_utils::ScheduledExecutor executor_;
+
+        /// Zero means legacy clock-derived stepping. Any positive value is the one authoritative
+        /// simulation timestep for this world.
+        TTimeDelta fixed_step_seconds_ = 0;
+        /// Borrowed; owned by the sim mode which created this world. Null in legacy mode.
+        PhysicsSceneCoordinator* coordinator_ = nullptr;
+        PhysicsResetPolicy reset_policy_;
     };
 }
 } //namespace

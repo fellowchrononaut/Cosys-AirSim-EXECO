@@ -13,16 +13,49 @@
 #include "RenderRequest.h"
 #include <cmath>
 #include <cstdlib>
+#include <stdexcept>
 #include <ctime>
 #include <algorithm>
 #include "stream/SensorStream.hpp"
 #include "stream/SharedMemorySink.hpp"
+
+namespace
+{
+void requireMutableTopology(const char* operation)
+{
+    const auto& coordinator =
+        msr::airlib::AirSimSettings::singleton().physics_coordinator;
+    if (coordinator.isCoordinated()) {
+        throw std::logic_error(
+            std::string(operation) +
+            " is unavailable while PhysicsCoordinator.Mode is coordinated because "
+            "PhysicsCoordinator.TopologyPolicy=Fixed. Use Mode=Legacy, or restart with the "
+            "object declared in the startup scene manifest.");
+    }
+}
+
+void requireCoordinatedObjectMutationAdapter(const char* operation)
+{
+    const auto& coordinator =
+        msr::airlib::AirSimSettings::singleton().physics_coordinator;
+    if (coordinator.isCoordinated()) {
+        throw std::logic_error(
+            std::string(operation) +
+            " is unavailable while PhysicsCoordinator.Mode is coordinated. Directly changing "
+            "an Unreal actor would leave the frozen Box3D/MuJoCo scene and foreign proxies at "
+            "their old pose or collision shape. A future registered kinematic/teleport command "
+            "must route this mutation through the coordinator atomically.");
+    }
+}
+} // namespace
 
 WorldSimApi::WorldSimApi(ASimModeBase* simmode)
     : simmode_(simmode) {}
 
 bool WorldSimApi::loadLevel(const std::string& level_name)
 {
+    requireMutableTopology("simLoadLevel");
+
     bool success;
     using namespace std::chrono_literals;
 
@@ -46,6 +79,8 @@ bool WorldSimApi::loadLevel(const std::string& level_name)
 
 void WorldSimApi::spawnPlayer()
 {
+    requireMutableTopology("simSpawnPlayer");
+
     using namespace std::chrono_literals;
     UE_LOG(LogTemp, Log, TEXT("spawning player"));
     bool success{ false };
@@ -66,6 +101,8 @@ void WorldSimApi::spawnPlayer()
 
 bool WorldSimApi::destroyObject(const std::string& object_name)
 {
+    requireMutableTopology("simDestroyObject");
+
     bool result{ false };
     UAirBlueprintLib::RunCommandOnGameThread([this, &object_name, &result]() {
         AActor* actor = UAirBlueprintLib::FindActor<AActor>(simmode_, FString(object_name.c_str()));
@@ -95,6 +132,8 @@ std::vector<std::string> WorldSimApi::listAssets() const
 
 std::string WorldSimApi::spawnObject(const std::string& object_name, const std::string& load_object, const WorldSimApi::Pose& pose, const WorldSimApi::Vector3r& scale, bool physics_enabled, bool is_blueprint)
 {
+    requireMutableTopology("simSpawnObject");
+
     FString asset_name(load_object.c_str());
     FAssetData* load_asset = simmode_->asset_map.Find(asset_name);
 
@@ -282,6 +321,8 @@ void WorldSimApi::setTimeOfDay(bool is_enabled, const std::string& start_datetim
 
 bool WorldSimApi::addVehicle(const std::string& vehicle_name, const std::string& vehicle_type, const Pose& pose, const std::string& pawn_path)
 {
+    requireMutableTopology("simAddVehicle");
+
     bool result;
     UAirBlueprintLib::RunCommandOnGameThread([&]() {
         result = simmode_->createVehicleAtRuntime(vehicle_name, vehicle_type, pose, pawn_path);
@@ -460,6 +501,8 @@ WorldSimApi::Vector3r WorldSimApi::getObjectScale(const std::string& object_name
 
 bool WorldSimApi::setObjectPose(const std::string& object_name, const WorldSimApi::Pose& pose, bool teleport)
 {
+    requireCoordinatedObjectMutationAdapter("simSetObjectPose");
+
     bool result;
     UAirBlueprintLib::RunCommandOnGameThread([this, &object_name, &pose, teleport, &result]() {
         FTransform actor_transform = simmode_->getGlobalNedTransform().fromGlobalNed(pose);
@@ -480,6 +523,8 @@ bool WorldSimApi::setObjectPose(const std::string& object_name, const WorldSimAp
 
 bool WorldSimApi::setObjectScale(const std::string& object_name, const Vector3r& scale)
 {
+    requireCoordinatedObjectMutationAdapter("simSetObjectScale");
+
     bool result;
     UAirBlueprintLib::RunCommandOnGameThread([this, &object_name, &scale, &result]() {
         // AActor* actor = UAirBlueprintLib::FindActor<AActor>(simmode_, FString(object_name.c_str()));

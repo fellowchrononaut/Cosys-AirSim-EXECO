@@ -263,6 +263,19 @@ protected: //must overrides
     void registerVehiclesWithCameraDirector();
 
 protected: //optional overrides
+    // Called after world/clock setup but before any vehicle API is constructed. Coordinated
+    // physics uses this seam to create (or reject) its world-scoped scenes before a URDF backend
+    // can accidentally allocate the legacy one-private-world-per-robot implementation.
+    virtual void preparePhysicsScene();
+
+public:
+    /// The world's shared solver scenes, or null in Legacy mode.
+    ///
+    /// A vehicle sim api asks for this while it is being constructed; a null answer means it owns
+    /// its own private physics world exactly as it always has.
+    virtual class ICoordinatedPhysicsScene* getCoordinatedPhysicsScene() const { return nullptr; }
+
+protected:
     virtual APawn* createVehiclePawn(const AirSimSettings::VehicleSetting& vehicle_setting);
     virtual std::unique_ptr<PawnSimApi> createVehicleApi(APawn* vehicle_pawn);
     virtual void setupVehiclesAndCamera();

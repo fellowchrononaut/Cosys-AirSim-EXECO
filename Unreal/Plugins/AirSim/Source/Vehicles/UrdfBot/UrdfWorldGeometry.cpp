@@ -1,5 +1,7 @@
 #include "UrdfWorldGeometry.h"
 
+#include "common/AirSimSettings.hpp"
+
 #include "Chaos/HeightField.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/PrimitiveComponent.h"
@@ -424,8 +426,17 @@ FString FMirrorStats::Report() const
         S += TEXT("    concave one is fatter than it looks.\n");
     }
     if (ComponentsSkippedMovable > 0) {
+        // ⚠ Name the key that actually works IN THIS MODE. Coordinated runs reject the per-vehicle
+        // UrdfMirrorMovable outright - one shared world has one mirror policy - so a hint naming it
+        // would send the operator to a setting that refuses to load.
+        const bool coordinated =
+            msr::airlib::AirSimSettings::singleton().physics_coordinator.isCoordinated();
         S += TEXT("  ! movable colliders are NOT in the physics world - a robot passes through\n");
-        S += TEXT("    them however solid they look. Set UrdfMirrorMovable to track them.\n");
+        S += coordinated
+                 ? TEXT("    them however solid they look. Set\n"
+                        "    PhysicsCoordinator.StaticWorldMirror.IncludeMovable to track them\n"
+                        "    (one-directional: they push the robot, the robot never pushes them).\n")
+                 : TEXT("    them however solid they look. Set UrdfMirrorMovable to track them.\n");
         S += TEXT("    First few: ");
         for (int32 i = 0; i < SkippedMovableNames.Num(); ++i)
             S += (i ? TEXT(", ") : TEXT("")) + SkippedMovableNames[i];

@@ -168,6 +168,7 @@ void ASimModeBase::BeginPlay()
 
     UAirBlueprintLib::LogMessage(TEXT("Press F1 to see help"), TEXT(""), LogDebugLevel::Informational);
 
+    preparePhysicsScene();
     setupVehiclesAndCamera();
     FRecordingThread::init();
 
@@ -2229,6 +2230,14 @@ std::unique_ptr<PawnSimApi> ASimModeBase::createVehicleApi(APawn* vehicle_pawn)
 bool ASimModeBase::createVehicleAtRuntime(const std::string& vehicle_name, const std::string& vehicle_type,
                                           const msr::airlib::Pose& pose, const std::string& pawn_path)
 {
+    if (getSettings().physics_coordinator.isCoordinated()) {
+        Utils::log(
+            "simAddVehicle rejected: coordinated physics currently requires "
+            "PhysicsCoordinator.TopologyPolicy=Fixed; no pawn, API, or physics body was created",
+            Utils::kLogLevelError);
+        return false;
+    }
+
     // Convert to lowercase as done during settings loading
     const std::string vehicle_type_lower = Utils::toLower(vehicle_type);
     if (!isVehicleTypeSupported(vehicle_type_lower)) {
@@ -2595,6 +2604,18 @@ void ASimModeBase::registerVehiclesWithCameraDirector()
 void ASimModeBase::registerPhysicsBody(msr::airlib::VehicleSimApiBase* physicsBody)
 {
     // derived class shoudl override this method to add new vehicle to the physics engine
+}
+
+void ASimModeBase::preparePhysicsScene()
+{
+    // A global setting must never produce a half-coordinated run. Sim modes which actually own an
+    // AirLib world override this hook; every other mode rejects the request before vehicle APIs or
+    // their legacy/private physics are constructed.
+    if (getSettings().physics_coordinator.isCoordinated()) {
+        throw std::runtime_error(
+            "PhysicsCoordinator.Mode is coordinated, but the selected SimMode does not provide "
+            "a world-scoped physics coordinator. Use Mode=Legacy or a coordinated world SimMode.");
+    }
 }
 
 void ASimModeBase::getExistingVehiclePawns(TArray<AActor*>& pawns) const

@@ -27,6 +27,7 @@
 #include "CoreMinimal.h"
 
 #include "PawnSimApi.h"
+#include "SimMode/CoordinatedPhysicsScene.h"
 #include "UrdfBotPawn.h"
 #include "common/AirSimSettings.hpp"
 #include "urdf/UrdfCollisionAudit.hpp"
@@ -46,8 +47,11 @@ public:
     typedef msr::airlib::StateReporter StateReporter;
     typedef msr::airlib::AirSimSettings AirSimSettings;
 
-    UrdfBotSimApi(const Params& params, const AirSimSettings::VehicleSetting* vehicle_setting);
-    virtual ~UrdfBotSimApi() = default;
+    /// `coordinated_scene` is null in Legacy mode, and non-null when this robot must join the
+    /// world's shared solver scene instead of creating a private one.
+    UrdfBotSimApi(const Params& params, const AirSimSettings::VehicleSetting* vehicle_setting,
+                  ICoordinatedPhysicsScene* coordinated_scene = nullptr);
+    virtual ~UrdfBotSimApi();
 
     virtual void initialize() override;
 
@@ -69,6 +73,14 @@ public:
 
     const urdf::Robot& getModel() const { return model_; }
     urdf::UrdfRobotBackend* getBackend() const { return backend_.get(); }
+    /// The overlay's view of this robot. Delegates to whichever backend it has — shared or
+    /// private — under the same mutex every other backend read takes.
+    bool collisionDebugGeometry(const urdf::CollisionDebugFilter& filter,
+                                urdf::CollisionDebugSnapshot& out) const override;
+
+    /// This robot's links as MPM colliders, qualified by vehicle name.
+    bool describeColliders(urdf::PhysicsColliderSet& out) const override;
+
 
     /// The robot's kinematics and the simulator time they were sampled at, as ONE value.
     ///
@@ -78,6 +90,28 @@ public:
     /// separately would stamp the kinematics with a time up to a frame later than the frame they
     /// describe, and under a paused or scaled clock the gap is unbounded.
     msr::airlib::UrdfBotApiBase::UrdfBotState getUrdfBotState() const;
+
+    // --- coordinated physics, physics thread --------------------------------------------------
+    //
+    // ⚠ These replace update()'s solve, they do not supplement it. The shared world is advanced
+    // once per coordinated tick by its own scene participant; this robot only latches its commands
+    // before that solve and reads the result after it, which is the same order the private-world
+    // update() had inside one call.
+    void coordinatedPreSolve();
+    void coordinatedPostSolve(double dt);
+
+    /// Everything that needs solver state but could not run at load.
+    ///
+    /// ⚠ MuJoCo CANNOT be built one robot at a time. `mjs_attach` + `mj_compile` is a batch
+    /// operation, so a shared MuJoCo scene has no bodies until every articulation has joined and
+    /// the manifest commits — while Box3D's shared scene builds each robot immediately and is
+    /// queryable at once. The mass cross-check and the first rendered poses therefore run here,
+    /// driven by the participant's manifest-finalize hook, for backends that are not live at load.
+    /// Called on the game thread, once, and never throws: a diagnostic must not abort a scenario
+    /// that has already been committed.
+    void onSharedSceneReady() noexcept;
+
+    bool isCoordinated() const { return coordinated_scene_ != nullptr; }
 
 protected:
     virtual void resetImplementation() override;
@@ -128,11 +162,21 @@ private:
     /// (physics stopped under physics_world_->lock()).
     void refreshKinematicMirror();
 
+    /// Whether THIS robot maintains the world's kinematic obstacle mirror. Always true in Legacy
+    /// mode, where each robot owns a private world; in a shared world exactly one robot claims it.
+    bool owns_kinematic_mirror_ = true;
+
     /// Last drive axes written to the log, so the diagnostic fires on change rather than at 333 Hz.
     float last_logged_throttle_ = 0.0f;
     float last_logged_steering_ = 0.0f;
 
     const AirSimSettings::VehicleSetting* vehicle_setting_;
+
+    /// Borrowed from the sim mode, which owns it for the whole UWorld. Null in Legacy mode.
+    ICoordinatedPhysicsScene* coordinated_scene_ = nullptr;
+    /// The coordinator holds this by shared_ptr; it holds this api by raw pointer and is detached
+    /// in the destructor, so a callback can never reach a destroyed vehicle.
+    std::shared_ptr<class UrdfBotStepParticipant> step_participant_;
 
     urdf::Robot model_;
     std::unique_ptr<urdf::UrdfRobotBackend> backend_;
@@ -148,7 +192,10 @@ private:
     /// step (drive-joint writes, step()). Reset only races update() if something can invoke it from
     /// a thread other than the one update() runs on; deliberately left unaudited and unlocked here -
     /// scope this in if that turns out to happen.
-    std::mutex backend_mutex_;
+    /// `mutable` so the const collision-overlay read can take it. Taking the lock is not a
+    /// logical mutation of the vehicle; skipping it while the physics thread rebuilds every body
+    /// on reset would be a crash.
+    mutable std::mutex backend_mutex_;
     /// The URDF exactly as read from disk, served to clients through getUrdfXml(). Held because
     /// a ROS client in a container generally cannot open UrdfFile itself.
     std::string urdf_xml_raw_;
@@ -205,6 +252,8 @@ private:
     double height_field_half_extent_ = 0;
     bool has_height_field_ = false;
 
+    /// False while a shared scene has not yet produced solver state for this robot.
+    bool backend_state_available_ = true;
     bool built_ = false;
     int64_t steps_taken_ = 0;
 };

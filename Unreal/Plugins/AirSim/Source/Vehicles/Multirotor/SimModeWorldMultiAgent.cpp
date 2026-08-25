@@ -374,8 +374,11 @@ std::unique_ptr<PawnSimApi> ASimModeWorldMultiAgent::createVehicleSimApi(
         // every member regardless of whether it has a physics body.
         const auto* vehicle_setting =
             AirSimSettings::singleton().getVehicleSetting(pawn_sim_api_params.vehicle_name);
+        // Null unless PhysicsCoordinator.Mode is coordinated, in which case this robot joins the
+        // world's shared solver scene instead of creating a private one.
         auto vehicle_sim_api = std::unique_ptr<PawnSimApi>(
-            new UrdfBotSimApi(pawn_sim_api_params, vehicle_setting));
+            new UrdfBotSimApi(pawn_sim_api_params, vehicle_setting,
+                              getCoordinatedPhysicsScene()));
         vehicle_sim_api->initialize();
         return vehicle_sim_api;
     }

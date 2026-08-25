@@ -20,6 +20,8 @@
 #include "urdf/UrdfConvexDecomposition.hpp"
 #include "urdf/UrdfMimic.hpp"
 #include "urdf/UrdfModel.hpp"
+#include "urdf/UrdfCollisionDebug.hpp"
+#include "urdf/UrdfPhysicsDescriptor.hpp"
 #include "urdf/UrdfStaticWorld.hpp"
 
 #include <memory>
@@ -333,6 +335,29 @@ public:
     virtual double totalMass() const = 0;
 
     // --- control ---------------------------------------------------------------------------
+    /// Describe every link as a registerable collider — mass, COM, inertia, pose, twist, geometry
+    /// and coupling role (plan §11.1). Returns false if this backend cannot say.
+    ///
+    /// ⚠ THIS IS AN INPUT, unlike collisionDebugGeometry below. A Newton MPM sidecar registers
+    /// colliders from exactly these numbers, so being wrong here is a wrong simulation rather than
+    /// a wrong picture. Read invariant 0 in UrdfPhysicsDescriptor.hpp before implementing it.
+    virtual bool describeColliders(PhysicsColliderSet& /*out*/) const { return false; }
+
+    /// Describe this robot's collision geometry as the SOLVER holds it, for drawing over the
+    /// Unreal geometry it approximates. Returns false if this backend cannot say.
+    ///
+    /// ⚠ NOT PURE, and deliberately so. A backend that cannot introspect its solver must answer
+    /// "I do not know" rather than be forced to invent an answer from what it was asked to build —
+    /// a readback that agrees with our beliefs by construction is worth nothing, and this whole
+    /// seam exists because two counters in this codebase were true about the wrong place.
+    ///
+    /// ⚠ A VIEW, NEVER AN INPUT. Nothing in the simulation may branch on what this returns.
+    virtual bool collisionDebugGeometry(const CollisionDebugFilter& /*filter*/,
+                                        CollisionDebugSnapshot& /*out*/) const
+    {
+        return false;
+    }
+
     virtual void setJointTarget(size_t joint, ControlMode mode, double value) = 0;
     virtual void setPositionGains(size_t joint, double hertz, double damping_ratio) = 0;
     virtual void applyExternalWrench(size_t link, const Wrench& wrench) = 0;

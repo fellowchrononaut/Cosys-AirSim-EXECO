@@ -35,6 +35,7 @@ endif()
 file(GLOB_RECURSE ${PROJECT_NAME}_sources 
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/api/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/common/common_utils/*.cpp
+  ${AIRSIM_ROOT}/${PROJECT_NAME}/src/physics/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/safety/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/vehicles/car/api/*.cpp
   ${AIRSIM_ROOT}/${PROJECT_NAME}/src/vehicles/computervision/api/*.cpp
@@ -50,6 +51,13 @@ file(GLOB_RECURSE ${PROJECT_NAME}_sources
 # always built; the backends are added below, only when the dependency is present.
 file(GLOB ${PROJECT_NAME}_urdf_sources ${AIRSIM_ROOT}/${PROJECT_NAME}/src/urdf/*.cpp)
 list(APPEND ${PROJECT_NAME}_sources ${${PROJECT_NAME}_urdf_sources})
+
+# The Newton MPM sidecar link. Always built, and deliberately: it depends on nothing but POSIX
+# mmap and the URDF descriptor headers, so it does not compromise the "byte-identical without the
+# optional dependency" guarantee that governs the backends above. Newton itself is a separate
+# PROCESS, not a library — there is nothing here to link against.
+file(GLOB ${PROJECT_NAME}_mpm_sources ${AIRSIM_ROOT}/${PROJECT_NAME}/src/mpm/*.cpp)
+list(APPEND ${PROJECT_NAME}_sources ${${PROJECT_NAME}_mpm_sources})
 
 # tinyxml2, vendored as a single translation unit and compiled into AirLib rather than carried as
 # a separate dependency. The URDF parser is the only consumer and it lives here; no plugin code
@@ -112,6 +120,18 @@ else()
 endif()
 
 add_library(${PROJECT_NAME} STATIC ${${PROJECT_NAME}_sources})
+
+# Standalone transaction/state-machine coverage for the engine-neutral coordinator. Keep it out of
+# the default production build, but make it a first-class target and CTest without linking AirLib,
+# Unreal, RPC, or any optional physics solver.
+add_executable(PhysicsSceneCoordinatorTests EXCLUDE_FROM_ALL
+  ${AIRSIM_ROOT}/AirLib/src/physics/PhysicsSceneCoordinator.cpp
+  ${AIRSIM_ROOT}/AirLib/tests/PhysicsSceneCoordinatorTests.cpp
+)
+target_include_directories(PhysicsSceneCoordinatorTests PRIVATE
+  ${AIRSIM_ROOT}/AirLib/include
+)
+add_test(NAME PhysicsSceneCoordinatorTests COMMAND PhysicsSceneCoordinatorTests)
 
 CommonTargetLink()
 target_link_libraries(${PROJECT_NAME} ${RPC_LIB})

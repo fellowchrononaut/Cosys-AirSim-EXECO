@@ -49,6 +49,11 @@ namespace airlib
             return step_;
         }
 
+        virtual TTimeDelta fixedStepSeconds() const override
+        {
+            return step_;
+        }
+
         virtual TTimePoint nowNanos() const override
         {
             return current_;

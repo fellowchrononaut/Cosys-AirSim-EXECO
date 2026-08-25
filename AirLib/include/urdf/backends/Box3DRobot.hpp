@@ -20,6 +20,8 @@
 
 namespace b3urdf {
 
+class Box3DPhysicsScene;
+
 struct BuildOptions {
     /// Box3D rejects fewer than 4 substeps for stiff chains.
     int substeps = 4;
@@ -283,8 +285,15 @@ public:
 
     int stepsTaken() const { return steps_taken_; }
     const BuildOptions& options() const { return opts_; }
+    /// True for the legacy one-robot/one-world path. A robot returned by Box3DPhysicsScene is a
+    /// participant in that scene and the scene alone owns stepping and reset.
+    bool ownsWorld() const { return owns_world_; }
+    /// True once solver objects exist for this robot.
+    bool isBuilt() const { return built_; }
 
 private:
+    friend class Box3DPhysicsScene;
+
     struct LinkRec {
         std::string name;
         b3BodyId body = b3_nullBodyId;
@@ -356,6 +365,8 @@ private:
     void instantiateKinematic();
     void addKinematicShapes(KinematicRec& r);
 
+    /// Tear down this robot's solver objects. The legacy path also destroys `world_`; a robot in a
+    /// Box3DPhysicsScene destroys only its own bodies because the scene owns the shared world.
     void destroyWorld();
     void createWorld();
     void instantiate();
@@ -377,6 +388,14 @@ private:
     /// the latter's position is float in both precision modes — see Box3DMath.hpp.
     WorldPose kinematicTransform(size_t link) const;
 
+    /// Shared-scene seam. These are private so no caller can accidentally step or rebuild only one
+    /// participant in a shared world; Box3DPhysicsScene is the sole owner of that lifecycle.
+    void buildInWorld(const urdf::Robot& model, const BuildOptions& opts, b3WorldId world);
+    std::unique_ptr<Box3DRobot> cloneIntoWorld(b3WorldId world) const;
+    void prepareSharedStep();
+    void finishSharedStep();
+    void swapSharedRuntime(Box3DRobot& other) noexcept;
+
     urdf::Robot model_;
     BuildOptions opts_;
     std::vector<urdf::MimicClassification> mimic_;
@@ -388,6 +407,7 @@ private:
     std::vector<JointControl> control_;
     std::vector<KinematicRec> kinematic_;
     b3WorldId world_ = b3_nullWorldId;
+    bool owns_world_ = true;
     /// Held, not borrowed: the cook must outlive every world whose shapes reference its meshes,
     /// and it must survive reset()'s world rebuild.
     std::shared_ptr<const Box3DStaticGeometry> static_geometry_;

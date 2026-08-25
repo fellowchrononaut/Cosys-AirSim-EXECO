@@ -12,6 +12,7 @@
 #include "sensors/SensorBase.hpp"
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <vector>
@@ -443,6 +444,240 @@ namespace airlib
         };    
 
         using VehicleLightSettingMap = std::map<std::string, LightSetting>;
+
+        // --- world-scoped physics coordinator settings --------------------------------------
+        //
+        // These are deliberately data-only settings records. Phase 0 parses and validates the
+        // contract, but does not put solver handles or Unreal object pointers in AirLib settings.
+        // Runtime resolution belongs to the world-scoped coordinator manifest.
+        enum class PhysicsCoordinatorMode {
+            Legacy,
+            CoordinatedSingleBackend,
+            MixedBackendExperimental
+        };
+
+        enum class ChaosMpmRegistrationMode {
+            Explicit
+        };
+
+        struct ChaosMpmRegistrationSetting
+        {
+            ChaosMpmRegistrationMode mode = ChaosMpmRegistrationMode::Explicit;
+            std::vector<std::string> include_tags;
+            std::vector<std::string> exclude_tags;
+        };
+
+        enum class StaticWorldCollisionSource {
+            Auto,
+            Simple,
+            Complex
+        };
+
+        /** The ONE static-world mirror policy for a coordinated world.
+         *
+         * A shared solver scene has exactly one static world, so the mirror cannot keep being
+         * described per robot: whichever robot initialised first would silently define the level
+         * every other robot then collides with. In coordinated modes the per-vehicle `UrdfMirror*`
+         * keys are therefore rejected rather than merged, and these values are the only source.
+         */
+        struct StaticWorldMirrorSetting
+        {
+            bool enabled = true;
+            StaticWorldCollisionSource collision_source = StaticWorldCollisionSource::Auto;
+            bool include_movable = false;
+            bool include_other_vehicles = false;
+            bool include_landscape = true;
+            bool include_instanced_meshes = true;
+            int max_instances = 50000;
+            std::vector<std::string> required_tags;
+            std::vector<std::string> excluded_tags;
+            double default_friction = 0.7;
+            double default_restitution = 0.0;
+        };
+
+        enum class CoordinatedGroundPlaneMode {
+            None,
+            Explicit
+        };
+
+        /** The one scaffolding floor for a coordinated world.
+         *
+         * ⚠ There is no `Probe` mode in v1, and its absence is deliberate. Probing traces downward
+         * from ONE robot's spawn; in a private world that was the robot's own floor, but a shared
+         * world has one floor for everybody and deriving it from whichever robot initialised first
+         * is precisely the ambiguity coordinated mode exists to remove. A world floor is either
+         * authored or absent; real level geometry arrives through the static mirror instead.
+         */
+        struct CoordinatedGroundPlaneSetting
+        {
+            CoordinatedGroundPlaneMode mode = CoordinatedGroundPlaneMode::None;
+            double z = 0.0;
+            double half_extent = 200.0;
+            double friction = 0.9;
+        };
+
+        enum class GroundHeightFieldMode {
+            None,
+            Authored,
+            AutoFromSpawns
+        };
+
+        /** The ONE ground height field for a coordinated world.
+         *
+         * ⚠ A per-robot field is not a shared world's ground. The legacy MuJoCo path samples a
+         * patch centred on each robot and recentres it as that robot drives; in one scene that
+         * would move the floor for everybody, and two overlapping patches would contact the same
+         * foot twice. So the region is authored, and `AutoFromSpawns` is an explicit opt-in that
+         * says loudly in the log that it derived one.
+         */
+        struct GroundHeightFieldSetting
+        {
+            GroundHeightFieldMode mode = GroundHeightFieldMode::None;
+
+            // Authored region.
+            double center_x = 0.0;
+            double center_y = 0.0;
+            double half_extent = 0.0;
+
+            /// AutoFromSpawns: how far beyond the vehicles' bounding box to sample.
+            double margin = 10.0;
+
+            /// One downward trace per cell, on the game thread at scenario build. The cap turns an
+            /// over-large region into a clear error instead of a multi-minute freeze at load.
+            double cell_size = 0.5;
+            int max_cells = 1000000;
+
+            bool isEnabled() const { return mode != GroundHeightFieldMode::None; }
+
+            /// Grid side for a given half extent, and the cell count it implies.
+            int samplesPerSide(double extent) const
+            {
+                const double span = 2.0 * extent;
+                return static_cast<int>(span / cell_size) + 1;
+            }
+        };
+
+        struct PhysicsCoordinatorSetting
+        {
+            PhysicsCoordinatorMode mode = PhysicsCoordinatorMode::Legacy;
+            std::string cross_engine_contact = "ReciprocalKinematicProxy";
+            std::string topology_policy = "Fixed";
+            bool reset_simulation_time = true;
+
+            // These defaults are active only in coordinated modes. Legacy keeps the existing
+            // per-robot UrdfSettleSeconds path and never consults these values.
+            bool presettle = true;
+            double presettle_seconds = 0.5;
+
+            ChaosMpmRegistrationSetting chaos_mpm_registration;
+            StaticWorldMirrorSetting static_world_mirror;
+            CoordinatedGroundPlaneSetting ground_plane;
+            GroundHeightFieldSetting ground_height_field;
+
+            bool isCoordinated() const
+            {
+                return mode != PhysicsCoordinatorMode::Legacy;
+            }
+        };
+
+        enum class PhysicsObjectSourceType {
+            LevelComponent
+        };
+
+        enum class PhysicsObjectAuthority {
+            Chaos,
+            Box3D,
+            MuJoCo,
+            None
+        };
+
+        enum class PhysicsObjectMotionType {
+            Static,
+            Kinematic,
+            Dynamic
+        };
+
+        struct PhysicsObjectSourceSetting
+        {
+            PhysicsObjectSourceType type = PhysicsObjectSourceType::LevelComponent;
+            std::string actor_path;
+            std::string component_path;
+        };
+
+        struct PhysicsObjectSetting
+        {
+            std::string object_id;
+            PhysicsObjectSourceSetting source;
+
+            // Authority and motion type are sparse external overrides. If absent, the future
+            // manifest builder resolves them from the authored component/profile precedence chain.
+            bool has_physics_authority = false;
+            PhysicsObjectAuthority physics_authority = PhysicsObjectAuthority::None;
+            bool has_motion_type = false;
+            PhysicsObjectMotionType motion_type = PhysicsObjectMotionType::Static;
+
+            bool interact_with_mpm = false;
+            bool has_mpm_patches = false;
+            std::vector<std::string> mpm_patches;
+        };
+
+        struct PhysicsVector3Setting
+        {
+            double x = 0;
+            double y = 0;
+            double z = 0;
+        };
+
+        struct DeformableTerrainRegionSetting
+        {
+            PhysicsVector3Setting center;
+            PhysicsVector3Setting size;
+        };
+
+        enum class DeformableTerrainBackend {
+            NewtonMPM
+        };
+
+        enum class DeformableTerrainCouplingMode {
+            KinematicOneWay
+        };
+
+        enum class DeformableTerrainRigidSurfacePolicy {
+            AuthoredReplacementPatch
+        };
+
+        struct DeformableTerrainCouplingSetting
+        {
+            DeformableTerrainCouplingMode mode = DeformableTerrainCouplingMode::KinematicOneWay;
+            int rigid_ticks_per_mpm_step = 0;
+        };
+
+        struct DeformableTerrainSetting
+        {
+            std::string terrain_id;
+            bool enabled = true;
+            DeformableTerrainBackend backend = DeformableTerrainBackend::NewtonMPM;
+            int seed = 0;
+            DeformableTerrainRegionSetting region;
+            DeformableTerrainCouplingSetting coupling;
+            DeformableTerrainRigidSurfacePolicy rigid_surface_policy =
+                DeformableTerrainRigidSurfacePolicy::AuthoredReplacementPatch;
+
+            // Seed/region/coupling values have no scientific defaults. Disabled placeholders may
+            // omit them; enabled terrains must provide them explicitly.
+            bool has_backend = false;
+            bool has_seed = false;
+            bool has_region = false;
+            bool has_coupling = false;
+            bool has_rigid_surface_policy = false;
+        };
+
+        struct UrdfLinkPhysicsSetting
+        {
+            bool interact_with_mpm = false;
+            bool has_mpm_patches = false;
+            std::vector<std::string> mpm_patches;
+        };
         
         struct VehicleSetting
         {
@@ -936,6 +1171,10 @@ namespace airlib
             };
             UrdfDriveSetting urdf_drive;
 
+            /// Coordinator/MPM participation policy keyed by exact URDF link name. This never
+            /// overrides robot collision, mass, inertia, joints, or controls from URDF/MJCF.
+            std::map<std::string, UrdfLinkPhysicsSetting> urdf_link_physics;
+
             VehicleSetting()
             {
             }
@@ -1141,6 +1380,9 @@ namespace airlib
         std::map<std::string, std::unique_ptr<BeaconSetting>> beacons;
         std::map<std::string, std::unique_ptr<PassiveEchoBeaconSetting>> passive_echo_beacons;
         std::map<std::string, std::unique_ptr<LightSetting>> world_lights;
+        PhysicsCoordinatorSetting physics_coordinator;
+        std::map<std::string, PhysicsObjectSetting> physics_objects;
+        std::map<std::string, DeformableTerrainSetting> deformable_terrains;
         float speed_unit_factor = 1.0f;
         std::string speed_unit_label = "m\\s";
         std::map<std::string, std::shared_ptr<SensorSetting>> sensor_defaults;
@@ -1168,10 +1410,23 @@ namespace airlib
         {
             warning_messages.clear();
             error_messages.clear();
+
+            // `AirSimSettings` is a process singleton and tests/editor reload it in place. Clear the
+            // whole new coordinator surface (and vehicle-owned UrdfLinkPhysics records) before any
+            // parsing that may throw, so a failed or minimal reload cannot expose the previous run's
+            // registry under a newly reset mode.
+            physics_coordinator = PhysicsCoordinatorSetting();
+            physics_objects.clear();
+            deformable_terrains.clear();
+            vehicles.clear();
+
             const Settings& settings_json = Settings::singleton();
             checkSettingsVersion(settings_json);
 
             loadCoreSimModeSettings(settings_json, simmode_getter);
+            loadPhysicsCoordinatorSettings(settings_json);
+            loadPhysicsObjectSettings(settings_json);
+            loadDeformableTerrainSettings(settings_json);
             loadLevelSettings(settings_json);
             loadDefaultCameraSetting(settings_json, camera_defaults);
             loadCameraDirectorSetting(settings_json, camera_director, simmode_name);
@@ -1181,7 +1436,9 @@ namespace airlib
             loadPawnPaths(settings_json, pawn_paths);
             loadOtherSettings(settings_json);
             loadDefaultSensorSettings(simmode_name, settings_json, sensor_defaults);
-            loadVehicleSettings(simmode_name, settings_json, vehicles, sensor_defaults, camera_defaults);
+            loadVehicleSettings(simmode_name, settings_json, vehicles, sensor_defaults, camera_defaults,
+                                physics_coordinator.mode);
+            validateMpmPatchReferences();
             loadBeaconSettings(simmode_name, settings_json, beacons);
             loadPassiveEchoBeaconSettings(settings_json, passive_echo_beacons);
             loadWorldLightSettings(settings_json, world_lights);
@@ -1252,6 +1509,794 @@ namespace airlib
         }
 
     private:
+        static std::vector<std::string> getStrictObjectKeys(const Settings& object,
+                                                            const std::string& path)
+        {
+            if (!object.isObject())
+                throw std::invalid_argument("Settings key '" + path + "' must be a JSON object");
+
+            std::vector<std::string> keys;
+            object.getChildNames(keys);
+            return keys;
+        }
+
+        static bool getStrictObject(const Settings& parent, const std::string& key,
+                                    const std::string& path, Settings& child)
+        {
+            if (!parent.hasKey(key)) return false;
+            if (!parent.getChild(key, child) || !child.isObject())
+                throw std::invalid_argument("Settings key '" + path + "' must be a JSON object");
+            return true;
+        }
+
+        static void validateStrictKeys(const std::vector<std::string>& keys,
+                                       std::initializer_list<const char*> allowed,
+                                       const std::string& path)
+        {
+            for (const std::string& key : keys) {
+                bool found = false;
+                for (const char* allowed_key : allowed) {
+                    if (key == allowed_key) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                    throw std::invalid_argument("Unknown settings key '" + path + "." + key + "'");
+            }
+        }
+
+        static std::string getStrictString(const Settings& object, const std::string& key,
+                                           const std::string& path,
+                                           const std::string& default_value,
+                                           bool required = false)
+        {
+            if (!object.hasKey(key)) {
+                if (required)
+                    throw std::invalid_argument("Missing required settings key '" + path + "." + key + "'");
+                return default_value;
+            }
+            if (!object.isString(key))
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be a string");
+            try {
+                return object.getString(key, default_value);
+            }
+            catch (const std::exception&) {
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be a string");
+            }
+        }
+
+        static bool getStrictBool(const Settings& object, const std::string& key,
+                                  const std::string& path, bool default_value,
+                                  bool required = false)
+        {
+            if (!object.hasKey(key)) {
+                if (required)
+                    throw std::invalid_argument("Missing required settings key '" + path + "." + key + "'");
+                return default_value;
+            }
+            if (!object.isBool(key))
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be a boolean");
+            try {
+                return object.getBool(key, default_value);
+            }
+            catch (const std::exception&) {
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be a boolean");
+            }
+        }
+
+        static int getStrictInt(const Settings& object, const std::string& key,
+                                const std::string& path, int default_value,
+                                bool required = false)
+        {
+            if (!object.hasKey(key)) {
+                if (required)
+                    throw std::invalid_argument("Missing required settings key '" + path + "." + key + "'");
+                return default_value;
+            }
+            if (!object.isInteger(key))
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be an integer");
+            try {
+                return object.getInt(key, default_value);
+            }
+            catch (const std::exception&) {
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be an integer");
+            }
+        }
+
+        static double getStrictDouble(const Settings& object, const std::string& key,
+                                      const std::string& path, double default_value,
+                                      bool required = false)
+        {
+            if (!object.hasKey(key)) {
+                if (required)
+                    throw std::invalid_argument("Missing required settings key '" + path + "." + key + "'");
+                return default_value;
+            }
+            if (!object.isNumber(key))
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be a number");
+            try {
+                return object.getDouble(key, default_value);
+            }
+            catch (const std::exception&) {
+                throw std::invalid_argument("Settings key '" + path + "." + key + "' must be a number");
+            }
+        }
+
+        static bool getStrictStringArray(const Settings& object, const std::string& key,
+                                         const std::string& path, std::vector<std::string>& values,
+                                         bool allow_empty)
+        {
+            if (!object.hasKey(key)) return false;
+            values.clear();
+            try {
+                object.getStringArray(key, values);
+            }
+            catch (const std::exception&) {
+                throw std::invalid_argument("Settings key '" + path + "." + key +
+                                            "' must be an array of strings");
+            }
+            if (!allow_empty && values.empty())
+                throw std::invalid_argument("Settings key '" + path + "." + key +
+                                            "' must not be an empty array");
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (values[i].empty())
+                    throw std::invalid_argument("Settings key '" + path + "." + key +
+                                                "' must not contain an empty string");
+                for (size_t j = 0; j < i; ++j) {
+                    if (values[i] == values[j])
+                        throw std::invalid_argument("Settings key '" + path + "." + key +
+                                                    "' contains duplicate value '" + values[i] + "'");
+                }
+            }
+            return true;
+        }
+
+        static PhysicsVector3Setting loadStrictPhysicsVector(const Settings& parent,
+                                                              const std::string& key,
+                                                              const std::string& path)
+        {
+            Settings vector_json;
+            const std::string vector_path = path + "." + key;
+            if (!getStrictObject(parent, key, vector_path, vector_json))
+                throw std::invalid_argument("Missing required settings key '" + vector_path + "'");
+            const std::vector<std::string> keys = getStrictObjectKeys(vector_json, vector_path);
+            validateStrictKeys(keys, { "X", "Y", "Z" }, vector_path);
+
+            PhysicsVector3Setting value;
+            value.x = getStrictDouble(vector_json, "X", vector_path, 0.0, true);
+            value.y = getStrictDouble(vector_json, "Y", vector_path, 0.0, true);
+            value.z = getStrictDouble(vector_json, "Z", vector_path, 0.0, true);
+            return value;
+        }
+
+        void loadPhysicsCoordinatorSettings(const Settings& settings_json)
+        {
+            physics_coordinator = PhysicsCoordinatorSetting();
+
+            Settings coordinator_json;
+            if (!getStrictObject(settings_json, "PhysicsCoordinator", "PhysicsCoordinator",
+                                 coordinator_json))
+                return;
+
+            const std::vector<std::string> keys =
+                getStrictObjectKeys(coordinator_json, "PhysicsCoordinator");
+            validateStrictKeys(keys,
+                               { "Mode", "CrossEngineContact", "TopologyPolicy",
+                                 "ResetSimulationTime", "Presettle", "PresettleSeconds",
+                                 "ChaosMPMRegistration", "StaticWorldMirror", "GroundPlane",
+                                 "GroundHeightField" },
+                               "PhysicsCoordinator");
+
+            const std::string mode =
+                getStrictString(coordinator_json, "Mode", "PhysicsCoordinator", "", true);
+            if (mode == "Legacy")
+                physics_coordinator.mode = PhysicsCoordinatorMode::Legacy;
+            else if (mode == "CoordinatedSingleBackend")
+                physics_coordinator.mode = PhysicsCoordinatorMode::CoordinatedSingleBackend;
+            else if (mode == "MixedBackendExperimental")
+                physics_coordinator.mode = PhysicsCoordinatorMode::MixedBackendExperimental;
+            else
+                throw std::invalid_argument(
+                    "Settings key 'PhysicsCoordinator.Mode' must be one of: Legacy, "
+                    "CoordinatedSingleBackend, MixedBackendExperimental");
+
+            physics_coordinator.cross_engine_contact =
+                getStrictString(coordinator_json, "CrossEngineContact", "PhysicsCoordinator",
+                                physics_coordinator.cross_engine_contact);
+            if (physics_coordinator.cross_engine_contact != "ReciprocalKinematicProxy")
+                throw std::invalid_argument(
+                    "Settings key 'PhysicsCoordinator.CrossEngineContact' currently supports only "
+                    "'ReciprocalKinematicProxy'");
+
+            physics_coordinator.topology_policy =
+                getStrictString(coordinator_json, "TopologyPolicy", "PhysicsCoordinator",
+                                physics_coordinator.topology_policy);
+            if (physics_coordinator.topology_policy != "Fixed")
+                throw std::invalid_argument(
+                    "Settings key 'PhysicsCoordinator.TopologyPolicy' currently supports only 'Fixed'");
+
+            physics_coordinator.reset_simulation_time =
+                getStrictBool(coordinator_json, "ResetSimulationTime", "PhysicsCoordinator", true);
+            physics_coordinator.presettle =
+                getStrictBool(coordinator_json, "Presettle", "PhysicsCoordinator", true);
+            physics_coordinator.presettle_seconds =
+                getStrictDouble(coordinator_json, "PresettleSeconds", "PhysicsCoordinator", 0.5);
+
+            if (physics_coordinator.presettle_seconds < 0.0)
+                throw std::invalid_argument(
+                    "Settings key 'PhysicsCoordinator.PresettleSeconds' must be non-negative");
+            if (physics_coordinator.isCoordinated() && !physics_coordinator.reset_simulation_time)
+                throw std::invalid_argument(
+                    "Coordinated physics requires PhysicsCoordinator.ResetSimulationTime=true");
+            if (physics_coordinator.isCoordinated() && physics_coordinator.presettle &&
+                physics_coordinator.presettle_seconds <= 0.0)
+                throw std::invalid_argument(
+                    "PhysicsCoordinator.PresettleSeconds must be greater than zero when Presettle=true");
+
+            Settings registration_json;
+            if (getStrictObject(coordinator_json, "ChaosMPMRegistration",
+                                "PhysicsCoordinator.ChaosMPMRegistration", registration_json)) {
+                const std::string path = "PhysicsCoordinator.ChaosMPMRegistration";
+                const std::vector<std::string> registration_keys =
+                    getStrictObjectKeys(registration_json, path);
+                validateStrictKeys(registration_keys, { "Mode", "IncludeTags", "ExcludeTags" }, path);
+
+                const std::string registration_mode =
+                    getStrictString(registration_json, "Mode", path, "", true);
+                if (registration_mode == "Explicit")
+                    physics_coordinator.chaos_mpm_registration.mode =
+                        ChaosMpmRegistrationMode::Explicit;
+                else if (registration_mode == "Tagged" || registration_mode == "AllSupported")
+                    throw std::invalid_argument(
+                        "Settings value '" + registration_mode +
+                        "' for PhysicsCoordinator.ChaosMPMRegistration.Mode is reserved and not "
+                        "implemented in v1; use 'Explicit'");
+                else
+                    throw std::invalid_argument(
+                        "Settings key 'PhysicsCoordinator.ChaosMPMRegistration.Mode' currently "
+                        "supports only 'Explicit'");
+
+                getStrictStringArray(registration_json, "IncludeTags", path,
+                                     physics_coordinator.chaos_mpm_registration.include_tags, true);
+                getStrictStringArray(registration_json, "ExcludeTags", path,
+                                     physics_coordinator.chaos_mpm_registration.exclude_tags, true);
+            }
+
+            loadStaticWorldMirrorSettings(coordinator_json);
+            loadCoordinatedGroundPlaneSettings(coordinator_json);
+            loadGroundHeightFieldSettings(coordinator_json);
+        }
+
+        void loadGroundHeightFieldSettings(const Settings& coordinator_json)
+        {
+            const std::string path = "PhysicsCoordinator.GroundHeightField";
+            Settings field_json;
+            if (!getStrictObject(coordinator_json, "GroundHeightField", path, field_json))
+                return;
+            if (!physics_coordinator.isCoordinated())
+                throw std::invalid_argument(
+                    "Settings key '" + path +
+                    "' requires a coordinated PhysicsCoordinator.Mode; in Legacy mode each robot "
+                    "samples its own patch through UrdfGroundPlaneAuto");
+
+            const std::vector<std::string> keys = getStrictObjectKeys(field_json, path);
+            validateStrictKeys(keys,
+                               { "Mode", "Center", "HalfExtent", "Margin", "CellSize", "MaxCells" },
+                               path);
+
+            GroundHeightFieldSetting& field = physics_coordinator.ground_height_field;
+            const std::string mode = getStrictString(field_json, "Mode", path, "", true);
+            if (mode == "None")
+                field.mode = GroundHeightFieldMode::None;
+            else if (mode == "Authored")
+                field.mode = GroundHeightFieldMode::Authored;
+            else if (mode == "AutoFromSpawns")
+                field.mode = GroundHeightFieldMode::AutoFromSpawns;
+            else
+                throw std::invalid_argument(
+                    "Settings key '" + path +
+                    ".Mode' must be one of: None, Authored, AutoFromSpawns");
+
+            field.cell_size = getStrictDouble(field_json, "CellSize", path, field.cell_size);
+            field.max_cells = getStrictInt(field_json, "MaxCells", path, field.max_cells);
+            field.margin = getStrictDouble(field_json, "Margin", path, field.margin);
+            if (field.cell_size <= 0.0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".CellSize' must be greater than zero");
+            if (field.max_cells <= 0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".MaxCells' must be greater than zero");
+            if (field.margin < 0.0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".Margin' must be non-negative");
+
+            const bool has_center = field_json.hasKey("Center");
+            const bool has_extent = field_json.hasKey("HalfExtent");
+
+            if (field.mode == GroundHeightFieldMode::Authored) {
+                if (!has_center || !has_extent)
+                    throw std::invalid_argument(
+                        "Settings key '" + path +
+                        "' with Mode=Authored requires both Center and HalfExtent");
+                Settings center_json;
+                const std::string center_path = path + ".Center";
+                if (!getStrictObject(field_json, "Center", center_path, center_json))
+                    throw std::invalid_argument("Settings key '" + center_path +
+                                                "' must be a JSON object");
+                const std::vector<std::string> center_keys =
+                    getStrictObjectKeys(center_json, center_path);
+                validateStrictKeys(center_keys, { "X", "Y" }, center_path);
+                field.center_x = getStrictDouble(center_json, "X", center_path, 0.0, true);
+                field.center_y = getStrictDouble(center_json, "Y", center_path, 0.0, true);
+
+                field.half_extent = getStrictDouble(field_json, "HalfExtent", path, 0.0, true);
+                if (field.half_extent <= 0.0)
+                    throw std::invalid_argument("Settings key '" + path +
+                                                ".HalfExtent' must be greater than zero");
+
+                // Checked here, where the region is known, rather than discovered as a freeze at
+                // load: one downward trace per cell runs on the game thread at scenario build.
+                const long long side = field.samplesPerSide(field.half_extent);
+                const long long cells = side * side;
+                if (cells > field.max_cells)
+                    throw std::invalid_argument(
+                        "Settings key '" + path + "' would sample " + std::to_string(cells) +
+                        " cells (" + std::to_string(side) + " x " + std::to_string(side) +
+                        "), above MaxCells=" + std::to_string(field.max_cells) +
+                        ". Raise CellSize, shrink HalfExtent, or raise MaxCells deliberately.");
+            }
+            else if (has_center || has_extent) {
+                throw std::invalid_argument(
+                    "Settings keys '" + path + ".Center' and '.HalfExtent' only apply when "
+                    "Mode=Authored; AutoFromSpawns derives the region and None has none");
+            }
+        }
+
+        void loadCoordinatedGroundPlaneSettings(const Settings& coordinator_json)
+        {
+            const std::string path = "PhysicsCoordinator.GroundPlane";
+            Settings ground_json;
+            if (!getStrictObject(coordinator_json, "GroundPlane", path, ground_json))
+                return;
+            if (!physics_coordinator.isCoordinated())
+                throw std::invalid_argument(
+                    "Settings key '" + path +
+                    "' requires a coordinated PhysicsCoordinator.Mode; in Legacy mode the "
+                    "per-vehicle UrdfGroundPlaneZ and UrdfGroundPlaneAuto keys remain authoritative");
+
+            const std::vector<std::string> keys = getStrictObjectKeys(ground_json, path);
+            validateStrictKeys(keys, { "Mode", "Z", "HalfExtent", "Friction" }, path);
+
+            CoordinatedGroundPlaneSetting& ground = physics_coordinator.ground_plane;
+            const std::string mode = getStrictString(ground_json, "Mode", path, "", true);
+            if (mode == "None")
+                ground.mode = CoordinatedGroundPlaneMode::None;
+            else if (mode == "Explicit")
+                ground.mode = CoordinatedGroundPlaneMode::Explicit;
+            else if (mode == "Probe")
+                throw std::invalid_argument(
+                    "Settings key '" + path +
+                    ".Mode' does not support 'Probe': a downward probe describes one robot's spawn, "
+                    "not a shared world's floor. Use 'Explicit' with a Z, or rely on the static "
+                    "world mirror.");
+            else
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".Mode' must be one of: None, Explicit");
+
+            const bool has_z = ground_json.hasKey("Z");
+            ground.z = getStrictDouble(ground_json, "Z", path, ground.z);
+            ground.half_extent = getStrictDouble(ground_json, "HalfExtent", path, ground.half_extent);
+            ground.friction = getStrictDouble(ground_json, "Friction", path, ground.friction);
+
+            if (ground.mode == CoordinatedGroundPlaneMode::Explicit && !has_z)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".Z' is required when Mode is 'Explicit'");
+            if (ground.mode == CoordinatedGroundPlaneMode::None && has_z)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".Z' has no meaning when Mode is 'None'");
+            if (ground.half_extent <= 0.0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".HalfExtent' must be greater than zero");
+            if (ground.friction < 0.0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".Friction' must be non-negative");
+        }
+
+        void loadStaticWorldMirrorSettings(const Settings& coordinator_json)
+        {
+            const std::string path = "PhysicsCoordinator.StaticWorldMirror";
+            Settings mirror_json;
+            if (!getStrictObject(coordinator_json, "StaticWorldMirror", path, mirror_json))
+                return;
+            if (!physics_coordinator.isCoordinated())
+                throw std::invalid_argument(
+                    "Settings key '" + path +
+                    "' requires a coordinated PhysicsCoordinator.Mode; in Legacy mode the "
+                    "per-vehicle UrdfMirror* keys remain authoritative");
+
+            const std::vector<std::string> keys = getStrictObjectKeys(mirror_json, path);
+            validateStrictKeys(keys,
+                               { "Enabled", "CollisionSource", "IncludeMovable",
+                                 "IncludeOtherVehicles", "IncludeLandscape",
+                                 "IncludeInstancedMeshes", "MaxInstances", "RequiredTags",
+                                 "ExcludedTags", "DefaultFriction", "DefaultRestitution" },
+                               path);
+
+            StaticWorldMirrorSetting& mirror = physics_coordinator.static_world_mirror;
+            mirror.enabled = getStrictBool(mirror_json, "Enabled", path, mirror.enabled);
+
+            if (mirror_json.hasKey("CollisionSource")) {
+                const std::string source =
+                    getStrictString(mirror_json, "CollisionSource", path, "", true);
+                if (source == "Auto")
+                    mirror.collision_source = StaticWorldCollisionSource::Auto;
+                else if (source == "Simple")
+                    mirror.collision_source = StaticWorldCollisionSource::Simple;
+                else if (source == "Complex")
+                    mirror.collision_source = StaticWorldCollisionSource::Complex;
+                else
+                    throw std::invalid_argument(
+                        "Settings key '" + path +
+                        ".CollisionSource' must be one of: Auto, Simple, Complex");
+            }
+
+            mirror.include_movable =
+                getStrictBool(mirror_json, "IncludeMovable", path, mirror.include_movable);
+            mirror.include_other_vehicles = getStrictBool(mirror_json, "IncludeOtherVehicles", path,
+                                                          mirror.include_other_vehicles);
+            mirror.include_landscape =
+                getStrictBool(mirror_json, "IncludeLandscape", path, mirror.include_landscape);
+            mirror.include_instanced_meshes = getStrictBool(
+                mirror_json, "IncludeInstancedMeshes", path, mirror.include_instanced_meshes);
+            mirror.max_instances =
+                getStrictInt(mirror_json, "MaxInstances", path, mirror.max_instances);
+            getStrictStringArray(mirror_json, "RequiredTags", path, mirror.required_tags, true);
+            getStrictStringArray(mirror_json, "ExcludedTags", path, mirror.excluded_tags, true);
+            mirror.default_friction =
+                getStrictDouble(mirror_json, "DefaultFriction", path, mirror.default_friction);
+            mirror.default_restitution = getStrictDouble(mirror_json, "DefaultRestitution", path,
+                                                         mirror.default_restitution);
+
+            if (mirror.max_instances <= 0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".MaxInstances' must be greater than zero");
+            if (mirror.default_friction < 0.0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".DefaultFriction' must be non-negative");
+            if (mirror.default_restitution < 0.0 || mirror.default_restitution > 1.0)
+                throw std::invalid_argument("Settings key '" + path +
+                                            ".DefaultRestitution' must be within [0, 1]");
+
+            // A kinematic copy of another vehicle IS a cross-authority proxy edge. In a
+            // single-backend population every dynamic body is already a native body in the shared
+            // scene, so mirroring one would place a second, infinite-mass ghost of it in the same
+            // world.
+            if (mirror.include_other_vehicles &&
+                physics_coordinator.mode != PhysicsCoordinatorMode::MixedBackendExperimental)
+                throw std::invalid_argument(
+                    "Settings key '" + path +
+                    ".IncludeOtherVehicles' declares a kinematic proxy of another vehicle, which "
+                    "is a cross-authority edge. Use PhysicsCoordinator.Mode="
+                    "MixedBackendExperimental, or leave it false so same-backend robots contact "
+                    "natively in the shared scene");
+        }
+
+        void loadPhysicsObjectSettings(const Settings& settings_json)
+        {
+            physics_objects.clear();
+
+            Settings objects_json;
+            if (!getStrictObject(settings_json, "PhysicsObjects", "PhysicsObjects", objects_json))
+                return;
+            const std::vector<std::string> object_ids =
+                getStrictObjectKeys(objects_json, "PhysicsObjects");
+            if (object_ids.empty())
+                throw std::invalid_argument(
+                    "Settings key 'PhysicsObjects' must be a non-empty JSON object when present");
+
+            for (const std::string& object_id : object_ids) {
+                if (object_id.empty())
+                    throw std::invalid_argument("PhysicsObjects IDs must not be empty");
+                const std::string path = "PhysicsObjects." + object_id;
+                Settings object_json;
+                if (!getStrictObject(objects_json, object_id, path, object_json))
+                    throw std::invalid_argument("Settings key '" + path + "' must be a JSON object");
+                const std::vector<std::string> keys = getStrictObjectKeys(object_json, path);
+                validateStrictKeys(keys,
+                                   { "Source", "PhysicsAuthority", "MotionType",
+                                     "InteractWithMPM", "MPMPatches" },
+                                   path);
+
+                PhysicsObjectSetting object;
+                object.object_id = object_id;
+
+                Settings source_json;
+                const std::string source_path = path + ".Source";
+                if (!getStrictObject(object_json, "Source", source_path, source_json))
+                    throw std::invalid_argument("Missing required settings key '" + source_path + "'");
+                const std::vector<std::string> source_keys =
+                    getStrictObjectKeys(source_json, source_path);
+                validateStrictKeys(source_keys, { "Type", "ActorPath", "ComponentPath" }, source_path);
+                const std::string source_type =
+                    getStrictString(source_json, "Type", source_path, "", true);
+                if (source_type != "LevelComponent")
+                    throw std::invalid_argument(
+                        "Settings key '" + source_path + ".Type' currently supports only 'LevelComponent'");
+                object.source.type = PhysicsObjectSourceType::LevelComponent;
+                object.source.actor_path =
+                    getStrictString(source_json, "ActorPath", source_path, "", true);
+                object.source.component_path =
+                    getStrictString(source_json, "ComponentPath", source_path, "", true);
+                if (object.source.actor_path.empty() || object.source.component_path.empty())
+                    throw std::invalid_argument(
+                        "Settings keys '" + source_path + ".ActorPath' and '.ComponentPath' must not be empty");
+
+                if (object_json.hasKey("PhysicsAuthority")) {
+                    object.has_physics_authority = true;
+                    const std::string authority =
+                        getStrictString(object_json, "PhysicsAuthority", path, "", true);
+                    if (authority == "Chaos")
+                        object.physics_authority = PhysicsObjectAuthority::Chaos;
+                    else if (authority == "Box3D")
+                        object.physics_authority = PhysicsObjectAuthority::Box3D;
+                    else if (authority == "MuJoCo")
+                        object.physics_authority = PhysicsObjectAuthority::MuJoCo;
+                    else if (authority == "None")
+                        object.physics_authority = PhysicsObjectAuthority::None;
+                    else
+                        throw std::invalid_argument(
+                            "Settings key '" + path +
+                            ".PhysicsAuthority' must be one of: Chaos, Box3D, MuJoCo, None");
+                }
+
+                if (object_json.hasKey("MotionType")) {
+                    object.has_motion_type = true;
+                    const std::string motion =
+                        getStrictString(object_json, "MotionType", path, "", true);
+                    if (motion == "Static")
+                        object.motion_type = PhysicsObjectMotionType::Static;
+                    else if (motion == "Kinematic")
+                        object.motion_type = PhysicsObjectMotionType::Kinematic;
+                    else if (motion == "Dynamic")
+                        object.motion_type = PhysicsObjectMotionType::Dynamic;
+                    else
+                        throw std::invalid_argument(
+                            "Settings key '" + path +
+                            ".MotionType' must be one of: Static, Kinematic, Dynamic");
+                }
+
+                object.interact_with_mpm =
+                    getStrictBool(object_json, "InteractWithMPM", path, false);
+                object.has_mpm_patches =
+                    getStrictStringArray(object_json, "MPMPatches", path, object.mpm_patches, false);
+                if (object.has_mpm_patches && !object.interact_with_mpm)
+                    throw std::invalid_argument(
+                        "Settings key '" + path +
+                        ".MPMPatches' requires InteractWithMPM=true");
+
+                physics_objects.emplace(object_id, std::move(object));
+            }
+        }
+
+        void loadDeformableTerrainSettings(const Settings& settings_json)
+        {
+            deformable_terrains.clear();
+
+            Settings terrains_json;
+            if (!getStrictObject(settings_json, "DeformableTerrains", "DeformableTerrains",
+                                 terrains_json))
+                return;
+            const std::vector<std::string> terrain_ids =
+                getStrictObjectKeys(terrains_json, "DeformableTerrains");
+            if (terrain_ids.empty())
+                throw std::invalid_argument(
+                    "Settings key 'DeformableTerrains' must be a non-empty JSON object when present");
+
+            for (const std::string& terrain_id : terrain_ids) {
+                if (terrain_id.empty())
+                    throw std::invalid_argument("DeformableTerrains IDs must not be empty");
+                const std::string path = "DeformableTerrains." + terrain_id;
+                Settings terrain_json;
+                if (!getStrictObject(terrains_json, terrain_id, path, terrain_json))
+                    throw std::invalid_argument("Settings key '" + path + "' must be a JSON object");
+                const std::vector<std::string> keys = getStrictObjectKeys(terrain_json, path);
+                validateStrictKeys(keys,
+                                   { "Enabled", "Backend", "Seed", "Region", "Coupling",
+                                     "RigidSurfacePolicy" },
+                                   path);
+
+                DeformableTerrainSetting terrain;
+                terrain.terrain_id = terrain_id;
+                terrain.enabled = getStrictBool(terrain_json, "Enabled", path, true);
+
+                if (terrain_json.hasKey("Backend")) {
+                    terrain.has_backend = true;
+                    const std::string backend =
+                        getStrictString(terrain_json, "Backend", path, "", true);
+                    if (backend != "NewtonMPM")
+                        throw std::invalid_argument(
+                            "Settings key '" + path + ".Backend' currently supports only 'NewtonMPM'");
+                    terrain.backend = DeformableTerrainBackend::NewtonMPM;
+                }
+
+                if (terrain_json.hasKey("Seed")) {
+                    terrain.has_seed = true;
+                    terrain.seed = getStrictInt(terrain_json, "Seed", path, 0, true);
+                }
+
+                Settings region_json;
+                if (getStrictObject(terrain_json, "Region", path + ".Region", region_json)) {
+                    terrain.has_region = true;
+                    const std::vector<std::string> region_keys =
+                        getStrictObjectKeys(region_json, path + ".Region");
+                    validateStrictKeys(region_keys, { "Center", "Size" }, path + ".Region");
+                    terrain.region.center = loadStrictPhysicsVector(region_json, "Center", path + ".Region");
+                    terrain.region.size = loadStrictPhysicsVector(region_json, "Size", path + ".Region");
+                    if (terrain.region.size.x <= 0.0 || terrain.region.size.y <= 0.0 ||
+                        terrain.region.size.z <= 0.0)
+                        throw std::invalid_argument(
+                            "Settings key '" + path + ".Region.Size' components must be greater than zero");
+                }
+
+                Settings coupling_json;
+                if (getStrictObject(terrain_json, "Coupling", path + ".Coupling", coupling_json)) {
+                    terrain.has_coupling = true;
+                    const std::vector<std::string> coupling_keys =
+                        getStrictObjectKeys(coupling_json, path + ".Coupling");
+                    validateStrictKeys(coupling_keys, { "Mode", "RigidTicksPerMPMStep" },
+                                       path + ".Coupling");
+                    const std::string coupling_mode =
+                        getStrictString(coupling_json, "Mode", path + ".Coupling", "", true);
+                    if (coupling_mode != "KinematicOneWay")
+                        throw std::invalid_argument(
+                            "Settings key '" + path +
+                            ".Coupling.Mode' currently supports only 'KinematicOneWay'");
+                    terrain.coupling.mode = DeformableTerrainCouplingMode::KinematicOneWay;
+                    terrain.coupling.rigid_ticks_per_mpm_step =
+                        getStrictInt(coupling_json, "RigidTicksPerMPMStep", path + ".Coupling", 0, true);
+                    if (terrain.coupling.rigid_ticks_per_mpm_step <= 0)
+                        throw std::invalid_argument(
+                            "Settings key '" + path +
+                            ".Coupling.RigidTicksPerMPMStep' must be greater than zero");
+                }
+
+                if (terrain_json.hasKey("RigidSurfacePolicy")) {
+                    terrain.has_rigid_surface_policy = true;
+                    const std::string policy =
+                        getStrictString(terrain_json, "RigidSurfacePolicy", path, "", true);
+                    if (policy != "AuthoredReplacementPatch")
+                        throw std::invalid_argument(
+                            "Settings key '" + path +
+                            ".RigidSurfacePolicy' currently supports only 'AuthoredReplacementPatch'");
+                    terrain.rigid_surface_policy =
+                        DeformableTerrainRigidSurfacePolicy::AuthoredReplacementPatch;
+                }
+
+                if (terrain.enabled &&
+                    (!terrain.has_backend || !terrain.has_seed || !terrain.has_region ||
+                     !terrain.has_coupling || !terrain.has_rigid_surface_policy))
+                    throw std::invalid_argument(
+                        "Enabled deformable terrain '" + terrain_id +
+                        "' requires Backend, Seed, Region, Coupling, and RigidSurfacePolicy");
+
+                deformable_terrains.emplace(terrain_id, std::move(terrain));
+            }
+        }
+
+        static void loadUrdfLinkPhysicsSettings(
+            const Settings& vehicle_json, const std::string& vehicle_name,
+            std::map<std::string, UrdfLinkPhysicsSetting>& link_settings)
+        {
+            link_settings.clear();
+            Settings links_json;
+            const std::string root_path = "Vehicles." + vehicle_name + ".UrdfLinkPhysics";
+            if (!getStrictObject(vehicle_json, "UrdfLinkPhysics", root_path, links_json)) return;
+
+            const std::vector<std::string> link_names = getStrictObjectKeys(links_json, root_path);
+            if (link_names.empty())
+                throw std::invalid_argument(
+                    "Settings key '" + root_path + "' must be a non-empty JSON object when present");
+
+            for (const std::string& link_name : link_names) {
+                if (link_name.empty())
+                    throw std::invalid_argument("UrdfLinkPhysics link names must not be empty");
+                const std::string path = root_path + "." + link_name;
+                Settings link_json;
+                if (!getStrictObject(links_json, link_name, path, link_json))
+                    throw std::invalid_argument("Settings key '" + path + "' must be a JSON object");
+                const std::vector<std::string> keys = getStrictObjectKeys(link_json, path);
+                validateStrictKeys(keys, { "InteractWithMPM", "MPMPatches" }, path);
+
+                UrdfLinkPhysicsSetting setting;
+                setting.interact_with_mpm =
+                    getStrictBool(link_json, "InteractWithMPM", path, false, true);
+                setting.has_mpm_patches =
+                    getStrictStringArray(link_json, "MPMPatches", path, setting.mpm_patches, false);
+                if (setting.has_mpm_patches && !setting.interact_with_mpm)
+                    throw std::invalid_argument(
+                        "Settings key '" + path +
+                        ".MPMPatches' requires InteractWithMPM=true");
+
+                link_settings.emplace(link_name, std::move(setting));
+            }
+        }
+
+        /** One shared scene has one static world, so a per-robot description of it is ambiguous.
+         *
+         * These keys are rejected, not merged and not ignored: merging would make the level depend
+         * on robot initialisation order, and ignoring would leave an authored value that appears to
+         * take effect and does not.
+         */
+        static void rejectPerVehicleStaticWorldKeys(const Settings& settings_json,
+                                                    const std::string& vehicle_name)
+        {
+            static const struct {
+                const char* vehicle_key;
+                const char* world_key;
+            } migrations[] = {
+                { "UrdfMirrorWorldGeometry", "Enabled" },
+                { "UrdfMirrorMovable", "IncludeMovable" },
+                { "UrdfMirrorOtherVehicles", "IncludeOtherVehicles" },
+                { "UrdfMirrorLandscape", "IncludeLandscape" },
+                { "UrdfMirrorInstancedMeshes", "IncludeInstancedMeshes" },
+                { "UrdfMirrorMaxInstances", "MaxInstances" },
+                { "UrdfWorldGeometryTags", "RequiredTags" }
+            };
+
+            static const struct {
+                const char* vehicle_key;
+                const char* world_key;
+            } ground_migrations[] = {
+                { "UrdfGroundPlaneZ", "PhysicsCoordinator.GroundPlane.Z" },
+                { "UrdfGroundPlaneAuto", "PhysicsCoordinator.GroundPlane.Mode" }
+            };
+
+            for (const auto& migration : ground_migrations) {
+                if (settings_json.hasKey(migration.vehicle_key))
+                    throw std::invalid_argument(
+                        "Vehicle '" + vehicle_name + "' sets per-robot " +
+                        migration.vehicle_key +
+                        " while PhysicsCoordinator.Mode is coordinated. One shared world has one "
+                        "floor; move this to " + migration.world_key + ".");
+            }
+
+            for (const auto& migration : migrations) {
+                if (settings_json.hasKey(migration.vehicle_key))
+                    throw std::invalid_argument(
+                        "Vehicle '" + vehicle_name + "' sets per-robot " +
+                        migration.vehicle_key +
+                        " while PhysicsCoordinator.Mode is coordinated. One shared scene has one "
+                        "static world; move this to PhysicsCoordinator.StaticWorldMirror." +
+                        migration.world_key + ".");
+            }
+        }
+
+        void validateMpmPatchReferences() const
+        {
+            for (const auto& object_pair : physics_objects) {
+                const PhysicsObjectSetting& object = object_pair.second;
+                for (const std::string& patch : object.mpm_patches) {
+                    if (deformable_terrains.find(patch) == deformable_terrains.end())
+                        throw std::invalid_argument(
+                            "PhysicsObjects." + object_pair.first +
+                            ".MPMPatches names unknown deformable terrain '" + patch + "'");
+                }
+            }
+
+            for (const auto& vehicle_pair : vehicles) {
+                for (const auto& link_pair : vehicle_pair.second->urdf_link_physics) {
+                    for (const std::string& patch : link_pair.second.mpm_patches) {
+                        if (deformable_terrains.find(patch) == deformable_terrains.end())
+                            throw std::invalid_argument(
+                                "Vehicles." + vehicle_pair.first + ".UrdfLinkPhysics." +
+                                link_pair.first + ".MPMPatches names unknown deformable terrain '" +
+                                patch + "'");
+                    }
+                }
+            }
+        }
+
         void checkSettingsVersion(const Settings& settings_json)
         {
             bool has_default_settings = hasDefaultSettings(settings_json, settings_version_actual);
@@ -1555,7 +2600,8 @@ namespace airlib
         static std::unique_ptr<VehicleSetting> createVehicleSetting(const std::string& simmode_name, const Settings& settings_json,
                                                                     const std::string vehicle_name,
                                                                     std::map<std::string, std::shared_ptr<SensorSetting>>& sensor_defaults,
-                                                                    const CameraSetting& camera_defaults)
+                                                                    const CameraSetting& camera_defaults,
+                                                                    PhysicsCoordinatorMode coordinator_mode)
         {
             auto vehicle_type = Utils::toLower(settings_json.getString("VehicleType", ""));
 
@@ -1612,8 +2658,19 @@ namespace airlib
                     settings_json.getString("UrdfConvexDecompositionCacheDir", "");
                 vehicle_setting->urdf_convex_decomposition_flush_cache =
                     settings_json.getBool("UrdfConvexDecompositionFlushCache", false);
+                if (coordinator_mode != PhysicsCoordinatorMode::Legacy &&
+                    settings_json.hasKey("UrdfSettleSeconds"))
+                    throw std::invalid_argument(
+                        "Vehicle '" + vehicle_name +
+                        "' sets per-robot UrdfSettleSeconds while PhysicsCoordinator.Mode is "
+                        "coordinated. Remove UrdfSettleSeconds and use the world-level "
+                        "PhysicsCoordinator.Presettle and PhysicsCoordinator.PresettleSeconds keys.");
+                if (coordinator_mode != PhysicsCoordinatorMode::Legacy)
+                    rejectPerVehicleStaticWorldKeys(settings_json, vehicle_name);
                 vehicle_setting->urdf_settle_seconds =
-                    settings_json.getDouble("UrdfSettleSeconds", 0.5);
+                    coordinator_mode == PhysicsCoordinatorMode::Legacy
+                        ? settings_json.getDouble("UrdfSettleSeconds", 0.5)
+                        : 0.0;
                 vehicle_setting->urdf_ground_sample_extent =
                     settings_json.getDouble("UrdfGroundSampleExtent", 40.0);
                 vehicle_setting->urdf_static_world_radius =
@@ -1685,6 +2742,9 @@ namespace airlib
                 settings_json.getStringArray("UrdfWorldGeometryTags",
                                              vehicle_setting->urdf_world_geometry_tags);
 
+                loadUrdfLinkPhysicsSettings(settings_json, vehicle_name,
+                                            vehicle_setting->urdf_link_physics);
+
                 vehicle_setting->urdf_ground_plane_z =
                     settings_json.getDouble("UrdfGroundPlaneZ", Utils::nan<double>());
                 vehicle_setting->urdf_ground_plane_auto =
@@ -1732,6 +2792,11 @@ namespace airlib
                                    "TurtleBot) want SkidSteerJoints.",
                                    Utils::kLogLevelWarn);
                 }
+            }
+            else if (settings_json.hasKey("UrdfLinkPhysics")) {
+                throw std::invalid_argument(
+                    "Vehicle '" + vehicle_name + "' of type \"" + vehicle_type +
+                    "\" sets \"UrdfLinkPhysics\", which only \"urdfbot\" supports.");
             }
             else if (!settings_json.getString("PhysicsEngine", "").empty()) {
                 // Naming a backend on a vehicle that cannot have one is a silent no-op otherwise,
@@ -1917,7 +2982,8 @@ namespace airlib
         static void loadVehicleSettings(const std::string& simmode_name, const Settings& settings_json,
                                         std::map<std::string, std::unique_ptr<VehicleSetting>>& vehicles,
                                         std::map<std::string, std::shared_ptr<SensorSetting>>& sensor_defaults,
-                                        const CameraSetting& camera_defaults)
+                                        const CameraSetting& camera_defaults,
+                                        PhysicsCoordinatorMode coordinator_mode)
         {
             createDefaultVehicle(simmode_name, vehicles, sensor_defaults);
 
@@ -1933,7 +2999,8 @@ namespace airlib
                 for (const auto& key : keys) {
                     msr::airlib::Settings child;
                     vehicles_child.getChild(key, child);
-                    vehicles[key] = createVehicleSetting(simmode_name, child, key, sensor_defaults, camera_defaults);
+                    vehicles[key] = createVehicleSetting(simmode_name, child, key, sensor_defaults,
+                                                         camera_defaults, coordinator_mode);
                 }
             }
         }
@@ -2570,6 +3637,7 @@ namespace airlib
         void loadClockSettings(const Settings& settings_json)
         {
             clock_type = settings_json.getString("ClockType", "");
+            const bool clock_type_authored = !clock_type.empty();
 
             if (clock_type == "") {
                 //default value
@@ -2590,6 +3658,29 @@ namespace airlib
                         }
                     }
                 }
+            }
+
+            // Coordinated physics is fixed-step by contract: one dt is chosen once and propagated
+            // through the world, the coordinator, every participant scene and the sensor
+            // timestamps. A wall-clock-derived ScalableClock cannot supply that, so an authored one
+            // is a configuration error rather than a silent downgrade to a non-reproducible run.
+            if (physics_coordinator.isCoordinated()) {
+                for (const auto& vehicle : vehicles) {
+                    if (vehicle.second->vehicle_type == kVehicleTypePX4) {
+                        warning_messages.push_back(
+                            "Vehicle '" + vehicle.first +
+                            "' is PX4 while PhysicsCoordinator.Mode is coordinated. Coordinated "
+                            "physics forces a fixed-step clock, which does not track wall time; "
+                            "PX4 timing behaviour under this mode is untested.");
+                    }
+                }
+                if (clock_type_authored && clock_type != "SteppableClock")
+                    throw std::invalid_argument(
+                        "ClockType '" + clock_type +
+                        "' cannot be used while PhysicsCoordinator.Mode is coordinated: a "
+                        "wall-clock-derived clock has no fixed simulation timestep. Use "
+                        "ClockType=SteppableClock, or PhysicsCoordinator.Mode=Legacy.");
+                clock_type = "SteppableClock";
             }
 
             clock_speed = settings_json.getFloat("ClockSpeed", 1.0f);

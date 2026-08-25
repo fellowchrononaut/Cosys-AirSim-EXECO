@@ -48,6 +48,14 @@ namespace airlib
             return elapsed;
         }
 
+        /// The fixed simulation interval one step() advances, or 0 for a wall-derived clock.
+        ///
+        /// ⚠ A capability query rather than a downcast, deliberately: Unreal builds this code with
+        /// RTTI off, so `dynamic_cast<SteppableClock*>` does not compile in the plugin at all, and
+        /// a static_cast to the wrong clock type would be undefined behaviour that never announces
+        /// itself. Anything needing an authoritative fixed step asks for one and handles 0.
+        virtual TTimeDelta fixedStepSeconds() const { return 0; }
+
         virtual TTimePoint stepBy(TTimeDelta amount)
         {
             unused(amount);

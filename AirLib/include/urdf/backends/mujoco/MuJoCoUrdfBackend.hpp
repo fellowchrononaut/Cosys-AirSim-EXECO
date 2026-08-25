@@ -85,6 +85,11 @@ public:
     JointState getJointState(size_t joint) const override;
     double totalMass() const override;
 
+    bool collisionDebugGeometry(const CollisionDebugFilter& filter,
+                                CollisionDebugSnapshot& out) const override;
+
+    bool describeColliders(PhysicsColliderSet& out) const override;
+
     void setJointTarget(size_t joint, ControlMode mode, double value) override;
     void setPositionGains(size_t joint, double hertz, double damping_ratio) override;
     void applyExternalWrench(size_t link, const Wrench& wrench) override;
@@ -137,7 +142,12 @@ public:
 
     /// Largest absolute vertex coordinate seen in a REJECTED static shape. Non-zero
     /// means the mirror produced corrupt geometry, not merely awkward geometry.
+    /// Largest absolute vertex coordinate in the mirrored level, metres from the world origin.
     double staticWorstVertex() const { return static_worst_vertex_; }
+    /// Mesh references that could not be resolved to a readable file before MuJoCo parsed the URDF.
+    const std::vector<std::string>& unresolvedMeshes() const { return unresolved_meshes_; }
+    /// Triangles that fell entirely outside the region radius and were clipped away.
+    size_t staticTrianglesClippedAway() const { return static_triangles_clipped_away_; }
 
     /// Largest span of any single mirrored shape, and which level actor produced it.
     /// Reported ALWAYS, not only on rejection: it is the one number that identifies
@@ -146,7 +156,6 @@ public:
 
     /// Mirrored shapes that were vast and flat enough to become mjGEOM_PLANE rather
     /// than a convex mesh — typically the level's ground.
-    size_t staticPlanesEmitted() const { return static_planes_emitted_; }
     /// True if the ground came from a sampled height grid rather than the flat plane.
     bool usedHeightField() const { return used_height_field_; }
 
@@ -162,10 +171,8 @@ public:
     /// recompiling. Same rows/cols as at build time, or it refuses. False if this
     /// robot has no height field.
     bool updateGroundHeightField(const BackendOptions::HeightField& hf);
-    size_t staticShapesClipped() const { return static_shapes_clipped_; }
     /// Shapes skipped for being kilometres across - the level's ground, which the
     /// exactly-traced plane represents instead.
-    size_t staticShapesOversize() const { return static_shapes_oversize_; }
     /// Level triangles emitted as thin convex prisms - the exact surface
     /// representation that replaced convex decomposition for static geometry.
     size_t staticTrianglesEmitted() const { return static_triangles_emitted_; }
@@ -191,10 +198,6 @@ public:
         return (handle >= 0 && handle < static_cast<int>(kinematic_.size()))
                    ? kinematic_[static_cast<size_t>(handle)].mocapid : -1;
     }
-    size_t staticShapesClippedAway() const { return static_shapes_clipped_away_; }
-    double planeZ() const { return plane_z_; }
-    double planeSpanLoZ() const { return plane_span_lo_z_; }
-    const std::string& planeBody() const { return plane_body_; }
     const std::string& staticWorstSpanBody() const { return static_worst_span_body_; }
     void staticGeomBounds(double out_min[3], double out_max[3]) const
     {
@@ -255,6 +258,7 @@ private:
     std::map<std::string, size_t> joint_index_;
 
     std::shared_ptr<const StaticWorld> static_world_;
+    std::vector<std::string> unresolved_meshes_;
 
     /// Static geoms actually emitted, and mesh shapes that could not be. Reported for the same
     /// reason as the robot's own dropped collisions: level geometry that quietly did not load is a
@@ -264,17 +268,11 @@ private:
     size_t static_geoms_compiled_ = 0;
     double static_worst_vertex_ = 0;
     bool used_height_field_ = false;
-    size_t static_planes_emitted_ = 0;
-    size_t static_shapes_clipped_ = 0;
-    size_t static_shapes_oversize_ = 0;
     size_t static_triangles_emitted_ = 0;
     size_t static_triangles_skipped_ = 0;
+    size_t static_triangles_clipped_away_ = 0;
     size_t static_convex_objects_ = 0;
     size_t static_enclosures_ = 0;
-    size_t static_shapes_clipped_away_ = 0;
-    double plane_z_ = 0;
-    double plane_span_lo_z_ = 0;
-    std::string plane_body_;
     double static_worst_span_ = 0;
     std::string static_worst_span_body_;
     double ground_probe_distance_ = -1;

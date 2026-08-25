@@ -133,6 +133,55 @@ namespace airlib
             return doc_.size();
         }
 
+        /// True when this Settings view is backed by a JSON object. `getChild` intentionally
+        /// supports both objects and arrays for legacy callers, so strict schemas must use this
+        /// predicate after obtaining a child rather than inferring its type from iteration.
+        bool isObject() const
+        {
+            return doc_.type() == nlohmann::detail::value_t::object;
+        }
+
+        /// True when this Settings view is backed by a JSON array.
+        bool isArray() const
+        {
+            return doc_.type() == nlohmann::detail::value_t::array;
+        }
+
+        /// Non-coercing predicates for strict schemas. These inspect a named child without changing
+        /// the permissive conversion behavior of the legacy getString/getBool/getInt/getDouble API.
+        /// Duplicate JSON object names have already been resolved by the JSON parser before a
+        /// Settings view exists; detecting them would require changing the legacy parse path.
+        bool isString(const std::string& name) const
+        {
+            const auto it = doc_.find(name);
+            return it != doc_.end() && it->type() == nlohmann::detail::value_t::string;
+        }
+
+        bool isBool(const std::string& name) const
+        {
+            const auto it = doc_.find(name);
+            return it != doc_.end() && it->type() == nlohmann::detail::value_t::boolean;
+        }
+
+        bool isInteger(const std::string& name) const
+        {
+            const auto it = doc_.find(name);
+            if (it == doc_.end()) return false;
+            const auto type = it->type();
+            return type == nlohmann::detail::value_t::number_integer ||
+                   type == nlohmann::detail::value_t::number_unsigned;
+        }
+
+        bool isNumber(const std::string& name) const
+        {
+            const auto it = doc_.find(name);
+            if (it == doc_.end()) return false;
+            const auto type = it->type();
+            return type == nlohmann::detail::value_t::number_integer ||
+                   type == nlohmann::detail::value_t::number_unsigned ||
+                   type == nlohmann::detail::value_t::number_float;
+        }
+
         template <typename Container>
         void getChildNames(Container& c) const
         {

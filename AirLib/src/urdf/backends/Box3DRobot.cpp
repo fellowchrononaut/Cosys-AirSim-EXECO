@@ -130,6 +130,17 @@ Box3DRobot::~Box3DRobot()
 
 void Box3DRobot::destroyWorld()
 {
+    // A shared-scene robot owns its bodies, never the world. Destroying a body also destroys its
+    // attached joints, so links are sufficient to remove the robot from a still-live candidate
+    // world after a failed atomic rebuild. The scene guarantees this runs before it destroys the
+    // world itself.
+    if (!owns_world_ && b3World_IsValid(world_)) {
+        for (LinkRec& l : links_)
+            if (b3Body_IsValid(l.body)) b3DestroyBody(l.body);
+        for (KinematicRec& r : kinematic_)
+            if (b3Body_IsValid(r.body)) b3DestroyBody(r.body);
+    }
+
     for (auto& l : links_) {
         for (b3HullData* h : l.owned_hulls) b3DestroyHull(h);
         l.owned_hulls.clear();
@@ -144,7 +155,7 @@ void Box3DRobot::destroyWorld()
         r.body = b3_nullBodyId;
     }
 
-    if (b3World_IsValid(world_)) b3DestroyWorld(world_);
+    if (owns_world_ && b3World_IsValid(world_)) b3DestroyWorld(world_);
     world_ = b3_nullWorldId;
     links_.clear();
     joints_.clear();
@@ -156,6 +167,7 @@ void Box3DRobot::destroyWorld()
     massless_markers_.clear();
     accumulator_ = 0;
     steps_taken_ = 0;
+    built_ = false;
 }
 
 int Box3DRobot::addKinematicBody(const urdf::KinematicBody& body)
@@ -279,6 +291,11 @@ void Box3DRobot::addKinematicShapes(KinematicRec& r)
 
 void Box3DRobot::setStaticWorld(std::shared_ptr<const urdf::StaticWorld> world)
 {
+    if (built_ && !owns_world_)
+        throw std::logic_error(
+            "setStaticWorld() on a shared-scene robot is not allowed; set the static world on "
+            "Box3DPhysicsScene before build() so it is attached exactly once");
+
     // Cooks here, at set time, rather than lazily inside instantiate(). That is deliberate: set is
     // called from the game thread during vehicle setup, while instantiate() runs on the physics
     // thread — including on every reset. Cooking a level-sized mesh on the physics thread would
@@ -298,7 +315,13 @@ void Box3DRobot::createWorld()
 
 void Box3DRobot::build(const urdf::Robot& model, const BuildOptions& opts)
 {
+    if (built_ && !owns_world_)
+        throw std::logic_error(
+            "build() on a shared-scene robot is not allowed; rebuild the entire "
+            "Box3DPhysicsScene instead");
+
     destroyWorld();
+    owns_world_ = true;
     model_ = model;
     opts_ = opts;
     if (opts_.substeps < 4)
@@ -318,9 +341,64 @@ void Box3DRobot::build(const urdf::Robot& model, const BuildOptions& opts)
     built_ = true;
 }
 
+void Box3DRobot::buildInWorld(const urdf::Robot& model, const BuildOptions& opts, b3WorldId world)
+{
+    destroyWorld();
+    if (!b3World_IsValid(world))
+        throw std::invalid_argument("Box3DRobot::buildInWorld received an invalid shared world");
+
+    owns_world_ = false;
+    world_ = world;
+    model_ = model;
+    opts_ = opts;
+    if (opts_.substeps < 4)
+        throw std::runtime_error("Box3D rejects substeps < 4 for stiff chains; got " +
+                                 std::to_string(opts_.substeps));
+
+    mimic_ = urdf::classifyMimicJoints(model_, opts_.mimic);
+    urdf::requireMimicSupported(model_, mimic_, opts_.mimic);
+
+    instantiate();
+    control_.assign(joints_.size(), JointControl{});
+    built_ = true;
+}
+
+std::unique_ptr<Box3DRobot> Box3DRobot::cloneIntoWorld(b3WorldId world) const
+{
+    auto candidate = std::make_unique<Box3DRobot>();
+
+    candidate->buildInWorld(model_, opts_, world);
+
+    // Kinematic descriptions and their last externally-pushed targets are solver-independent
+    // configuration, just like the legacy reset path. Copy them after buildInWorld because that
+    // method begins by clearing any previous runtime. Then instantiate only this late-added set in
+    // the already-created candidate world, at the most recently pushed targets.
+    candidate->kinematic_.reserve(kinematic_.size());
+    for (const KinematicRec& source : kinematic_) {
+        KinematicRec copy;
+        copy.desc = source.desc;
+        copy.target = source.target;
+        candidate->kinematic_.push_back(std::move(copy));
+    }
+    candidate->instantiateKinematic();
+
+    // Match legacy reset semantics: control mode and gains survive; commands do not. This must be
+    // applied to the candidate before commit so a failure leaves the live scene untouched.
+    if (control_.size() != candidate->control_.size())
+        throw std::logic_error("shared Box3D reset changed the robot joint topology");
+    candidate->control_ = control_;
+    for (JointControl& control : candidate->control_) control.target = 0;
+    candidate->reapplyControl();
+    return candidate;
+}
+
 void Box3DRobot::reset()
 {
     if (!built_) throw std::runtime_error("reset() before build()");
+    if (!owns_world_)
+        throw std::logic_error(
+            "reset() on a shared-scene robot is not allowed; reset Box3DPhysicsScene so every "
+            "participant is rebuilt atomically");
 
     // ⚠ Control CONFIGURATION survives the rebuild; control STATE does not.
     //
@@ -962,6 +1040,18 @@ void Box3DRobot::updateMimicFollowers()
 
 void Box3DRobot::stepOnce()
 {
+    if (!owns_world_)
+        throw std::logic_error(
+            "stepOnce() on a shared-scene robot is not allowed; step Box3DPhysicsScene so its "
+            "b3World advances exactly once");
+
+    prepareSharedStep();
+    b3World_Step(world_, static_cast<float>(opts_.fixed_timestep), opts_.substeps);
+    finishSharedStep();
+}
+
+void Box3DRobot::prepareSharedStep()
+{
     // Before the solve, so the follower's target is consistent with the state it was read from.
     updateMimicFollowers();
     // Kinematic targets, immediately before the step they are sized for. b3Body_SetTargetTransform
@@ -982,13 +1072,20 @@ void Box3DRobot::stepOnce()
     // which reads as a controller that twitches at the step rate rather than as a missing
     // re-application. The Wrench documentation in UrdfRobotBackend.hpp says the same thing.
     applyJointTorques();
+}
 
-    b3World_Step(world_, static_cast<float>(opts_.fixed_timestep), opts_.substeps);
+void Box3DRobot::finishSharedStep()
+{
     ++steps_taken_;
 }
 
 int Box3DRobot::step(double dt)
 {
+    if (!owns_world_)
+        throw std::logic_error(
+            "step() on a shared-scene robot is not allowed; step Box3DPhysicsScene so its b3World "
+            "advances exactly once");
+
     accumulator_ += dt;
     int taken = 0;
     while (accumulator_ >= opts_.fixed_timestep) {
@@ -997,6 +1094,28 @@ int Box3DRobot::step(double dt)
         ++taken;
     }
     return taken;
+}
+
+void Box3DRobot::swapSharedRuntime(Box3DRobot& other) noexcept
+{
+    // Persistent model/options stay on the stable robot objects; only solver-backed state moves.
+    // Every operation below is a no-throw swap, making the candidate-to-live commit atomic from
+    // callers' point of view.
+    mimic_.swap(other.mimic_);
+    hull_budget_reductions_.swap(other.hull_budget_reductions_);
+    decompositions_.swap(other.decompositions_);
+    std::swap(degenerate_parts_dropped_, other.degenerate_parts_dropped_);
+    decomposition_fallbacks_.swap(other.decomposition_fallbacks_);
+    massless_markers_.swap(other.massless_markers_);
+    control_.swap(other.control_);
+    kinematic_.swap(other.kinematic_);
+    std::swap(world_, other.world_);
+    links_.swap(other.links_);
+    joints_.swap(other.joints_);
+    std::swap(accumulator_, other.accumulator_);
+    std::swap(steps_taken_, other.steps_taken_);
+    std::swap(built_, other.built_);
+    std::swap(owns_world_, other.owns_world_);
 }
 
 LinkState Box3DRobot::linkState(size_t i) const

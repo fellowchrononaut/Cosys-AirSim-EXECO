@@ -4,6 +4,7 @@
 #ifndef airsim_core_PhysicsVehicleWorld_hpp
 #define airsim_core_PhysicsVehicleWorld_hpp
 
+#include <mutex>
 #include "common/UpdatableContainer.hpp"
 #include "common/Common.hpp"
 #include "PhysicsBody.hpp"
@@ -19,15 +20,35 @@ namespace airlib
     class PhysicsWorld : UpdatableObject
     {
     public:
+        /** Construct the world.
+         *
+         * ⚠ `fixed_step_seconds` and `coordinator` must be supplied HERE rather than attached
+         * afterwards. `initializeWorld` performs the world's first reset, and in a coordinated
+         * world that reset IS the global transaction which establishes the t=0 initial condition,
+         * pre-settle included. Attaching after construction would leave every robot's first
+         * published state describing an unsettled spawn pose, and the settled baseline would
+         * appear only after someone happened to call reset again.
+         *
+         * The defaults keep every existing call site byte-identical and un-coordinated.
+         */
         PhysicsWorld(std::unique_ptr<PhysicsEngineBase> physics_engine, const std::vector<UpdatableObject*>& bodies,
                      uint64_t update_period_nanos = 3000000LL, bool state_reporter_enabled = false,
-                     bool start_async_updator = true)
+                     bool start_async_updator = true, TTimeDelta fixed_step_seconds = 0,
+                     PhysicsSceneCoordinator* coordinator = nullptr,
+                     const PhysicsResetPolicy& reset_policy = PhysicsResetPolicy())
             : world_(std::move(physics_engine))
         {
             setName("PhysicsWorld");
             enableStateReport(state_reporter_enabled);
             update_period_nanos_ = update_period_nanos;
+            if (fixed_step_seconds > 0)
+                world_.enableFixedStep(fixed_step_seconds, coordinator, reset_policy);
             initializeWorld(bodies, start_async_updator);
+        }
+
+        bool isFixedStep() const
+        {
+            return world_.isFixedStep();
         }
 
         void lock()
@@ -42,9 +63,8 @@ namespace airlib
 
         void reset()
         {
-            lock();
+            std::lock_guard<PhysicsWorld> guard(*this);
             world_.reset();
-            unlock();
         }
 
         void addBody(UpdatableObject* body)

@@ -17,6 +17,7 @@
 
 #if WITH_BOX3D_BINDING
 #include "urdf/backends/Box3DUrdfBackend.hpp"
+#include "urdf/backends/mujoco/MuJoCoSharedUrdfBackend.hpp"
 #endif
 
 #if WITH_MUJOCO_BINDING
@@ -207,7 +208,20 @@ namespace
             // different origins, no error, and a client differencing them would be badly wrong.
             //
             // Routing through NedTransform is what every other AirSim pose already does, so link
-            // poses now share an origin with simGetVehiclePose, the sensors and the other vehicles.
+            // poses share an origin with simGetVehiclePose and this vehicle's sensors.
+            //
+            // ⚠ NOT WITH OTHER VEHICLES, despite what this comment used to claim. NedTransform is
+            // constructed with THE PAWN as its pivot (PawnSimApi.cpp:18), so toLocalNed subtracts
+            // that vehicle's OWN spawn location: every robot reports itself in its own frame, and
+            // two robots 1.5 m apart both read ~0. Observed 2026-08-24 with two rovers.
+            //
+            // Differences are still exact - the offset is captured once at construction and never
+            // moves - so displacement, velocity and "did it get pushed" are all trustworthy. What
+            // is NOT valid is comparing one robot's POSITION against another's, which is precisely
+            // the cross-vehicle question a shared world invites. The coordinator's own snapshots
+            // are world-frame (invariant 0); this RPC surface is not, and nothing yet exposes the
+            // world-frame state to clients. toGlobalNed() is the shared-origin conversion if that
+            // is ever wanted here.
             const float world_to_meters = ned_->fromNed(1.0f);
             const FTransform link_world(UrdfTransform::toFQuat(p.orientation),
                                         UrdfTransform::toFVector(p.position, world_to_meters));
@@ -278,10 +292,64 @@ namespace
     };
 } // namespace
 
-UrdfBotSimApi::UrdfBotSimApi(const Params& params,
-                             const AirSimSettings::VehicleSetting* vehicle_setting)
-    : PawnSimApi(params), vehicle_setting_(vehicle_setting)
+/// The vehicle's half of one coordinated tick.
+///
+/// Separate from the sim api because the coordinator owns its participants by `shared_ptr` — a
+/// callback must not be able to outlive the object it targets — while the api provider owns sim
+/// apis by `unique_ptr`. The api detaches this in its destructor, so a late callback becomes a
+/// no-op rather than a dangling call.
+class UrdfBotStepParticipant : public msr::airlib::PhysicsSceneParticipant
 {
+public:
+    explicit UrdfBotStepParticipant(UrdfBotSimApi* api) : api_(api) {}
+
+    void detach() { api_ = nullptr; }
+
+    void onManifestFinalize(const msr::airlib::PhysicsManifestContext&) noexcept override
+    {
+        // Runs after EVERY participant committed, so every shared scene has compiled by now. That
+        // ordering is the whole reason this lives on the finalize hook rather than on commit.
+        if (api_ != nullptr) api_->onSharedSceneReady();
+    }
+
+    void onStepPrepare(const msr::airlib::PhysicsStepContext& context) override
+    {
+        // ⚠ Commands are latched during the pre-roll too. Their values are whatever reset left
+        // them at, which for a rebuilt scene is zero; what must NOT happen here is publishing.
+        (void)context;
+        if (api_ != nullptr) api_->coordinatedPreSolve();
+    }
+
+    void onStepCommit(const msr::airlib::PhysicsStepContext& context) override
+    {
+        // Commit runs only for a real step. The pre-settle deliberately never reaches it, which is
+        // exactly how sensor publication is suppressed for that interval.
+        if (api_ != nullptr) api_->coordinatedPostSolve(context.dt);
+    }
+
+private:
+    UrdfBotSimApi* api_ = nullptr;
+};
+
+UrdfBotSimApi::UrdfBotSimApi(const Params& params,
+                             const AirSimSettings::VehicleSetting* vehicle_setting,
+                             ICoordinatedPhysicsScene* coordinated_scene)
+    : PawnSimApi(params), vehicle_setting_(vehicle_setting),
+      coordinated_scene_(coordinated_scene)
+{
+    if (coordinated_scene_ != nullptr) {
+        // Registered before the manifest is committed, which is what makes participation part of
+        // the frozen scenario rather than something a robot can join later.
+        step_participant_ = std::make_shared<UrdfBotStepParticipant>(this);
+        coordinated_scene_->registerParticipant(
+            ICoordinatedPhysicsScene::vehicleParticipantId(getVehicleName()), 0,
+            step_participant_);
+    }
+}
+
+UrdfBotSimApi::~UrdfBotSimApi()
+{
+    if (step_participant_) step_participant_->detach();
 }
 
 void UrdfBotSimApi::initialize()
@@ -380,7 +448,12 @@ void UrdfBotSimApi::loadModelAndBackend()
 
     if (engine.empty() || engine == "box3d") {
 #if WITH_BOX3D_BINDING
-        backend = std::make_unique<urdf::Box3DUrdfBackend>();
+        auto box3d_backend = std::make_unique<urdf::Box3DUrdfBackend>();
+        // ⚠ BEFORE buildFromUrdf. Attaching afterwards would already have created a private
+        // b3World, which is the thing coordinated mode exists to eliminate.
+        if (coordinated_scene_ != nullptr)
+            box3d_backend->attachToScene(&coordinated_scene_->box3dScene());
+        backend = std::move(box3d_backend);
 #else
         throw std::invalid_argument(
             "Vehicle '" + getVehicleName() + "': PhysicsEngine \"Box3D\" is not in this build "
@@ -390,7 +463,17 @@ void UrdfBotSimApi::loadModelAndBackend()
     }
     else if (engine == "mujoco") {
 #if WITH_MUJOCO_BINDING
-        backend = std::make_unique<urdf::MuJoCoUrdfBackend>();
+        if (coordinated_scene_ != nullptr) {
+            // ⚠ A DIFFERENT CLASS, not a mode of MuJoCoUrdfBackend. The shared facade owns no
+            // mjModel/mjData/mjSpec of its own; the world's scene does, and this robot is one
+            // namespaced articulation inside it.
+            backend = std::make_unique<urdf::MuJoCoSharedUrdfBackend>(
+                coordinated_scene_->mujocoScene(),
+                ICoordinatedPhysicsScene::vehicleBodyId(getVehicleName()));
+        }
+        else {
+            backend = std::make_unique<urdf::MuJoCoUrdfBackend>();
+        }
 #else
         // ⚠ The overwhelmingly likely cause, so it is named first. MuJoCo is not built by
         // build.sh - it needs Unreal's own toolchain and has its own script.
@@ -423,7 +506,8 @@ void UrdfBotSimApi::loadModelAndBackend()
     // iteration (ASimModeWorldMultiAgent::setupClockSpeed overrides the 20 ms ASimModeBase
     // default, which applies to Car/ComputerVision/SkidVehicle only). Matching the backend's
     // internal step to it keeps whole steps consuming whole clock ticks.
-    opts.fixed_timestep = 0.003;
+    opts.fixed_timestep =
+        coordinated_scene_ != nullptr ? coordinated_scene_->fixedStepSeconds() : 0.003;
     opts.fixed_base = vehicle_setting_->urdf_fixed_base;
     opts.mesh_base_dir = dirOf(urdf_path);
     opts.mesh_search_paths = vehicle_setting_->urdf_mesh_search_paths;
@@ -533,8 +617,11 @@ void UrdfBotSimApi::loadModelAndBackend()
     //
     // An explicit plane is an operator override. Do not also sample a height field: the two
     // scaffolds would overlap, and the explicit value must remain deterministic.
+    // ⚠ In coordinated mode the floor belongs to the world, not to this robot: the shared scene
+    // was created with the authored PhysicsCoordinator.GroundPlane, and the per-robot keys are
+    // rejected by the settings loader. Everything below therefore stays inert.
     const bool has_explicit_ground_plane =
-        !std::isnan(vehicle_setting_->urdf_ground_plane_z);
+        coordinated_scene_ == nullptr && !std::isnan(vehicle_setting_->urdf_ground_plane_z);
     UE_LOG(LogUrdfBot, Log,
            TEXT("ground configuration [%s]: auto=%d explicit=%d z=%.6f m"),
            UTF8_TO_TCHAR(getVehicleName().c_str()),
@@ -544,7 +631,7 @@ void UrdfBotSimApi::loadModelAndBackend()
 
     // Only backends that ask for it get one; Box3D cooks the real triangles and needs nothing.
     if (backend->needsScaffoldingGroundPlane() && vehicle_setting_->urdf_ground_plane_auto &&
-        !has_explicit_ground_plane) {
+        !has_explicit_ground_plane && coordinated_scene_ == nullptr) {
         urdf::BackendOptions::HeightField hf;
         if (sampleGroundHeightField(opts.root_position,
                                     vehicle_setting_->urdf_ground_sample_extent, hf)) {
@@ -574,15 +661,53 @@ void UrdfBotSimApi::loadModelAndBackend()
     // Mirrored once per level and shared by every robot: the shared_ptr's identity is what makes
     // the cook shared (Box3DStaticGeometry), so this must go through MirrorLevelShared rather than
     // each robot mirroring for itself.
-    if (vehicle_setting_->urdf_mirror_world_geometry) {
+    // ⚠ ONE POLICY PER WORLD in coordinated mode. A shared solver scene has exactly one static
+    // world, so which components are in it cannot be a per-robot choice: whichever robot
+    // initialised first would define the level for every other robot. The per-vehicle UrdfMirror*
+    // keys are rejected by the settings loader in that mode and these world-level values are used.
+    const bool coordinated_mirror = coordinated_scene_ != nullptr;
+    const AirSimSettings::StaticWorldMirrorSetting& world_mirror =
+        AirSimSettings::singleton().physics_coordinator.static_world_mirror;
+    const bool mirror_world_geometry = coordinated_mirror
+                                           ? world_mirror.enabled
+                                           : vehicle_setting_->urdf_mirror_world_geometry;
+
+    if (mirror_world_geometry) {
         UrdfWorldGeometry::FMirrorOptions mirror_opts;
-        mirror_opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
-        mirror_opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
-        mirror_opts.bIncludeLandscape = vehicle_setting_->urdf_mirror_landscape;
-        mirror_opts.bIncludeInstancedMeshes = vehicle_setting_->urdf_mirror_instanced_meshes;
-        mirror_opts.MaxInstances = vehicle_setting_->urdf_mirror_max_instances;
-        for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
-            mirror_opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+        if (coordinated_mirror) {
+            switch (world_mirror.collision_source) {
+            case AirSimSettings::StaticWorldCollisionSource::Simple:
+                mirror_opts.Source = UrdfWorldGeometry::ECollisionSource::Simple;
+                break;
+            case AirSimSettings::StaticWorldCollisionSource::Complex:
+                mirror_opts.Source = UrdfWorldGeometry::ECollisionSource::Complex;
+                break;
+            case AirSimSettings::StaticWorldCollisionSource::Auto:
+            default:
+                mirror_opts.Source = UrdfWorldGeometry::ECollisionSource::Auto;
+                break;
+            }
+            mirror_opts.bIncludeMovable = world_mirror.include_movable;
+            mirror_opts.bIncludeOtherVehicles = world_mirror.include_other_vehicles;
+            mirror_opts.bIncludeLandscape = world_mirror.include_landscape;
+            mirror_opts.bIncludeInstancedMeshes = world_mirror.include_instanced_meshes;
+            mirror_opts.MaxInstances = world_mirror.max_instances;
+            mirror_opts.DefaultFriction = world_mirror.default_friction;
+            mirror_opts.DefaultRestitution = world_mirror.default_restitution;
+            for (const std::string& tag : world_mirror.required_tags)
+                mirror_opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+            for (const std::string& tag : world_mirror.excluded_tags)
+                mirror_opts.ExcludedTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+        }
+        else {
+            mirror_opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
+            mirror_opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
+            mirror_opts.bIncludeLandscape = vehicle_setting_->urdf_mirror_landscape;
+            mirror_opts.bIncludeInstancedMeshes = vehicle_setting_->urdf_mirror_instanced_meshes;
+            mirror_opts.MaxInstances = vehicle_setting_->urdf_mirror_max_instances;
+            for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
+                mirror_opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+        }
 
         UrdfWorldGeometry::FMirrorStats stats;
         bool from_cache = false;
@@ -609,7 +734,27 @@ void UrdfBotSimApi::loadModelAndBackend()
                 LogDebugLevel::Informational);
         }
 
-        backend->setStaticWorld(static_world_);
+        // ⚠ The shared scene owns the static world; a shared-scene backend REFUSES setStaticWorld
+        // for exactly that reason. The mirror is memoised per UWorld, so every robot presents the
+        // same shared_ptr and only the first one attaches it.
+        if (coordinated_scene_ != nullptr) {
+            const bool mirror_is_box3d = (std::strcmp(backend->backendName(), "Box3D") == 0);
+#if WITH_BOX3D_BINDING
+            if (mirror_is_box3d) {
+                b3urdf::Box3DPhysicsScene& shared_scene = coordinated_scene_->box3dScene();
+                if (!shared_scene.hasStaticWorld()) shared_scene.setStaticWorld(static_world_);
+            }
+#endif
+#if WITH_MUJOCO_BINDING
+            if (!mirror_is_box3d) {
+                urdf::MuJoCoPhysicsScene& shared_scene = coordinated_scene_->mujocoScene();
+                if (!shared_scene.compiled()) shared_scene.setStaticWorld(static_world_);
+            }
+#endif
+        }
+        else {
+            backend->setStaticWorld(static_world_);
+        }
 
         // ⚠ Said out loud, because the level mirrored SUCCESSFULLY and the report above says so.
         // Without this line the log reads as though this robot has 172 bodies of world to collide
@@ -646,7 +791,13 @@ void UrdfBotSimApi::loadModelAndBackend()
         // but still not the moving bodies; with the old single flag, switching static mirroring on
         // would have silently re-enabled this and gone back to logging "+6 bodies ... now solid to
         // this one" about handles that are all -1.
-        if (static_world_ && backend->mirrorsKinematicBodies()) {
+        // ⚠ ONE OWNER PER SHARED WORLD. In a private world every robot registered its own
+        // kinematic copy of every moving prop, which was right because the worlds were private.
+        // In one shared world that is N overlapping copies of the same lift, and each robot would
+        // be pushed by the other robots' copies of it.
+        owns_kinematic_mirror_ =
+            coordinated_scene_ == nullptr || coordinated_scene_->claimKinematicMirror();
+        if (static_world_ && backend->mirrorsKinematicBodies() && owns_kinematic_mirror_) {
             for (size_t i = 0; i < static_world_->kinematic.size(); ++i) {
                 UPrimitiveComponent* src =
                     (static_cast<int32>(i) < mirror.KinematicSources.Num())
@@ -724,7 +875,7 @@ void UrdfBotSimApi::loadModelAndBackend()
                 LogDebugLevel::Informational);
         }
     }
-    else if (vehicle_setting_->urdf_ground_plane_auto) {
+    else if (vehicle_setting_->urdf_ground_plane_auto && coordinated_scene_ == nullptr) {
         const FVector start = getPawn()->GetActorLocation();
         FCollisionQueryParams params(FName(TEXT("UrdfGroundProbe")), /*bTraceComplex=*/true);
         params.AddIgnoredActor(getPawn());  // the robot's own link components carry collision
@@ -862,15 +1013,49 @@ void UrdfBotSimApi::loadModelAndBackend()
     cook_progress.Reset();
     backend_ = std::move(backend);
 
+    // ⚠ IS SOLVER STATE AVAILABLE YET? Box3D's shared scene builds each robot into the live world
+    // as it joins, so it is queryable immediately. MuJoCo's cannot: mjs_attach + mj_compile is a
+    // batch operation and there are no bodies until the manifest commits. Everything below that
+    // reads state is deferred to onSharedSceneReady() in that case.
+    backend_state_available_ =
+        (coordinated_scene_ == nullptr) ||
+        (std::strcmp(backend_->backendName(), "Box3D") == 0);
+
+    // Declare this robot to the coordinator as a body the shared scene owns and publishes state
+    // for. Done here rather than at construction because the scene handle only exists once the
+    // robot has actually been built into the shared world.
+    if (coordinated_scene_ != nullptr) {
+        // ⚠ backendName() is the discriminator, as everywhere else here: Unreal builds with RTTI
+        // off, so dynamic_cast is unavailable and a static_cast to the wrong type is undefined
+        // behaviour that never announces itself.
+        const bool shared_is_box3d = (std::strcmp(backend_->backendName(), "Box3D") == 0);
+#if WITH_BOX3D_BINDING
+        if (shared_is_box3d) {
+            coordinated_scene_->publishBox3DBody(
+                ICoordinatedPhysicsScene::vehicleBodyId(getVehicleName()),
+                static_cast<urdf::Box3DUrdfBackend*>(backend_.get())->sceneHandle());
+        }
+#endif
+#if WITH_MUJOCO_BINDING
+        if (!shared_is_box3d) {
+            coordinated_scene_->publishMuJoCoBody(
+                ICoordinatedPhysicsScene::vehicleBodyId(getVehicleName()),
+                static_cast<urdf::MuJoCoSharedUrdfBackend*>(backend_.get())->articulation());
+        }
+#endif
+    }
+
     // Cross-check the realised mass against the file. A mismatch means links were merged, dropped
     // or given shape-derived mass, and it is far cheaper to catch here than to explain later.
-    const double urdf_mass = model_.totalMass();
-    const double realised = backend_->totalMass();
-    if (urdf_mass > 0 && std::fabs(realised - urdf_mass) > 1e-4 * std::max(1.0, urdf_mass)) {
-        UAirBlueprintLib::LogMessageString(
-            "UrdfBot WARNING: realised mass ",
-            Utils::stringf("%.6f kg does not match the URDF's %.6f kg", realised, urdf_mass),
-            LogDebugLevel::Failure);
+    if (backend_state_available_) {
+        const double urdf_mass = model_.totalMass();
+        const double realised = backend_->totalMass();
+        if (urdf_mass > 0 && std::fabs(realised - urdf_mass) > 1e-4 * std::max(1.0, urdf_mass)) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: realised mass ",
+                Utils::stringf("%.6f kg does not match the URDF's %.6f kg", realised, urdf_mass),
+                LogDebugLevel::Failure);
+        }
     }
 
     // ⚠ THE ONLY WAY TO ASK "which backend is this?" IN THIS CODEBASE. Unreal builds with RTTI off,
@@ -1024,7 +1209,11 @@ void UrdfBotSimApi::loadModelAndBackend()
     // scaffolding ground plane, so if these geoms silently fail to appear the robot is left with
     // no world at all and falls forever — which is exactly what happened the first time this ran.
     // The counters existed before this log did, which is why the failure was invisible.
-    if (!is_box3d) {
+    // ⚠ LEGACY BACKEND ONLY. In a coordinated run this vehicle holds a MuJoCoSharedUrdfBackend,
+    // which is a DIFFERENT class - static_cast-ing it to MuJoCoUrdfBackend is undefined behaviour
+    // that will not announce itself, because Unreal builds with RTTI off and backendName() returns
+    // "MuJoCo" for both. The shared scene reports its own cook through StaticWorldEmitStats.
+    if (!is_box3d && coordinated_scene_ == nullptr) {
         const urdf::MuJoCoUrdfBackend* mjw =
             static_cast<const urdf::MuJoCoUrdfBackend*>(backend_.get());
         const size_t emitted = mjw->staticGeomsEmitted();
@@ -1057,15 +1246,18 @@ void UrdfBotSimApi::loadModelAndBackend()
         UE_LOG(LogUrdfBot, Log,
                TEXT("MuJoCo largest mirrored shape: %.1f m across, from '%s'"),
                mjw->staticWorstSpan(), UTF8_TO_TCHAR(mjw->staticWorstSpanBody().c_str()));
+        // ⚠ Two lines were removed here, not reworded. They reported "N vast flat shapes converted
+        // to infinite planes" and "N shapes skipped as oversize" from counters that NO CODE EVER
+        // ASSIGNED, so both printed 0 whatever the level contained - a log that described a
+        // feature the emitter does not implement. What actually keeps a 40 km ground mesh out of
+        // the broadphase is the region clipping, which is real and is reported below.
         UE_LOG(LogUrdfBot, Log,
-               TEXT("MuJoCo static world: %d vast flat shapes converted to infinite planes"),
-               static_cast<int32>(mjw->staticPlanesEmitted()));
-        UE_LOG(LogUrdfBot, Log,
-               TEXT("MuJoCo static world: %d shapes skipped as oversize (the level ground); "
-                    "ground represented by %s"),
-               static_cast<int32>(mjw->staticShapesOversize()),
+               TEXT("MuJoCo static world: ground represented by %s; %d triangles clipped away "
+                    "outside the %.1f m region"),
                mjw->usedHeightField() ? TEXT("a sampled HEIGHT FIELD")
-                                      : TEXT("a flat traced plane"));
+                                      : TEXT("a flat traced plane"),
+               static_cast<int32>(mjw->staticTrianglesClippedAway()),
+               vehicle_setting_->urdf_static_world_radius);
         // ⚠ Geom count is the cost of the per-triangle representation, and it is the number to
         // watch if stepping gets slow. Exactness is bought with geoms rather than with cook time.
         UE_LOG(LogUrdfBot, Log,
@@ -1086,13 +1278,6 @@ void UrdfBotSimApi::loadModelAndBackend()
                                static_cast<int>(mjw->staticTrianglesSkipped()),
                                vehicle_setting_->urdf_static_world_max_triangles),
                 LogDebugLevel::Failure);
-        }
-        if (mjw->staticPlanesEmitted() > 0) {
-            UE_LOG(LogUrdfBot, Log,
-                   TEXT("MuJoCo ground plane placed at z = %.3f (shape spanned z %.3f..%.3f) from "
-                        "'%s'   robot spawns at z = %.3f"),
-                   mjw->planeZ(), mjw->planeSpanLoZ(), mjw->planeZ(),
-                   UTF8_TO_TCHAR(mjw->planeBody().c_str()), opts.root_position.z);
         }
         UE_LOG(LogUrdfBot, Log,
                TEXT("MuJoCo static world EXTENT (pos+/-rbound): x[%.2f %.2f] y[%.2f %.2f] z[%.2f %.2f]   "
@@ -1145,7 +1330,11 @@ void UrdfBotSimApi::loadModelAndBackend()
     // ROS packages) and COLLADA meshes (it reads STL, OBJ and MSH) — which between them covers most
     // robot URDFs. Our own loader handles both, so a model that works perfectly on Box3D can arrive
     // here hollow.
-    if (!is_box3d) {
+    // ⚠ LEGACY BACKEND ONLY. In a coordinated run this vehicle holds a MuJoCoSharedUrdfBackend,
+    // which is a DIFFERENT class - static_cast-ing it to MuJoCoUrdfBackend is undefined behaviour
+    // that will not announce itself, because Unreal builds with RTTI off and backendName() returns
+    // "MuJoCo" for both. The shared scene reports its own cook through StaticWorldEmitStats.
+    if (!is_box3d && coordinated_scene_ == nullptr) {
         const urdf::MuJoCoUrdfBackend* mj =
             static_cast<const urdf::MuJoCoUrdfBackend*>(backend_.get());
         const size_t declared = mj->collisionGeomsDeclared();
@@ -1238,8 +1427,10 @@ void UrdfBotSimApi::loadModelAndBackend()
     // update arrives. The robot therefore appears LIMP — every link at identity — for the first
     // frames, which is exactly the "hangs for a moment before landing" symptom, and it survived the
     // settle fix because settling moves the SOLVER while the renderer was still reading defaults.
-    for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
-    render_poses_ = snapshot_;
+    if (backend_state_available_) {
+        for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+        render_poses_ = snapshot_;
+    }
 
     // Borrowed from the backend, which outlives the api — both are members of this sim api and
     // the backend is declared first, so it is destroyed last.
@@ -1623,6 +1814,15 @@ void UrdfBotSimApi::applyDriveInput()
 // ---------------------------------------------------------------------------------------------
 void UrdfBotSimApi::update(float delta)
 {
+    // ⚠ In COORDINATED mode this function no longer solves anything. The shared world is advanced
+    // once per tick by its scene participant, and this robot's command latch and state publication
+    // are its pre/post-solve hooks — so doing any of it here as well would apply commands twice and
+    // publish a state that is half a tick old.
+    if (isCoordinated()) {
+        PawnSimApi::update(delta);
+        return;
+    }
+
     // ⚠ `delta` is 0 here. World::worldUpdatorAsync calls update() with no argument, so the
     // default propagates all the way down. dt comes from the clock, exactly as FastPhysicsEngine
     // does it. Trusting the argument would step the backend by zero forever — a robot that loads,
@@ -1664,6 +1864,113 @@ void UrdfBotSimApi::update(float delta)
     PawnSimApi::update(delta);
 }
 
+void UrdfBotSimApi::onSharedSceneReady() noexcept
+{
+    // ⚠ noexcept. This runs from the coordinator's manifest-FINALIZE phase, which by contract
+    // cannot turn an already-published transaction into a failure. A diagnostic that threw here
+    // would abort a scenario whose physics is already committed and correct.
+    try {
+        if (!built_ || backend_state_available_) return;
+        backend_state_available_ = true;
+
+        const double urdf_mass = model_.totalMass();
+        const double realised = backend_->totalMass();
+        if (urdf_mass > 0 && std::fabs(realised - urdf_mass) > 1e-4 * std::max(1.0, urdf_mass)) {
+            UAirBlueprintLib::LogMessageString(
+                "UrdfBot WARNING: realised mass ",
+                Utils::stringf("%.6f kg does not match the URDF's %.6f kg", realised, urdf_mass),
+                LogDebugLevel::Failure);
+        }
+        UE_LOG(LogUrdfBot, Log, TEXT("'%s': shared scene ready, realised mass %.6f kg"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), realised);
+
+        // ⚠ THE DIAGNOSTIC THAT WAS MISSING. The legacy backend reports dropped collision meshes
+        // loudly; guarding its class-specific block for the shared path removed that, and the very
+        // next run had two robots fall through the floor with every other number healthy. A robot
+        // with zero collision geoms collides with NOTHING - it must never be a quiet condition.
+#if WITH_MUJOCO_BINDING
+        if (std::strcmp(backend_->backendName(), "MuJoCo") == 0 && coordinated_scene_ != nullptr) {
+            const auto* shared = static_cast<const urdf::MuJoCoSharedUrdfBackend*>(backend_.get());
+            const urdf::MuJoCoPhysicsScene& scene = coordinated_scene_->mujocoScene();
+            const size_t geoms = scene.collisionGeomsRealised(shared->articulation());
+            UE_LOG(LogUrdfBot, Log, TEXT("'%s': MuJoCo realised %d collision geoms"),
+                   UTF8_TO_TCHAR(getVehicleName().c_str()), static_cast<int32>(geoms));
+
+            if (!scene.unresolvedMeshes().empty()) {
+                std::string list;
+                for (const std::string& mesh : scene.unresolvedMeshes())
+                    list += (list.empty() ? "" : "\n  ") + mesh;
+                UAirBlueprintLib::LogMessageString(
+                    "UrdfBot WARNING: MuJoCo could not resolve mesh files ",
+                    Utils::stringf("%d reference(s) did not resolve to a readable file. Those "
+                                   "shapes are NOT in the physics world.",
+                                   static_cast<int>(scene.unresolvedMeshes().size())),
+                    LogDebugLevel::Failure);
+                UE_LOG(LogUrdfBot, Error, TEXT("unresolved mesh references:\n  %s"),
+                       UTF8_TO_TCHAR(list.c_str()));
+            }
+            if (geoms == 0) {
+                UAirBlueprintLib::LogMessageString(
+                    "UrdfBot WARNING: NO COLLISION ",
+                    getVehicleName() + " realised ZERO collision geoms in MuJoCo. It will fall "
+                    "through the floor and pass through everything.",
+                    LogDebugLevel::Failure);
+                UE_LOG(LogUrdfBot, Error,
+                       TEXT("'%s': ZERO collision geoms - the robot has no collision at all"),
+                       UTF8_TO_TCHAR(getVehicleName().c_str()));
+            }
+        }
+#endif
+
+        // Fill the render buffers, or the robot is drawn LIMP - every link at identity - until the
+        // first physics update arrives.
+        if (snapshot_.size() != backend_->linkCount()) snapshot_.resize(backend_->linkCount());
+        if (render_poses_.size() != backend_->linkCount())
+            render_poses_.resize(backend_->linkCount());
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+        }
+        render_poses_ = snapshot_;
+    }
+    catch (const std::exception& ex) {
+        UE_LOG(LogUrdfBot, Error, TEXT("'%s': shared-scene finalize failed: %s"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()), UTF8_TO_TCHAR(ex.what()));
+    }
+    catch (...) {
+        UE_LOG(LogUrdfBot, Error, TEXT("'%s': shared-scene finalize failed"),
+               UTF8_TO_TCHAR(getVehicleName().c_str()));
+    }
+}
+
+void UrdfBotSimApi::coordinatedPreSolve()
+{
+    if (!built_) return;
+
+    // Latched before the shared world advances, so the command and the step it affects belong to
+    // the same iteration — the same order the private-world update() had inside one call.
+    applyDriveInput();
+}
+
+void UrdfBotSimApi::coordinatedPostSolve(double dt)
+{
+    if (!built_) return;
+
+    // ⚠ After the solve, so the sample describes the state the step just produced. The whole point
+    // of a urdfbot over a Chaos vehicle is that kinematics and sensor stamps are computed in the
+    // same executor iteration (§6.0b).
+    if (vehicle_api_ != nullptr) vehicle_api_->update(static_cast<float>(dt));
+
+    const size_t n = backend_->linkCount();
+    std::vector<urdf::LinkPose> fresh(n);
+    for (size_t i = 0; i < n; ++i) fresh[i] = backend_->getLinkPose(i);
+    {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        snapshot_.swap(fresh);
+    }
+    ++steps_taken_;
+}
+
 // ---------------------------------------------------------------------------------------------
 // GAME THREAD, under physics_world_->lock()
 // ---------------------------------------------------------------------------------------------
@@ -1693,13 +2000,32 @@ void UrdfBotSimApi::refreshKinematicMirror()
     // every handle was -1 and nothing was solid to anything. Observed 2026-08-19.
     if (!backend_->mirrorsKinematicBodies()) return;
 
+    // ⚠ THE SECOND PATH INTO THE SHARED WORLD. A robot that does not own the mirror must not
+    // re-collect here either, or the shared world grows one kinematic copy of every moving prop
+    // per robot — the same double-representation the initial registration guards against, arriving
+    // later and looking like a physics bug rather than a bookkeeping one.
+    if (!owns_kinematic_mirror_) return;
+
     urdf::UrdfRobotBackend* backend = backend_.get();
 
     UrdfWorldGeometry::FMirrorOptions opts;
-    opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
-    opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
-    for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
-        opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+    if (coordinated_scene_ != nullptr) {
+        // One world policy, exactly as the initial mirror used.
+        const AirSimSettings::StaticWorldMirrorSetting& world_mirror =
+            AirSimSettings::singleton().physics_coordinator.static_world_mirror;
+        opts.bIncludeMovable = world_mirror.include_movable;
+        opts.bIncludeOtherVehicles = world_mirror.include_other_vehicles;
+        for (const std::string& tag : world_mirror.required_tags)
+            opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+        for (const std::string& tag : world_mirror.excluded_tags)
+            opts.ExcludedTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+    }
+    else {
+        opts.bIncludeMovable = vehicle_setting_->urdf_mirror_movable;
+        opts.bIncludeOtherVehicles = vehicle_setting_->urdf_mirror_other_vehicles;
+        for (const std::string& tag : vehicle_setting_->urdf_world_geometry_tags)
+            opts.RequiredTags.Add(FName(UTF8_TO_TCHAR(tag.c_str())));
+    }
 
     UrdfWorldGeometry::FMirrorStats stats;
     const UrdfWorldGeometry::FMirrorResult mirror = UrdfWorldGeometry::MirrorVehicles(
@@ -1956,7 +2282,10 @@ void UrdfBotSimApi::updateRendering(float dt)
 
 void UrdfBotSimApi::settleAndPublish()
 {
-    if (!backend_ || vehicle_setting_->urdf_settle_seconds <= 0) return;
+    // ⚠ Never in coordinated mode, and not merely because the parser forces the interval to zero
+    // there: settling steps the backend, and a shared-scene backend REFUSES to step alone. The
+    // world-level pre-settle inside the global reset transaction is the coordinated equivalent.
+    if (!backend_ || isCoordinated() || vehicle_setting_->urdf_settle_seconds <= 0) return;
 
     // ⚠ Stepped on the LOADING thread, before play, so the robot is already resting when the first
     // frame is drawn. Drive input is untouched and zero, so this settles under gravity and contact
@@ -2021,6 +2350,24 @@ void UrdfBotSimApi::resetImplementation()
     // its spawn pose with no error visible in the sim.
     if (vehicle_api_ != nullptr) vehicle_api_->reset();
 
+    if (built_ && isCoordinated()) {
+        // ⚠ The solver rebuild ALREADY HAPPENED. World::resetImplementation runs the coordinator's
+        // global transaction — new epoch, every shared scene rebuilt from the frozen manifest, the
+        // approved pre-settle — before any member is reset. Rebuilding here as well would rebuild
+        // the shared world once per robot, and each rebuild would throw away the previous robots'
+        // restored state.
+        std::lock_guard<std::mutex> backend_lock(backend_mutex_);
+        last_update_time_ = 0;
+        steps_taken_ = 0;
+        if (snapshot_.size() != backend_->linkCount()) snapshot_.resize(backend_->linkCount());
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            for (size_t i = 0; i < snapshot_.size(); ++i) snapshot_[i] = backend_->getLinkPose(i);
+        }
+        render_poses_ = snapshot_;
+        return;
+    }
+
     if (built_) {
         // ⚠ Rebuilds the Box3D world rather than rewriting poses. Box3D has no rollback
         // determinism — contact caches, warm-start impulses and island state survive a pose write,
@@ -2049,6 +2396,45 @@ void UrdfBotSimApi::resetImplementation()
     // Settling here as well makes "reset" mean "back to the resting initial state" rather than
     // "back to mid-air", which is what an initial condition should be.
     if (built_) settleAndPublish();
+}
+
+bool UrdfBotSimApi::describeColliders(urdf::PhysicsColliderSet& out) const
+{
+    // ⚠ Same lock as every other backend read. resetImplementation() destroys and rebuilds every
+    // solver body; walking the link tables while that happens is a use-after-free.
+    std::lock_guard<std::mutex> lock(backend_mutex_);
+    if (backend_ == nullptr || !backend_state_available_)
+        return false;
+    if (!backend_->describeColliders(out))
+        return false;
+
+    // ⚠ Qualify with the VEHICLE. A private-world backend names its links from the URDF, and two
+    // rovers of one model would otherwise offer the sidecar two colliders with the same stable id
+    // — which its registry keys on, so they would silently become one.
+    for (urdf::PhysicsColliderDescriptor& collider : out.colliders)
+        collider.stable_id = getVehicleName() + "/" + collider.stable_id;
+    return true;
+}
+
+bool UrdfBotSimApi::collisionDebugGeometry(const urdf::CollisionDebugFilter& filter,
+                                          urdf::CollisionDebugSnapshot& out) const
+{
+    // ⚠ THE SAME LOCK EVERY OTHER BACKEND READ TAKES. resetImplementation() destroys and rebuilds
+    // every solver body; walking the shape tables while that happens is a use-after-free, and a
+    // debug view is not a good enough reason to be the one caller that skips the guard.
+    std::lock_guard<std::mutex> lock(backend_mutex_);
+    if (backend_ == nullptr || !backend_state_available_)
+        return false;
+    if (!backend_->collisionDebugGeometry(filter, out))
+        return false;
+
+    // Qualify every label with the VEHICLE, because the whole point of a two-backend comparison is
+    // telling the two robots apart, and a private-world backend names its links from the URDF -
+    // which is the same URDF in both rovers.
+    for (urdf::CollisionShape& geom : out.geoms)
+        if (!geom.is_world)
+            geom.label = getVehicleName() + "/" + geom.label;
+    return true;
 }
 
 void UrdfBotSimApi::reportState(StateReporter& reporter)

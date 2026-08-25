@@ -161,6 +161,7 @@
     <ClInclude Include="include\physics\PhysicsBody.hpp" />
     <ClInclude Include="include\physics\PhysicsBodyVertex.hpp" />
     <ClInclude Include="include\physics\PhysicsEngineBase.hpp" />
+    <ClInclude Include="include\physics\PhysicsSceneCoordinator.hpp" />
     <ClInclude Include="include\physics\World.hpp" />
     <ClInclude Include="include\sensors\barometer\BarometerBase.hpp" />
     <ClInclude Include="include\sensors\barometer\BarometerSimple.hpp" />
@@ -191,6 +192,7 @@
     <ClCompile Include="src\safety\ObstacleMap.cpp" />
     <ClCompile Include="src\safety\SafetyEval.cpp" />
     <ClCompile Include="src\common\common_utils\FileSystem.cpp" />
+    <ClCompile Include="src\physics\PhysicsSceneCoordinator.cpp" />
     <ClCompile Include="src\vehicles\car\api\CarRpcLibClient.cpp" />
     <ClCompile Include="src\vehicles\car\api\CarRpcLibServer.cpp" />
     <ClCompile Include="src\vehicles\computervision\api\ComputerVisionRpcLibClient.cpp" />
