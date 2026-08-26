@@ -70,6 +70,20 @@ namespace airlib
             return false;
         }
 
+        /// Suspend or restore ONE link's collision against the mirrored static world (plan D10).
+        /// Returns false when the vehicle cannot do it — which the caller must respect, because
+        /// believing rigid support was removed when it was not turns the floor's reaction into
+        /// "the sand is carrying the vehicle".
+        ///
+        /// ⚠ Declared here for the same reason as applyLinkWrench: with RTTI off, a caller holding
+        /// `VehicleSimApiBase*` cannot ask "are you a urdfbot?".
+        ///
+        /// ⚠ TRANSITIONS ONLY — a filter change is expensive in Box3D. The caller owns hysteresis.
+        virtual bool setLinkWorldCollision(size_t /*link_index*/, bool /*enabled*/)
+        {
+            return false;
+        }
+
         /// Collision geometry as THIS vehicle's solver holds it, for the debug overlay.
         /// Returns false when the vehicle cannot say, which is the honest default.
         ///

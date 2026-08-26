@@ -209,6 +209,11 @@ void Box3DUrdfBackend::applyExternalWrench(size_t link, const Wrench& w)
     robot().applyWrench(link, f, t, p, w.at_center);
 }
 
+bool Box3DUrdfBackend::setLinkWorldCollision(size_t link, bool enabled)
+{
+    return robot().setLinkWorldCollision(link, enabled);
+}
+
 bool Box3DUrdfBackend::collisionDebugGeometry(const CollisionDebugFilter& filter,
                                               CollisionDebugSnapshot& out) const
 {

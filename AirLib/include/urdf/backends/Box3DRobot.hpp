@@ -291,6 +291,18 @@ public:
     /// True once solver objects exist for this robot.
     bool isBuilt() const { return built_; }
 
+    /// Suspend or restore this link's collision against the MIRRORED STATIC WORLD only (plan D10).
+    /// Every other contact — self-collision, other robots, other links — is untouched.
+    ///
+    /// ⚠ TRANSITIONS ONLY. Box3D documents a filter change as "almost as expensive as recreating
+    /// the shape", so the caller must own hysteresis and call this when a link actually crosses a
+    /// patch boundary, not once per tick. A repeat call with the current value is free.
+    ///
+    /// ⚠ THIS REMOVES GROUND SUPPORT. A link with world collision off inside a patch whose sand
+    /// cannot carry it will fall to whatever is left below. The caller is responsible for the bed
+    /// being able to hold the vehicle, or for a floor of last resort.
+    bool setLinkWorldCollision(size_t link, bool enabled);
+
 private:
     friend class Box3DPhysicsScene;
 
@@ -309,6 +321,10 @@ private:
         /// it instead — in the backend rather than in the renderer, so that sensors, recording and
         /// the RPC API all get the same right answer.
         bool kinematic = false;
+
+        /// Does this link still collide with the mirrored static world? Cached so that
+        /// setLinkWorldCollision() can skip the expensive filter write when nothing changed.
+        bool world_collision = true;
         int kinematic_parent = -1;             // link index to compose from
         int kinematic_joint = -1;              // joint index connecting the two
     };

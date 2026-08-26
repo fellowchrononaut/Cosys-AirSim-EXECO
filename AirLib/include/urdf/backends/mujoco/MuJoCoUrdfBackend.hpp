@@ -93,6 +93,7 @@ public:
     void setJointTarget(size_t joint, ControlMode mode, double value) override;
     void setPositionGains(size_t joint, double hertz, double damping_ratio) override;
     void applyExternalWrench(size_t link, const Wrench& wrench) override;
+    bool setLinkWorldCollision(size_t link, bool enabled) override;
 
     /// How many <collision> elements the URDF declared, and how many geoms MuJoCo actually
     /// compiled (excluding our scaffolding ground plane).

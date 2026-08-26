@@ -169,6 +169,10 @@ void Box3DStaticGeometry::attachTo(b3WorldId world) const
         const b3BodyId id = b3CreateBody(world, &bd);
 
         b3ShapeDef sd = b3DefaultShapeDef();
+        // ⚠ TAGGED SO ONE LINK CAN OPT OUT OF IT (plan D10). Without a distinct category the
+        // mirrored terrain is indistinguishable from every other shape, and "ignore the rigid
+        // ground but keep colliding with everything else" cannot be expressed.
+        sd.filter = b3urdf::filters::staticWorld();
         sd.baseMaterial.friction = static_cast<float>(body.friction);
         sd.baseMaterial.restitution = static_cast<float>(body.restitution);
         // Static geometry never contributes mass, and letting shapes touch a static body's mass

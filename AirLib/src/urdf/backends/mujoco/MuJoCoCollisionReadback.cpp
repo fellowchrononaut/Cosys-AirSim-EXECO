@@ -304,6 +304,27 @@ void describeMuJoCoColliders(const mjModel_* model, const mjData_* data,
         // ⚠ KinematicOneWay, unconditionally, and NOT because this code is unfinished. Plan §11.1
         // decides that M2 is kinematic to MPM precisely because the effective inertia above is not
         // available; promoting a link to DynamicTwoWay is gated on that spike, not on plumbing.
+        // ⚠ REPORT THE FRICTION, or the sand silently uses a library default. mjModel's
+        // geom_friction is a triple — sliding, torsional, rolling — and only the first is the
+        // Coulomb coefficient an MPM collider wants. Box3D has reported this since its readback
+        // was written; MuJoCo did not, so every MuJoCo vehicle reached the sidecar with
+        // material_reported=false and fell back to Newton's 0.5. That default is the SMOOTH-wheel
+        // value and it decides whether a vehicle can climb at all (see the 0.5/0.8/1.2 sweep in
+        // COORDINATOR-IMPLEMENTATION-LOG.md, 2026-08-26), so an unreported material is not a
+        // cosmetic gap.
+        //
+        // ⚠ FIRST GEOM ON THE BODY, matching Box3D's readback exactly. A body whose geoms disagree
+        // about friction cannot be described by one number, and inventing an average here would
+        // hide that; the shape-level material belongs in a later protocol revision.
+        for (int g = 0; g < model->ngeom; ++g) {
+            if (model->geom_bodyid[g] != b)
+                continue;
+            collider.material.friction = model->geom_friction[3 * g];
+            collider.material.restitution = 0.0;   // MuJoCo has no per-geom restitution
+            collider.material.reported = true;
+            break;
+        }
+
         collider.role = CouplingRole::KinematicOneWay;
 
         out.colliders.push_back(std::move(collider));

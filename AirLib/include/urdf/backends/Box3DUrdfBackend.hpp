@@ -61,6 +61,7 @@ public:
     void setJointTarget(size_t joint, ControlMode mode, double value) override;
     void setPositionGains(size_t joint, double hertz, double damping_ratio) override;
     void applyExternalWrench(size_t link, const Wrench& wrench) override;
+    bool setLinkWorldCollision(size_t link, bool enabled) override;
 
     // --- Box3D-specific, outside the portable interface by design ---------------------------
     /// Engine tuning that has no meaning for another backend: solver substeps, worker count, hull

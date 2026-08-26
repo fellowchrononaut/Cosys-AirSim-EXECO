@@ -540,6 +540,43 @@ void MuJoCoUrdfBackend::applyExternalWrench(size_t link, const Wrench& wrench)
     d_->xfrc_applied[6 * rec.body + 5] = wrench.torque.z;
 }
 
+bool MuJoCoUrdfBackend::setLinkWorldCollision(size_t link, bool enabled)
+{
+    // ⚠ contype/conaffinity, NOT geom_group. MuJoCo's pair test is
+    //     (contype1 & conaffinity2) || (contype2 & conaffinity1)
+    // — a zero on EITHER side suppresses the pair, which is what makes "this link ignores the
+    // static world" expressible without touching the world's own geoms. geom_group is a visual
+    // filter and would change nothing about contact.
+    if (!m_ || link >= links_.size())
+        return false;
+    const LinkRec& rec = links_.at(link);
+    if (rec.body < 0)
+        return false;
+    // The static-world classification was cached at build time; without it there is no way to
+    // distinguish "the mirrored terrain" from "another robot" and we would disable too much.
+    if (static_contype_ < 0 || robot_contype_ < 0)
+        return false;
+
+    bool touched = false;
+    for (int g = 0; g < m_->ngeom; ++g) {
+        if (m_->geom_bodyid[g] != rec.body)
+            continue;
+        // ⚠ Clear only the bits that pair this geom WITH THE STATIC WORLD, and restore exactly
+        // those. Zeroing contype outright would also stop the wheel colliding with other robots
+        // and with its own vehicle, which is a different and much larger change than D10 asks for.
+        if (enabled) {
+            m_->geom_contype[g] |= static_conaffinity_;
+            m_->geom_conaffinity[g] |= static_contype_;
+        }
+        else {
+            m_->geom_contype[g] &= ~static_conaffinity_;
+            m_->geom_conaffinity[g] &= ~static_contype_;
+        }
+        touched = true;
+    }
+    return touched;
+}
+
 void MuJoCoUrdfBackend::setStaticWorld(std::shared_ptr<const StaticWorld> world)
 {
     // ⚠ STORED, NOT APPLIED — the geoms are emitted in buildFromUrdf. MuJoCo has no way to add

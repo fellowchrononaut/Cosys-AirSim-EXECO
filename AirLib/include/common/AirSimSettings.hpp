@@ -680,6 +680,28 @@ namespace airlib
             int particle_every = 2;
             int max_render_particles = 40000;
 
+            /// ⚠ PLAN D13, MATERIAL HALF. Resolution above decides cost; these decide whether a
+            /// vehicle can move at all, and until 2026-08-26 both were Newton library defaults that
+            /// no settings file could reach. Measured on a 52 kg Scout against a 2 x 1.6 x 0.4 m
+            /// mound, everything else identical:
+            ///     wheel mu 0.5 -> stalls at the toe          (climbs 0.082 m)
+            ///     wheel mu 0.8 -> creeps 40% up the face     (climbs 0.251 m)
+            ///     wheel mu 1.2 -> crests and drives off      (climbs 0.325 m)
+            ///
+            /// ⚠ EQUAL COEFFICIENTS ARE A TRAP, not a neutral default. A heap rests at
+            /// atan(sand_friction) and a vehicle climbs at most atan(collider friction), so making
+            /// them equal — which Newton's defaults do, both 0.5 — puts every vehicle exactly at
+            /// marginal stability on a slope the sand builds by itself.
+            ///
+            /// 0 means "leave it to the sidecar", which in turn means Newton's default of 0.5.
+            double sand_friction = 0.0;
+            /// Wheel-on-sand friction for colliders whose backend reports no material. A lugged
+            /// wheel shears SOIL rather than sliding on it, so its effective coefficient sits at or
+            /// above the sand's own; 0.5 is the smooth-wheel value.
+            double collider_friction_default = 0.0;
+            /// Overrides EVERY collider, ignoring what the backend reported. For experiments.
+            double collider_friction = 0.0;
+
             /// Appended verbatim, for flags this schema does not model yet.
             std::string extra_args;
 
@@ -2217,7 +2239,8 @@ namespace airlib
                     validateStrictKeys(getStrictObjectKeys(sidecar_json, spath),
                                        { "AutoStart", "Python", "Script", "LogFile", "VoxelSize",
                                          "Density", "Fps", "ParticleEvery", "MaxRenderParticles",
-                                         "ExtraArgs" },
+                                         "SandFriction", "ColliderFriction",
+                                         "ColliderFrictionDefault", "ExtraArgs" },
                                        spath);
 
                     auto& sc = terrain.sidecar;
@@ -2227,6 +2250,25 @@ namespace airlib
                     sc.script = getStrictString(sidecar_json, "Script", spath, "", false);
                     sc.log_file = getStrictString(sidecar_json, "LogFile", spath, "", false);
                     sc.extra_args = getStrictString(sidecar_json, "ExtraArgs", spath, "", false);
+                    sc.sand_friction =
+                        getStrictDouble(sidecar_json, "SandFriction", spath, 0.0, false);
+                    sc.collider_friction =
+                        getStrictDouble(sidecar_json, "ColliderFriction", spath, 0.0, false);
+                    sc.collider_friction_default =
+                        getStrictDouble(sidecar_json, "ColliderFrictionDefault", spath, 0.0, false);
+                    // ⚠ SAY IT WHEN THE TWO FRICTIONS MATCH. Equal coefficients put a vehicle
+                    // exactly at marginal stability on the slope the sand builds by itself, and a
+                    // rover that never climbs anything looks like a broken coupling rather than an
+                    // authored material. Cheap to warn, expensive to rediscover.
+                    if (sc.sand_friction > 0.0 && sc.collider_friction_default > 0.0 &&
+                        std::fabs(sc.sand_friction - sc.collider_friction_default) < 1e-6) {
+                        warning_messages.push_back(
+                            "Settings '" + spath + "': SandFriction and ColliderFrictionDefault "
+                            "are both " + std::to_string(sc.sand_friction) + ". A heap rests at "
+                            "atan(sand) and a vehicle climbs at most atan(collider), so equal "
+                            "values leave every vehicle marginal on a slope the sand forms by "
+                            "itself. A lugged wheel should exceed the sand's own friction.");
+                    }
                     sc.voxel_size = getStrictDouble(sidecar_json, "VoxelSize", spath, 0.02, false);
                     sc.density = getStrictDouble(sidecar_json, "Density", spath, 2500.0, false);
                     sc.fps = getStrictDouble(sidecar_json, "Fps", spath, 120.0, false);

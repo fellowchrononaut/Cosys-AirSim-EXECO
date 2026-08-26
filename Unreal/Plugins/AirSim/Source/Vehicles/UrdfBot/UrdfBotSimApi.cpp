@@ -2411,6 +2411,20 @@ bool UrdfBotSimApi::applyLinkWrench(size_t link_index, const urdf::Wrench& wrenc
     return true;
 }
 
+bool UrdfBotSimApi::setLinkWorldCollision(size_t link_index, bool enabled)
+{
+    // ⚠ Same lock as applyLinkWrench, for the same reason: resetImplementation() rebuilds every
+    // solver body, and this is called from the game thread while reset can come from an RPC thread.
+    //
+    // ⚠ THE RESULT IS LOAD-BEARING. A caller that believes rigid support was suspended when it was
+    // not will read the rigid floor's reaction as the sand carrying the vehicle. Both the backend
+    // and this seam return false rather than guessing.
+    std::lock_guard<std::mutex> lock(backend_mutex_);
+    if (backend_ == nullptr || !backend_state_available_)
+        return false;
+    return backend_->setLinkWorldCollision(link_index, enabled);
+}
+
 bool UrdfBotSimApi::describeColliders(urdf::PhysicsColliderSet& out) const
 {
     // ⚠ Same lock as every other backend read. resetImplementation() destroys and rebuilds every

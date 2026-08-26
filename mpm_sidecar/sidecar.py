@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 import gc
 import os
 import sys
@@ -78,6 +79,8 @@ class Sidecar:
 
         self.model = None
         self._collider_bodies: list[int] = []
+        self._collider_masses: list[float] = []
+        self._collider_volumes: list = []
         self.impulse_seg = None
         self._impulse_announced = False
         self.solver = None
@@ -205,6 +208,9 @@ class Sidecar:
         from newton.solvers import SolverImplicitMPM
 
         self._collider_bodies = []
+        self._collider_masses = []
+        self._collider_volumes = []
+        frictions_used = []
         builder = newton.ModelBuilder()
         builder.gravity = float(self.args.gravity)
 
@@ -262,20 +268,71 @@ class Sidecar:
             # attributing sand force to the wrong wheel is exactly the kind of error that looks
             # plausible in a video, so the mapping is stored instead of inferred.
             self._collider_bodies.append(body)
+            # ⚠ KEPT FOR --collider-mass. The wire has carried `mass` since v1 and nothing has ever
+            # read it; see the setup_collider call below for why that was the ejection bug.
+            self._collider_masses.append(float(entry.mass))
+            body_xform = xform
+
+            # ⚠ REPORTED vs ASSUMED, said out loud. A backend that could not state a friction
+            # coefficient must not be indistinguishable from one that stated Newton's default.
+            shape_friction = float(entry.friction) if entry.material_reported else 0.0
+            if self.args.collider_friction > 0.0:
+                shape_friction = float(self.args.collider_friction)   # explicit override wins
+            frictions_used.append((name, shape_friction if shape_friction > 0.0
+                                   else float(self.args.collider_friction_default),
+                                   bool(entry.material_reported)))
 
             for s in range(entry.shape_count):
                 shape = entry.shapes[s]
                 xform = wp.transform(wp.vec3(*shape.position.as_tuple()),
                                      wp.quat(*shape.orientation.as_xyzw()))
+                # ⚠ REMEMBERED IN WORLD SPACE so the sand can be spawned AROUND this shape rather
+                # than through it. See _spawn_sand: the bed is a filled box built wherever the
+                # operator declared it, with no knowledge of what is standing there, so without
+                # this every collider present at t=0 is born full of sand that never leaves.
+                world = wp.transform_multiply(body_xform, xform)
+                # ⚠ A HULL CARRIES NEITHER radius NOR half_extents — both are 0 on the wire — so
+                # the bounding-sphere fallback in _points_in_shape would cull nothing at all and
+                # silently leave every Box3D wheel full of sand. Derive the bound from the actual
+                # vertices, which is the only place a hull's size is stated.
+                bound = float(shape.radius)
+                if shape.kind == P.SHAPE_CONVEX_HULL:
+                    verts = np.asarray(shape.hull_vertices(), dtype=float)
+                    bound = float(np.linalg.norm(verts, axis=1).max()) if len(verts) else 0.0
+                self._collider_volumes.append(dict(
+                    kind=shape.kind,
+                    hull_bound=bound,
+                    pos=np.array(wp.transform_get_translation(world), dtype=float),
+                    quat=np.array(wp.transform_get_rotation(world), dtype=float),  # xyzw
+                    radius=float(shape.radius),
+                    half_length=float(shape.half_length),
+                    half_extents=np.array(shape.half_extents.as_tuple(), dtype=float),
+                ))
+                # ⚠ THE WIRE HAS CARRIED THIS SINCE v1 AND IT WAS BEING THROWN AWAY. Every
+                # add_shape_* call below used to omit `cfg`, so every collider silently inherited
+                # Newton's default mu of 0.5 no matter what the simulator reported. That default
+                # happens to equal the sand's own internal friction, i.e. the SMOOTH-WHEEL limit,
+                # and it is decisive rather than cosmetic: measured 2026-08-26 on a 52 kg Scout
+                # against a 2 x 1.6 x 0.4 m mound, all else identical —
+                #     mu 0.5 -> stalls at the toe, climbs 0.082 m
+                #     mu 0.8 -> creeps to 40% up the face, climbs 0.251 m
+                #     mu 1.2 -> crests and drives off the far side, climbs 0.325 m
+                # A lugged wheel shears the SOIL rather than sliding on it, so its effective
+                # coefficient is at or above the soil's internal friction; 0.5 understates a
+                # treaded tyre. Until this line existed, no settings file could reach it.
+                mu = float(shape_friction if shape_friction > 0.0
+                           else self.args.collider_friction_default)
+                cfg = newton.ModelBuilder.ShapeConfig(mu=mu)
+
                 kind = shape.kind
                 if kind == P.SHAPE_SPHERE:
-                    builder.add_shape_sphere(body, xform=xform, radius=shape.radius)
+                    builder.add_shape_sphere(body, xform=xform, radius=shape.radius, cfg=cfg)
                 elif kind == P.SHAPE_BOX:
                     hx, hy, hz = shape.half_extents.as_tuple()
-                    builder.add_shape_box(body, xform=xform, hx=hx, hy=hy, hz=hz)
+                    builder.add_shape_box(body, xform=xform, hx=hx, hy=hy, hz=hz, cfg=cfg)
                 elif kind in (P.SHAPE_CAPSULE, P.SHAPE_CYLINDER):
                     builder.add_shape_capsule(body, xform=xform, radius=shape.radius,
-                                              half_height=shape.half_length)
+                                              half_height=shape.half_length, cfg=cfg)
                 elif kind == P.SHAPE_CONVEX_HULL:
                     vertices = shape.hull_vertices()
                     if len(vertices) < 4:
@@ -286,7 +343,7 @@ class Sidecar:
                         continue
                     mesh = self._hull_mesh(np.array(vertices, dtype=np.float32))
                     if mesh is not None:
-                        builder.add_shape_mesh(body, xform=xform, mesh=mesh)
+                        builder.add_shape_mesh(body, xform=xform, mesh=mesh, cfg=cfg)
                 else:
                     print(f"  ⚠ {name} shape {s}: wire kind {kind} not handled, skipped")
 
@@ -317,6 +374,21 @@ class Sidecar:
         self.state_1 = self.model.state()
         self.particle_count = len(self.model.particle_q) if self.model.particle_q is not None else 0
 
+        # ⚠ D13 MATERIAL: the sand's own internal friction, which is what sets its ANGLE OF REPOSE.
+        # Newton's default is 0.5 -> atan(0.5) = 26.6 deg, and the beds measured on 2026-08-26 stood
+        # at 24.2-26.2 deg, confirming it. Filled BEFORE the solver is constructed so no
+        # notify_model_changed is needed, exactly as newton/examples/mpm/example_mpm_viscous.py does.
+        #
+        # ⚠ THE TWO FRICTIONS INTERACT, and getting them equal is a trap rather than a neutral
+        # choice: a heap rests at atan(sand mu) and a vehicle climbs at most atan(wheel mu), so
+        # equal coefficients put every vehicle exactly at marginal stability on a slope the sand
+        # builds by itself. That is the configuration in which nothing ever climbs anything.
+        if self.args.sand_friction > 0.0:
+            import math as _math
+            self.model.mpm.friction.fill_(float(self.args.sand_friction))
+            print(f"sand internal friction mu = {self.args.sand_friction} "
+                  f"-> angle of repose {_math.degrees(_math.atan(self.args.sand_friction)):.1f} deg")
+
         config = SolverImplicitMPM.Config()
         config.voxel_size = float(self.args.voxel_size)
         config.tolerance = 1.0e-4
@@ -341,14 +413,84 @@ class Sidecar:
 
         self.solver = SolverImplicitMPM(self.model, config=config)
 
-        # ⚠ ZERO MASS IS THE ONE-WAY SWITCH, and it is Newton's documented mechanism, not a trick:
-        # "Rigid body colliders will be treated as kinematic if their effective mass is zero... An
-        # explicit body_mass array is authoritative." body_inv_inertia is deliberately NOT passed —
-        # it is exactly the articulated effective inertia §11.1 says we cannot supply.
+        # ⚠ THE COLLIDER MASS IS THE TWO-WAY SWITCH, AND ZERO MEANT "INFINITELY HEAVY".
+        #
+        # Newton's documented mechanism: "Rigid body colliders will be treated as kinematic if
+        # their effective mass is zero... An explicit body_mass array is authoritative." Passing
+        # zeros therefore does not mean "no mass" — it means the sand is solved against an
+        # IMMOVABLE WALL. The impulse that comes back is whatever it takes to stop the sand dead
+        # against infinite inertia, and the simulator then applies that number to a 0.28 kg wheel.
+        #
+        # Measured in PhysicsEngineDiscussion/newton_probes (results/bridge_massscale_*.csv), with
+        # everything else held identical, peak sand force on the rover against the mass Newton
+        # believes the wheel has:
+        #     1x true mass    8.6 N        100x   39.1 N        10000x   78.3 N
+        # and the live Unreal bridge, which is past the right-hand end of that table AND has no
+        # fixed-point iteration, reached 1443 N on a 16.5 N vehicle. Newton's own coupled solver
+        # instead asks the rigid solver for each body's ARTICULATED EFFECTIVE inertia
+        # (`coupling_eval_effective_mass_block`) and installs that as the proxy mass.
+        #
+        # ⚠ THE LINK'S OWN MASS IS NOT THAT QUANTITY — §11.1 is still right about that, and the wire
+        # says so honestly via `inertia_is_articulated_effective`, which no backend sets to true
+        # yet. But finite-and-approximate beats infinite: the gap this closes is the one between a
+        # wall and a wheel, not the one between a wheel and a wheel-on-a-rocker.
+        #
+        # The bodies stay `is_kinematic=True`, so Newton still never integrates them; their motion
+        # is still the pose we push each frame. This array only tells the CONTACT SOLVE how much
+        # inertia to expect on the other side.
+        mode = self.args.collider_mass
+        if mode == "kinematic" or not self._collider_masses:
+            body_mass = wp.zeros_like(self.model.body_mass)
+            print("colliders are KINEMATIC to the sand (mass 0 = infinite): one-way, M2 behaviour")
+        else:
+            # ⚠ THE SAND SHOULD FEEL A VEHICLE, NOT SIX LOOSE WHEEL CASTINGS. A URDF wheel link
+            # weighs 57 g; the thing actually resisting the sand is that wheel plus its share of the
+            # 1.68 kg rover it is bolted to. --collider-mass-total spreads a declared vehicle mass
+            # across the colliders IN PROPORTION to their own mass, so the total the contact solve
+            # sees is the vehicle and no collider is counted twice.
+            #
+            # ⚠ NOT "the whole vehicle mass on every collider" — that is the same 1443 N mistake
+            # approached from the other side, over-counting by the number of contacts.
+            scale = float(self.args.collider_mass_scale)
+            total_wire = sum(self._collider_masses)
+            if self.args.collider_mass_total > 0.0 and total_wire > 0.0:
+                scale = float(self.args.collider_mass_total) / total_wire
+                print(f"--collider-mass-total {self.args.collider_mass_total} kg over "
+                      f"{total_wire:.3f} kg of link mass -> scale x{scale:.2f}")
+
+            masses = np.zeros(len(self.model.body_mass), dtype=np.float32)
+            missing = []
+            for slot, body in enumerate(self._collider_bodies):
+                m = self._collider_masses[slot] * scale
+                # ⚠ A ZERO HERE WOULD SILENTLY RESTORE THE BUG for that one link, and a link whose
+                # mass the simulator could not report is exactly the one worth naming.
+                if not (m > 0.0):
+                    # ⚠ body_label; Model has no body_key. Caught while debugging a penetration
+                    # metric that had the same typo and silently measured the wrong bodies.
+                    missing.append(self.model.body_label[body])
+                    m = float(self.args.collider_mass_floor)
+                masses[body] = m
+            body_mass = wp.array(masses, dtype=float)
+            total = float(masses.sum())
+            print(f"colliders have REAL MASS to the sand: {total:.3f} kg over "
+                  f"{len(self._collider_bodies)} colliders "
+                  f"(x{scale:.2f} scale) — two-way contact")
+            if missing:
+                print(f"  ⚠ {len(missing)} collider(s) reported no mass on the wire and fell back "
+                      f"to {self.args.collider_mass_floor} kg: {', '.join(missing[:6])}")
+
         self.solver.setup_collider(
-            body_mass=wp.zeros_like(self.model.body_mass),
+            body_mass=body_mass,
             body_q=self.state_0.body_q,
         )
+
+        if frictions_used:
+            reported = sum(1 for _, _, r in frictions_used if r)
+            mus = sorted({round(m, 3) for _, m, _ in frictions_used})
+            print(f"collider friction mu {mus} — {reported} of {len(frictions_used)} reported by "
+                  f"the simulator, the rest defaulted to {self.args.collider_friction_default}"
+                  + (f" (overridden to {self.args.collider_friction})"
+                     if self.args.collider_friction > 0.0 else ""))
 
         print(f"built: {count} colliders, {self.particle_count} sand particles, "
               f"voxel {config.voxel_size} m")
@@ -413,12 +555,96 @@ class Sidecar:
         self._particle_radius = radius
         mass = float(np.prod(cell)) * float(self.args.density)
 
-        builder.add_particle_grid(
-            pos=wp.vec3(*lo), rot=wp.quat_identity(), vel=wp.vec3(0.0),
-            dim_x=int(res[0]) + 1, dim_y=int(res[1]) + 1, dim_z=int(res[2]) + 1,
-            cell_x=float(cell[0]), cell_y=float(cell[1]), cell_z=float(cell[2]),
-            mass=mass, jitter=2.0 * radius, radius_mean=radius,
+        dims = (int(res[0]) + 1, int(res[1]) + 1, int(res[2]) + 1)
+        if not self._collider_volumes or self.args.no_collider_cull:
+            builder.add_particle_grid(
+                pos=wp.vec3(*lo), rot=wp.quat_identity(), vel=wp.vec3(0.0),
+                dim_x=dims[0], dim_y=dims[1], dim_z=dims[2],
+                cell_x=float(cell[0]), cell_y=float(cell[1]), cell_z=float(cell[2]),
+                mass=mass, jitter=2.0 * radius, radius_mean=radius,
+            )
+            return
+
+        # ⚠ THE BED MUST NOT BE BUILT THROUGH THE ROBOT.
+        #
+        # add_particle_grid fills the declared box regardless of what occupies it, so every
+        # collider standing in the patch at build time is born full of sand — and MPM's collision
+        # only stops particles CROSSING a boundary, never evicts ones that started inside. They
+        # stay there for the life of the run, moving with the wheel, and the wheel reads as
+        # transparent: sand at ~ambient density inside it, no visible displacement. It also puts a
+        # wheel's worth of trapped mass inside every wheel.
+        #
+        # The grid is reproduced exactly as ModelBuilder.add_particle_grid generates it, jitter
+        # and all (same rng seed rule: 42 + len(particle_q)), then filtered, then bulk-added — so
+        # culling changes WHICH particles exist and nothing else about them.
+        px = np.arange(dims[0]) * float(cell[0])
+        py = np.arange(dims[1]) * float(cell[1])
+        pz = np.arange(dims[2]) * float(cell[2])
+        pts = np.stack(np.meshgrid(px, py, pz)).reshape(3, -1).T + lo
+        rng = np.random.default_rng(42 + len(builder.particle_q))
+        pts += (rng.random(pts.shape) - 0.5) * (2.0 * radius)
+
+        inside = np.zeros(len(pts), dtype=bool)
+        for v in self._collider_volumes:
+            inside |= self._points_in_shape(pts, v, skin=radius)
+
+        kept = pts[~inside]
+        culled = int(inside.sum())
+        builder.add_particles(
+            pos=kept.tolist(),
+            vel=[(0.0, 0.0, 0.0)] * len(kept),
+            mass=[mass] * len(kept),
+            radius=[radius] * len(kept),
         )
+        print(f"sand: {len(kept)} particles, {culled} culled from inside "
+              f"{len(self._collider_volumes)} collider shape(s) "
+              f"({100.0 * culled / max(1, len(pts)):.2f}% of the bed)")
+
+    @staticmethod
+    def _points_in_shape(pts, v, skin: float = 0.0) -> "np.ndarray":
+        """Boolean mask of points inside one collider shape, in world space.
+
+        ⚠ `skin` grows the shape by one particle radius. A particle whose CENTRE is just outside
+        the surface still overlaps it, and leaving those behind produces a shell of half-embedded
+        grains that the solver immediately has to resolve.
+        """
+        import numpy as np
+
+        d = pts - v["pos"]
+        kind = v["kind"]
+        r = v["radius"] + skin
+
+        if kind == P.SHAPE_SPHERE:
+            return np.einsum("ij,ij->i", d, d) < r * r
+
+        # Rotate into the shape's local frame: q is xyzw, and the INVERSE rotation is what takes a
+        # world offset into local coordinates.
+        x, y, z, w = v["quat"]
+        n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+        x, y, z, w = x / n, y / n, z / n, w / n
+        R = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+            [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+        ])
+        local = d @ R          # d @ R == R^T @ d, i.e. world -> local
+
+        if kind == P.SHAPE_BOX:
+            h = v["half_extents"] + skin
+            return np.all(np.abs(local) < h, axis=1)
+
+        if kind in (P.SHAPE_CAPSULE, P.SHAPE_CYLINDER):
+            hl = v["half_length"] + skin
+            radial = local[:, 0] ** 2 + local[:, 1] ** 2
+            return (radial < r * r) & (np.abs(local[:, 2]) < hl)
+
+        # ⚠ CONVEX HULL FALLS BACK TO A BOUNDING SPHERE, deliberately over-culling rather than
+        # under-culling: a few extra grains removed next to a wheel settle back in during
+        # presettle, whereas grains left inside it never leave at all. Box3D reports wheels as
+        # 32-vertex hulls, so this is the path the ExoMy actually takes.
+        bound = max(v.get("hull_bound", 0.0), v["radius"],
+                    float(np.max(np.abs(v["half_extents"]))), v["half_length"]) + skin
+        return np.einsum("ij,ij->i", d, d) < bound * bound
 
     def _setup_offline_viewer(self) -> None:
         """Offscreen GL viewer writing PNGs, encoded to video when the run ends.
@@ -1022,6 +1248,23 @@ def main() -> int:
                         help="ground plane height. Defaults to the BOTTOM of the sand patch "
                              "(patch-z - patch-depth/2), which is where the sand needs support.")
     parser.add_argument("--ground-friction", type=float, default=0.5)
+    # ⚠ D13 MATERIAL. These decide whether a vehicle climbs at all — see the note at the shape
+    # creation in build() for the measured 0.5/0.8/1.2 sweep — and until 2026-08-26 none of them
+    # was reachable from a settings file.
+    parser.add_argument("--collider-friction", type=float, default=0.0, metavar="MU",
+                        help="override wheel-on-sand friction for EVERY collider, ignoring what "
+                             "the simulator reported. 0 = use the wire's per-collider value.")
+    parser.add_argument("--collider-friction-default", type=float, default=0.5, metavar="MU",
+                        help="used for a collider whose backend reported no material. 0.5 is "
+                             "Newton's default and the SMOOTH-wheel value; a lugged wheel shears "
+                             "soil rather than sliding on it and sits at or above the sand's own "
+                             "internal friction.")
+    parser.add_argument("--sand-friction", type=float, default=0.0, metavar="MU",
+                        help="the sand's INTERNAL friction, which sets its angle of repose "
+                             "(atan(mu): 0.5 -> 26.6 deg, measured 26.0-26.2 deg). 0 = Newton's "
+                             "default of 0.5. ⚠ A vehicle can only climb a slope up to "
+                             "atan(collider friction), so sand friction >= wheel friction means "
+                             "the heap builds a face the wheels cannot hold on.")
     parser.add_argument("--camera-distance", type=float, default=0.0,
                         help="metres back from the sand centre. 0 derives it from the patch size.")
     parser.add_argument("--camera-pitch", type=float, default=25.0,
@@ -1048,6 +1291,31 @@ def main() -> int:
                              "M3/M4). ⚠ EXPERIMENTAL and off by default: the effective-inertia "
                              "question in plan 11.1 is unresolved, so a run using this must be "
                              "recorded as LaggedImpulseTwoWay, never as TwoWay.")
+    # ⚠ THE COLLIDER MASS IS THE TWO-WAY SWITCH. See the setup_collider call in build() for the
+    # measured numbers; in short, "kinematic" solves the sand against an immovable wall and returns
+    # an impulse sized for infinite inertia, which is what ejected the rover.
+    parser.add_argument("--collider-mass", choices=["kinematic", "real", "auto"], default="auto",
+                        help="mass the sand's contact solve believes each collider has. "
+                             "'kinematic' = 0 = infinite (one-way M2 behaviour); 'real' = the mass "
+                             "the simulator reported on the wire; 'auto' (default) = 'real' when "
+                             "--two-way is set, 'kinematic' otherwise.")
+    parser.add_argument("--collider-mass-scale", type=float, default=1.0,
+                        help="multiply the wire masses. A link's own mass is NOT its articulated "
+                             "effective mass (plan 11.1); this is the knob for compensating until "
+                             "a backend can report the real quantity.")
+    parser.add_argument("--no-collider-cull", action="store_true",
+                        help="spawn the bed straight through any collider standing in it, the "
+                             "pre-2026-08-26 behaviour. Those particles are trapped inside the "
+                             "collider for the life of the run and make it look transparent.")
+    parser.add_argument("--collider-mass-total", type=float, default=0.0, metavar="KG",
+                        help="total mass the sand's contact solve should see across ALL colliders, "
+                             "spread in proportion to their link masses. This is the vehicle's "
+                             "mass, not the mass per wheel: the effective inertia resisting sand at "
+                             "one wheel is its SHARE of the vehicle. Overrides "
+                             "--collider-mass-scale. 0 disables.")
+    parser.add_argument("--collider-mass-floor", type=float, default=0.05, metavar="KG",
+                        help="fallback for a collider whose reported mass is zero, so one missing "
+                             "value cannot silently restore infinite inertia on that link")
     parser.add_argument("--parent-pid", type=int, default=0,
                         help="exit when this process disappears. Set by the simulator when it owns "
                              "this sidecar (plan D14), so an editor crash cannot strand a process "
@@ -1060,6 +1328,29 @@ def main() -> int:
                         help="capture one frame every N solves. Rasterising is CPU-bound here, so "
                              "capturing every solve makes the sidecar the slow part of the link.")
     args = parser.parse_args()
+
+    # ⚠ RESOLVED ONCE, HERE, so every later read sees a concrete choice rather than "auto".
+    # Two-way with kinematic colliders is the combination that ejected the rover: the sand is
+    # solved against infinite inertia and the resulting impulse is applied to a light wheel. It is
+    # still reachable with an explicit --collider-mass kinematic, because reproducing the old
+    # behaviour is how the fix gets measured.
+    if args.collider_mass == "auto":
+        # ⚠ ALWAYS 'kinematic', INCLUDING WITH --two-way. This briefly resolved to 'real' when
+        # two-way was on, on the theory that infinite collider mass was what produced 1443 N
+        # reactions. It does cut the force — to ~24 N — but it buys that by making the wheel SOFT
+        # to the sand, and a soft contact leaks: sand passes through the wheel instead of being
+        # pushed by it. Compare Newton-MPM-Discussions/m0/exomy_box3d_run{1,2}.mp4, recorded on
+        # the kinematic path, where the bed is visibly displaced by the wheels.
+        #
+        # Non-penetration and reaction magnitude are SEPARATE problems. A wheel is a boundary
+        # whatever it weighs; mass governs how much it recoils. Trading the boundary away to damp
+        # the reaction loses the geometry, which is the part that is visible and the part
+        # terramechanics depends on. The force problem belongs on the simulator side, where
+        # MpmImpulseMaxForce, MpmImpulseRelaxation and force-hold already live — and in the initial
+        # condition, since the rover being spawned buried at the bed floor is what forces a wheel
+        # through 0.2 m of sand in the first place.
+        args.collider_mass = "kinematic"
+        print("--collider-mass auto -> 'kinematic' (hard boundary; see the note in main())")
 
     sidecar = Sidecar(args)
     try:

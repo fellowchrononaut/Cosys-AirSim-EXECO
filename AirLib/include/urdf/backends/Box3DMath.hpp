@@ -235,4 +235,44 @@ inline b3Quat prismaticAxisFrame(const urdf::Vec3& axis)
 /// frame; Box3D wants it in the body frame.
 void rotateInertia(const double in[9], const b3Quat& q, double out[9]);
 
+/// --- collision categories (plan D10) -------------------------------------------------------
+///
+/// ⚠ WHY CATEGORIES EXIST AT ALL. Every shape in this backend used b3DefaultShapeDef(), so every
+/// shape collided with every other. Plan D10 requires that a link selected for MPM coupling stop
+/// receiving support from the RIGID copy of the terrain while it is inside the particle bed —
+/// otherwise the wheel rests on the mirrored ground at the bed floor, buried under the whole
+/// depth of sand, and the sand can never carry the vehicle. Masking is the only mechanism that can
+/// express "this one link ignores that one surface" without touching the rest of the world.
+///
+/// ⚠ BOTH DIRECTIONS MUST PASS for a contact to exist:
+///     (catA & maskB) && (catB & maskA)
+/// so clearing the static-world bit from ONE link's mask is sufficient, and leaves the static
+/// world's own filter untouched for every other body.
+namespace filters {
+
+constexpr uint64_t kCategoryRobot = 0x1;
+constexpr uint64_t kCategoryStaticWorld = 0x2;
+constexpr uint64_t kMaskAll = ~uint64_t(0);
+
+/// The static world's filter: its own category, colliding with everything that still accepts it.
+inline b3Filter staticWorld()
+{
+    b3Filter f = b3DefaultFilter();
+    f.categoryBits = kCategoryStaticWorld;
+    f.maskBits = kMaskAll;
+    return f;
+}
+
+/// A robot link's filter. `world_collision=false` drops the static-world bit from the MASK, which
+/// is what suspends rigid ground support for that link alone.
+inline b3Filter robotLink(bool world_collision)
+{
+    b3Filter f = b3DefaultFilter();
+    f.categoryBits = kCategoryRobot;
+    f.maskBits = world_collision ? kMaskAll : (kMaskAll & ~kCategoryStaticWorld);
+    return f;
+}
+
+} // namespace filters
+
 } // namespace b3urdf

@@ -81,6 +81,7 @@ public:
     /// This robot's links as MPM colliders, qualified by vehicle name.
     bool describeColliders(urdf::PhysicsColliderSet& out) const override;
     bool applyLinkWrench(size_t link_index, const urdf::Wrench& wrench) override;
+    bool setLinkWorldCollision(size_t link_index, bool enabled) override;
 
 
     /// The robot's kinematics and the simulator time they were sampled at, as ONE value.

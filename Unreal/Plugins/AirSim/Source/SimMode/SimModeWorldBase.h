@@ -82,6 +82,11 @@ private:
     /// Act on that health, per plan §M2: a stalled sidecar pauses the clock until it catches up; a
     /// wrong-epoch or faulted one halts. Both defer to a lockstep firmware — see
     /// detectLockstepVehicles.
+    /// Plan D10: suspend rigid ground collision for MPM-selected links inside the patch, restore
+    /// it outside, with hysteresis. Called once per state publish, where the poses are already in
+    /// hand. Toggles the backend only on an actual crossing.
+    void applyMpmGroundGating(const std::vector<urdf::PhysicsColliderSet>& robots);
+
     void applyMpmLinkPolicy(const msr::airlib::mpm::MpmSidecarPublisher::Health& health, double now);
     /// Note whether any vehicle runs a MAVLink firmware, which owns the clock in lockstep and
     /// therefore forbids back-pressure.
@@ -174,6 +179,17 @@ private:
     std::vector<MpmImpulseTarget> mpm_impulse_targets_;
     /// Last force applied per collider, for relaxation blending. Same order as the targets.
     std::vector<urdf::Wrench> mpm_previous_wrench_;
+    /// Per target: is this link currently INSIDE the patch with rigid ground support suspended?
+    /// Only set when the backend confirmed the change, so it never claims support was removed when
+    /// it was not. Same order as the targets.
+    /// Per VEHICLE, not per link: does this vehicle currently have rigid ground support
+    /// suspended? Gating one link at a time left a crossing rover half supported, which threw it —
+    /// see applyMpmGroundGating. Only set when the backend confirmed every coupled link.
+    std::map<msr::airlib::VehicleSimApiBase*, bool> mpm_vehicle_suspended_;
+    /// Any link currently suspended — lets the gating return immediately when the feature has
+    /// never been armed, and still run once to RESTORE support after it is turned off mid-run.
+    bool mpm_ground_suspended_any_ = false;
+    bool mpm_ground_unsupported_reported_ = false;
     msr::airlib::mpm::MpmImpulseReader mpm_impulse_reader_;
     uint64_t mpm_last_impulse_step_ = 0;
     double mpm_last_impulse_seconds_ = 0.0;

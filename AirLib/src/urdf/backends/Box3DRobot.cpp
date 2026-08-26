@@ -468,6 +468,50 @@ void Box3DRobot::applyInertial(const urdf::Link& link, b3BodyId body)
     b3Body_SetMassData(body, md);
 }
 
+bool Box3DRobot::setLinkWorldCollision(size_t link, bool enabled)
+{
+    // ⚠ CALL THIS ON TRANSITIONS ONLY, NEVER PER TICK. box3d.h on b3Shape_SetFilter: "This is
+    // almost as expensive as recreating the shape." Six wheels re-filtered every frame at 120 Hz
+    // would cost more than the coupling it exists to serve, which is why the caller owns
+    // hysteresis and only calls here when a link actually crosses the patch boundary.
+    if (link >= links_.size())
+        return false;
+    LinkRec& rec = links_[link];
+    if (B3_IS_NULL(rec.body))
+        return false;
+    if (rec.world_collision == enabled)
+        return true;                       // already there; do not pay the filter cost
+
+    const int count = b3Body_GetShapeCount(rec.body);
+    if (count <= 0) {
+        // ⚠ Not a failure: a link with no collision shapes (the ExoMy's chassis, for one) has
+        // nothing to filter. Record the state so the caller is not asked again every frame.
+        rec.world_collision = enabled;
+        return true;
+    }
+
+    std::vector<b3ShapeId> shapes(static_cast<size_t>(count));
+    const int got = b3Body_GetShapes(rec.body, shapes.data(), count);
+    const b3Filter want = b3urdf::filters::robotLink(enabled);
+    for (int i = 0; i < got; ++i) {
+        // ⚠ Preserve groupIndex: it is not ours, and Box3D documents non-zero group filtering as
+        // overriding the mask entirely. Overwriting it here would silently defeat any
+        // self-collision policy a future caller sets.
+        b3Filter f = b3Shape_GetFilter(shapes[i]);
+        f.categoryBits = want.categoryBits;
+        f.maskBits = want.maskBits;
+        // ⚠ invokeContacts=true, AND IT IS LOAD-BEARING. Box3D only applies a new filter to
+        // contacts formed AFTERWARDS unless asked to recompute; without it the wheel would keep
+        // resting on the ground contact that already exists, and "rigid support suspended" would
+        // be true of the filter and false of the simulation until the contact happened to be
+        // destroyed. Its own header calls the recompute expensive, which is the other half of why
+        // this must be called on patch transitions only, never per tick.
+        b3Shape_SetFilter(shapes[i], f, /*invokeContacts=*/true);
+    }
+    rec.world_collision = enabled;
+    return true;
+}
+
 void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3BodyId body)
 {
     for (const urdf::Collision& col : link.collisions) {
@@ -475,6 +519,8 @@ void Box3DRobot::addCollisionShapes(const urdf::Link& link, LinkRec& rec, b3Body
         // Mass comes from <inertial> where present, so shapes must not overwrite it.
         sd.updateBodyMass = false;
         sd.enableContactEvents = true;
+        // Robot category, full mask. setLinkWorldCollision() narrows the mask later, per link.
+        sd.filter = b3urdf::filters::robotLink(true);
 
         const b3Transform xf = transformFromOrigin(col.origin);
 

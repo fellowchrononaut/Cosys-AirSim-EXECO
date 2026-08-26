@@ -829,6 +829,29 @@ TAutoConsoleVariable<int32> CVarMpmImpulseContract(
 /// too: a different default would be a silent physics choice made by this file rather than by an
 /// operator. Lower it when the coupling oscillates — which it does, because we also still have the
 /// double-support problem D10 describes, and relaxation bounds that fight without resolving it.
+TAutoConsoleVariable<int32> CVarMpmReplacementPatch(
+    TEXT("airsim.MpmReplacementPatch"), 0,
+    TEXT("Plan D10 / RigidSurfacePolicy=AuthoredReplacementPatch. While an MPM-selected link is "
+         "inside the terrain patch, suspend its collision against the MIRRORED RIGID GROUND so the "
+         "sand alone carries it. 0 = off (the link rests on the rigid floor at the BED FLOOR, "
+         "buried under the whole bed, and the sand can never support the vehicle)."),
+    ECVF_Default);
+
+TAutoConsoleVariable<float> CVarMpmReplacementHysteresis(
+    TEXT("airsim.MpmReplacementHysteresis"), 0.05f,
+    TEXT("Metres of hysteresis on the patch boundary. A link must be this far INSIDE to lose rigid "
+         "support and this far OUTSIDE to regain it. Zero makes a link straddling the edge toggle "
+         "every frame, and a Box3D filter change is 'almost as expensive as recreating the shape'."),
+    ECVF_Default);
+
+TAutoConsoleVariable<float> CVarMpmReplacementReach(
+    TEXT("airsim.MpmReplacementReach"), 0.35f,
+    TEXT("Metres above the bed's top and below its floor within which a link still counts as being "
+         "in the patch. A wheel RESTING on a bed has its centre a radius proud of the surface, so a "
+         "strict containment test excludes the case this feature exists for. Should exceed the "
+         "largest coupled link's radius."),
+    ECVF_Default);
+
 TAutoConsoleVariable<float> CVarMpmImpulseRelaxation(
     TEXT("airsim.MpmImpulseRelaxation"), 1.0f,
     TEXT("Blend factor for the sand's reaction: 1.0 applies each frame's force raw, lower values "
@@ -1232,6 +1255,19 @@ void ASimModeWorldBase::startMpmSidecarProcess()
              "--max-render-particles %d --parent-pid %u"),
         *script, sc->voxel_size, sc->fps, sc->density, sc->particle_every,
         sc->max_render_particles, own_pid);
+    // ⚠ D13 MATERIAL, and it is not optional detail: wheel friction was the difference between a
+    // 52 kg rover stalling at the toe of a mound and cresting it. Only forwarded when authored, so
+    // an unset key still means "the sidecar decides" rather than "zero friction".
+    if (sc->sand_friction > 0.0)
+        args += FString::Printf(TEXT(" --sand-friction %g"), sc->sand_friction);
+    if (sc->collider_friction > 0.0)
+        args += FString::Printf(TEXT(" --collider-friction %g"), sc->collider_friction);
+    if (sc->collider_friction_default > 0.0)
+        args += FString::Printf(TEXT(" --collider-friction-default %g"),
+                                sc->collider_friction_default);
+
+    // ⚠ EXTRA ARGS LAST, so an operator debugging by hand can still override anything the schema
+    // now models — argparse takes the final occurrence.
     if (!sc->extra_args.empty())
         args += FString::Printf(TEXT(" %s"), UTF8_TO_TCHAR(sc->extra_args.c_str()));
 
@@ -1640,6 +1676,19 @@ void ASimModeWorldBase::publishMpmRegistry()
         }
     }
     mpm_previous_wrench_.assign(mpm_impulse_targets_.size(), urdf::Wrench());
+
+    // ⚠ THE GATING'S BELIEF MUST BE DROPPED WITH THE BODIES IT DESCRIBED. resetImplementation()
+    // destroys and rebuilds every solver body, so each link comes back with FULL world collision —
+    // but `mpm_vehicle_suspended_` remembered which vehicles had it suspended. The coordinator
+    // would then believe a vehicle's ground support was suspended while the fresh Box3D shapes
+    // collide with the terrain, and skip the call that would have made it true — reading the
+    // rigid floor's reaction as sand support.
+    //
+    // It happens to self-heal today because every vehicle respawns OUTSIDE the patch and the next
+    // transition corrects it. That is a property of the current settings files, not of the code: a
+    // vehicle authored to spawn inside its own bed would carry the divergence for the whole run.
+    mpm_vehicle_suspended_.clear();
+    mpm_ground_suspended_any_ = false;
     mpm_last_impulse_step_ = 0;
     mpm_last_impulse_sim_time_ = 0.0;
 
@@ -1768,6 +1817,8 @@ void ASimModeWorldBase::publishMpmState()
     }
     mpm_publisher_->publishState(stamp, step, time, robots);
 
+    applyMpmGroundGating(robots);
+
     const auto health = mpm_publisher_->health(stamp);
     const double now = FPlatformTime::Seconds();
 
@@ -1788,6 +1839,207 @@ void ASimModeWorldBase::publishMpmState()
     if (now - last_mpm_health_log_ > 10.0) {
         last_mpm_health_log_ = now;
         UE_LOG(LogPhysicsCoordinator, Log, TEXT("%s"), UTF8_TO_TCHAR(health.describe().c_str()));
+    }
+}
+
+void ASimModeWorldBase::applyMpmGroundGating(const std::vector<urdf::PhysicsColliderSet>& robots)
+{
+    // ⚠ WHAT THIS FIXES. Plan §11.4: inside an active patch a selected link must not ALSO receive
+    // support from a rigid copy of the same terrain. The bed's floor is the level's ground, so a
+    // wheel resting on the mirrored ground sits at the BOTTOM of the sand — measured 2026-08-26,
+    // six wheels pinned at z=1.049 across 740 mm of driving through a bed spanning 0.994..1.247.
+    // No work on the force path can make sand carry a vehicle the rigid floor is holding up.
+    //
+    // ⚠ THIS IS THE ONE SWITCH THAT CAN DROP A ROBOT THROUGH THE WORLD. Off by default, and it
+    // must stay that way until a bed is known to carry the vehicle: with rigid support suspended
+    // and sand that cannot hold it, the link falls to whatever is left below.
+    const bool want = CVarMpmReplacementPatch.GetValueOnGameThread() != 0;
+    if (!want && !mpm_ground_suspended_any_)
+        return;                       // never armed and nothing to restore — the common case
+
+    const AirSimSettings::DeformableTerrainSetting* terrain = nullptr;
+    for (const auto& item : getSettings().deformable_terrains)
+        if (item.second.enabled) { terrain = &item.second; break; }
+
+    // The patch in SOLVER coordinates, the frame gatherColliders reports poses in. Converted here
+    // rather than trusting the NED numbers, for the same reason the region publish does it: a Y
+    // mirror on the wrong side of that boundary already cost this workstream a debugging cycle.
+    urdf::Vec3 lo{}, hi{};
+    if (terrain != nullptr && want) {
+        const float world_to_meters = getGlobalNedTransform().fromNed(1.0f);
+        const msr::airlib::Vector3r ned_center(static_cast<float>(terrain->region.center.x),
+                                               static_cast<float>(terrain->region.center.y),
+                                               static_cast<float>(terrain->region.center.z));
+        const urdf::Vec3 c = UrdfTransform::toUrdfVec(
+            getGlobalNedTransform().fromGlobalNed(ned_center), world_to_meters);
+        const double hx = std::fabs(terrain->region.size.x) * 0.5;
+        const double hy = std::fabs(terrain->region.size.y) * 0.5;
+        const double hz = std::fabs(terrain->region.size.z) * 0.5;
+        lo = urdf::Vec3{ c.x - hx, c.y - hy, c.z - hz };
+        hi = urdf::Vec3{ c.x + hx, c.y + hy, c.z + hz };
+    }
+
+    const double band = FMath::Max(0.0f, CVarMpmReplacementHysteresis.GetValueOnGameThread());
+
+    // Index the gathered poses by stable id, so a target resolves to the pose the sidecar was sent.
+    std::map<std::string, urdf::Vec3> pose_by_id;
+    // ⚠ AND ITS EXTENT. The floor test compared the link ORIGIN to the bed floor, so a 0.165 m
+    // wheel had its BOTTOM 66 mm below the floor while its centre was still comfortably inside —
+    // the guard never fired, the wheel sank past Newton's ground plane, and a collider below that
+    // plane scoops particles through it: 7.8% of a Scout's bed reached -10 km on 2026-08-26. A
+    // wheel is not a point, and the one place that mattered treated it as one.
+    std::map<std::string, double> bound_by_id;
+    for (const auto& set : robots) {
+        for (const auto& c : set.colliders) {
+            pose_by_id[c.stable_id] = c.position;
+            double bound = 0.0;
+            for (const auto& sh : c.shapes) {
+                const double off = std::sqrt(sh.position.x * sh.position.x +
+                                             sh.position.y * sh.position.y +
+                                             sh.position.z * sh.position.z);
+                double extent = std::max({ sh.radius, sh.half_length,
+                                           std::fabs(sh.half_extents.x),
+                                           std::fabs(sh.half_extents.y),
+                                           std::fabs(sh.half_extents.z) });
+                // A convex hull states its size only through its vertices; Box3D reports wheels
+                // that way, so without this the dominant collider kind would bound to zero.
+                for (const auto& v : sh.vertices)
+                    extent = std::max(extent, std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z));
+                bound = std::max(bound, off + extent);
+            }
+            bound_by_id[c.stable_id] = bound;
+        }
+    }
+
+    // ⚠ ALL-OR-NOTHING PER VEHICLE, NOT PER LINK — and per link was actively harmful.
+    //
+    // The first version gated each link independently. A rover 0.3 m long crossing a patch edge
+    // then spends the crossing with some wheels on the mirrored terrain and some suspended over
+    // sand, which is worse than either extreme: measured 2026-08-26, 30 transitions during one
+    // traverse and an ExoMy thrown while standing on three wheels and dangling on three. Half
+    // supported is not an intermediate state between supported and unsupported; it is a lever.
+    //
+    // Deciding per VEHICLE turns the crossing into one clean handover. The AABB test is unchanged;
+    // only the rule that consumes it is.
+    std::map<msr::airlib::VehicleSimApiBase*, bool> all_inside;   // vehicle -> EVERY link inside
+    for (size_t i = 0; i < mpm_impulse_targets_.size(); ++i) {
+        const auto& target = mpm_impulse_targets_[i];
+        if (target.api == nullptr)
+            continue;
+
+        // ⚠ HYSTERESIS FROM THE VEHICLE'S STATE, not the link's. Mixing the two would let one
+        // wheel's margin fight another's and reintroduce the chatter this replaces.
+        const auto held = mpm_vehicle_suspended_.find(target.api);
+        const bool suspended_now = held != mpm_vehicle_suspended_.end() && held->second;
+        const double m = suspended_now ? -band : band;
+
+        bool inside = false;
+        if (want && terrain != nullptr && i < mpm_selected_ids_.size()) {
+            const auto found = pose_by_id.find(mpm_selected_ids_[i]);
+            if (found != pose_by_id.end()) {
+                const urdf::Vec3& p = found->second;
+                const double reach =
+                    FMath::Max(0.0f, CVarMpmReplacementReach.GetValueOnGameThread());
+                // ⚠ THE REACH IS UPWARD ONLY, AND THE BED FLOOR IS A FLOOR OF LAST RESORT.
+                //
+                // A symmetric window let a sinking vehicle stay "inside" all the way down, so it
+                // never got its rigid support back and fell out of the world — observed
+                // 2026-08-26 with an ExoMy whose 1.8-voxel wheels the sand cannot carry. Plan
+                // §11.4 already specifies the correct shape: "A container floor below the particle
+                // bed is valid; a coincident rigid surface at the particle top is not."
+                //
+                // So: generous ABOVE the bed, because a wheel resting on the surface has its
+                // centre a radius proud of it; hard cut AT the bed floor, because a link that has
+                // sunk that far has been abandoned by the sand and the rigid ground must catch it.
+                // Leaving the patch downwards is a real physical event, not an edge case, and it
+                // is reported below rather than passed over in silence.
+                // The floor test uses the link's LOWEST point, not its origin.
+                const auto b = bound_by_id.find(mpm_selected_ids_[i]);
+                const double half = b != bound_by_id.end() ? b->second : 0.0;
+                inside = p.x > lo.x + m && p.x < hi.x - m &&
+                         p.y > lo.y + m && p.y < hi.y - m &&
+                         p.z - half > lo.z + m && p.z < hi.z + reach;
+            }
+        }
+        auto slot = all_inside.find(target.api);
+        if (slot == all_inside.end())
+            all_inside.emplace(target.api, inside);
+        else
+            slot->second = slot->second && inside;
+    }
+
+    int32 suspended = 0, restored = 0;
+    bool any_suspended = false;
+    for (const auto& entry : all_inside) {
+        msr::airlib::VehicleSimApiBase* api = entry.first;
+        const bool want_suspend = entry.second;
+        const auto held = mpm_vehicle_suspended_.find(api);
+        const bool suspended_now = held != mpm_vehicle_suspended_.end() && held->second;
+        if (want_suspend == suspended_now) {
+            any_suspended = any_suspended || suspended_now;
+            continue;
+        }
+
+        // Applied to EVERY coupled link of this vehicle in one pass, so it is never left in the
+        // mixed state the per-link rule created.
+        bool all_ok = true;
+        for (const auto& t : mpm_impulse_targets_) {
+            if (t.api != api)
+                continue;
+            if (!t.api->setLinkWorldCollision(t.link_index, !want_suspend))
+                all_ok = false;
+        }
+
+        // ⚠ ONLY RECORD IT IF THE BACKEND ACTUALLY DID IT. Believing support was suspended when it
+        // was not turns the rigid floor's reaction into "the sand is carrying the vehicle".
+        if (!all_ok) {
+            if (!mpm_ground_unsupported_reported_) {
+                mpm_ground_unsupported_reported_ = true;
+                UE_LOG(LogPhysicsCoordinator, Error,
+                       TEXT("airsim.MpmReplacementPatch is ON but this vehicle's backend could not "
+                            "suspend rigid ground collision on every coupled link. The wheels are "
+                            "STILL resting on the mirrored terrain; any sinkage or support measured "
+                            "from this run is the rigid floor, not the sand."));
+            }
+            continue;
+        }
+        // ⚠ SAY WHY IT CAME BACK. Restoring support because the vehicle DROVE OUT is routine;
+        // restoring it because the vehicle SANK THROUGH THE BED is the sand failing to carry it,
+        // and the two must not look the same in a log. The discriminator is whether any coupled
+        // link is now at or below the bed floor.
+        if (!want_suspend && suspended_now) {
+            bool sank = false;
+            for (size_t i = 0; i < mpm_impulse_targets_.size(); ++i) {
+                if (mpm_impulse_targets_[i].api != api || i >= mpm_selected_ids_.size())
+                    continue;
+                const auto found = pose_by_id.find(mpm_selected_ids_[i]);
+                const auto bb = bound_by_id.find(mpm_selected_ids_[i]);
+                const double bhalf = bb != bound_by_id.end() ? bb->second : 0.0;
+                if (found != pose_by_id.end() && found->second.z - bhalf <= lo.z)
+                    sank = true;
+            }
+            if (sank) {
+                UE_LOG(LogPhysicsCoordinator, Warning,
+                       TEXT("the sand did NOT carry this vehicle: a coupled link reached the bed "
+                            "floor (z=%.3f), so rigid ground support has been restored to stop it "
+                            "falling out of the world. The bed cannot support this vehicle at this "
+                            "resolution — check the wheel radius in voxels before reading anything "
+                            "else from the run."),
+                       lo.z);
+            }
+        }
+
+        mpm_vehicle_suspended_[api] = want_suspend;
+        want_suspend ? ++suspended : ++restored;
+        any_suspended = any_suspended || want_suspend;
+    }
+
+    mpm_ground_suspended_any_ = any_suspended;
+    if (suspended > 0 || restored > 0) {
+        UE_LOG(LogPhysicsCoordinator, Log,
+               TEXT("replacement patch: %d vehicle(s) fully entered the bed and gave up "
+                    "rigid ground, %d left it and got it back (hysteresis %.3f m)"),
+               suspended, restored, band);
     }
 }
 

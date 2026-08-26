@@ -361,6 +361,25 @@ public:
     virtual void setJointTarget(size_t joint, ControlMode mode, double value) = 0;
     virtual void setPositionGains(size_t joint, double hertz, double damping_ratio) = 0;
     virtual void applyExternalWrench(size_t link, const Wrench& wrench) = 0;
+
+    /// Suspend or restore ONE link's collision against the mirrored static world (plan D10, §11.4).
+    /// Returns false when this backend cannot do it — the honest default, since a caller that
+    /// believes ground support was removed when it was not will conclude the sand is carrying a
+    /// vehicle the rigid floor is actually holding up.
+    ///
+    /// ⚠ WHY IT IS NEEDED. Inside an active MPM patch a selected link must not also receive
+    /// support from a rigid copy of the same terrain. Without this the wheel rests on the mirrored
+    /// ground at the BED FLOOR, buried under the full depth of sand, and no amount of coupling
+    /// work can make the sand carry the vehicle — measured 2026-08-26: wheels pinned at z=1.049
+    /// across 740 mm of driving through a 250 mm bed.
+    ///
+    /// ⚠ TRANSITIONS ONLY. Box3D documents a filter change as "almost as expensive as recreating
+    /// the shape". The caller owns the hysteresis; repeating the current value must be cheap.
+    ///
+    /// ⚠ SCOPED TO THE STATIC WORLD. Self-collision, robot-robot and link-link contacts are not
+    /// affected. A backend that cannot express that distinction must return false rather than
+    /// disabling more than was asked.
+    virtual bool setLinkWorldCollision(size_t /*link*/, bool /*enabled*/) { return false; }
 };
 
 } // namespace urdf
