@@ -111,6 +111,15 @@ class Sidecar:
         self._recorded_registry = None
         self._initial_state = None
         self._fall_warned = False
+        self._draw_particles = False
+        self._pidx_stride = 1
+        # ⚠ D15 step 1: set only in --own-vehicle mode. `vehicle` being None is what every other
+        # code path means by "the simulator owns the robot and we only see kinematic colliders".
+        self.vehicle = None
+        self.control = None
+        self.contacts = None
+        self.pipeline = None
+        self.mpm = None
 
     # ---- shared memory -------------------------------------------------------------------
 
@@ -537,7 +546,9 @@ class Sidecar:
         else:
             centre = np.array([self.args.patch_x, self.args.patch_y, self.args.patch_z],
                               dtype=float)
-            half = np.array([self.args.patch_size, self.args.patch_size,
+            half_y = (self.args.patch_size if self.args.patch_size_y is None
+                      else self.args.patch_size_y)
+            half = np.array([self.args.patch_size, half_y,
                              self.args.patch_depth * 0.5], dtype=float)
             # Said out loud: a sidecar quietly inventing its own patch is how the two ends stop
             # agreeing about where the sand is while both look healthy.
@@ -665,7 +676,26 @@ class Sidecar:
 
         self.viewer = ViewerGL(headless=True, num_frames=None, vsync=False)
         self.viewer.set_model(self.model)
-        self.viewer.show_particles = True
+
+        # ⚠ DRAW A FRACTION OF THE SAND WHEN THERE IS A LOT OF IT. Rasterising is the cost here,
+        # not the solve: measured on the 1.37 M-particle mound, the step went from ~78 ms on its
+        # own to ~428 ms with every particle drawn. The sidecar already decimates what it publishes
+        # to Unreal for exactly this reason. Radius grows as the cube root of the stride so a
+        # decimated bed still reads as solid rather than sparse — the same compensation the
+        # sim-side renderer applies.
+        stride = max(1, int(self.args.render_particle_stride))
+        self.viewer.show_particles = stride <= 1
+        self._draw_particles = stride > 1
+        if self._draw_particles:
+            import numpy as np
+            n = int(self.particle_count)
+            self._pidx_stride = stride
+            r = float(self.model.particle_radius.numpy()[0]) * (stride ** (1.0 / 3.0))
+            self._pradii = wp.full(len(range(0, n, stride)), value=r, dtype=float)
+            self._pcolors = wp.full(len(range(0, n, stride)),
+                                    value=wp.vec3(0.76, 0.68, 0.47), dtype=wp.vec3)
+            print(f"drawing {len(range(0, n, stride))} of {n} particles (stride {stride}) "
+                  f"at radius {r:.4f} m")
 
         # ⚠ AIM THE CAMERA AT THE SAND, or the recording is 167 frames of empty space.
         #
@@ -827,9 +857,26 @@ class Sidecar:
             span = max(h[0], h[1]) * 2.0
         else:
             c = (self.args.patch_x, self.args.patch_y, self.args.patch_z)
-            span = self.args.patch_size * 2.0
+            span = max(self.args.patch_size,
+                       self.args.patch_size if self.args.patch_size_y is None
+                       else self.args.patch_size_y) * 2.0
         distance = self.args.camera_distance if self.args.camera_distance > 0 else max(span * 1.8, 2.0)
         return c, distance
+
+    def _render_frame(self, state, sim_time: float) -> None:
+        """One offscreen frame of `state`. Shared by the wire loop and the own-vehicle loop."""
+        import warp as wp
+
+        self.viewer.begin_frame(sim_time)
+        self.viewer.log_state(state)
+        if self._draw_particles:
+            # ⚠ The stride happens on the host. 1.37 M x 3 floats is ~16 MB over PCIe, a few ms,
+            # against the tens of ms it costs to rasterise the particles we would otherwise draw.
+            gathered = state.particle_q.numpy()[::self._pidx_stride]
+            self.viewer.log_points("/sand", points=wp.array(gathered, dtype=wp.vec3),
+                                   radii=self._pradii, colors=self._pcolors)
+        self.viewer.end_frame()
+        self._capture_frame()
 
     def _capture_frame(self) -> None:
         from PIL import Image
@@ -969,10 +1016,7 @@ class Sidecar:
                 self._check_sand_is_supported()
             if self.viewer is not None and \
                     self.sidecar_step % max(1, self.args.render_every) == 0:
-                self.viewer.begin_frame(self.sidecar_time)
-                self.viewer.log_state(self.state_0)
-                self.viewer.end_frame()
-                self._capture_frame()
+                self._render_frame(self.state_0, self.sidecar_time)
             if index % 50 == 0:
                 print(f"  {index}/{len(states)} samples, {self.last_solve_seconds*1000:.1f} ms/solve",
                       flush=True)
@@ -1171,14 +1215,323 @@ class Sidecar:
                 self._check_sand_is_supported()
 
             if self.viewer is not None and self.sidecar_step % max(1, self.args.render_every) == 0:
-                self.viewer.begin_frame(self.sidecar_time)
-                self.viewer.log_state(self.state_0)
-                self.viewer.end_frame()
-                self._capture_frame()
+                self._render_frame(self.state_0, self.sidecar_time)
 
             if self.args.max_steps and self.sidecar_step >= self.args.max_steps:
                 print(f"reached --max-steps {self.args.max_steps}")
                 return 0
+
+    # ---- D15 step 1: the sidecar owns the vehicle -----------------------------------------
+
+    def build_own_vehicle(self) -> None:
+        """One model holding BOTH the robot and the sand, coupled by `SolverCoupledProxy`.
+
+        ⚠ HOW THIS DIFFERS FROM build(), AND WHY IT IS THE WHOLE POINT.
+
+        build() adds one body per wire collider with `mass=0, is_kinematic=True`, then hands
+        `SolverImplicitMPM` a zero `body_mass` array. Newton documents zero effective mass as
+        "kinematic", which means the sand is solved against an IMMOVABLE WALL: gravity never acts
+        on the collider inside the sand solve, so the impulses that come back are the reaction to
+        the collider's MOTION and nothing else. A wheel resting on settled sand transfers no
+        momentum and reads ~0 N. That is why the live bridge measured 8 N under a 52 kg Scout while
+        Newton's own coupled solver measured 507 N on the identical bed.
+
+        Here MuJoCo integrates the articulated robot and MPM integrates the sand inside ONE
+        `newton.Model`, and the proxy installs each body's ARTICULATED EFFECTIVE inertia
+        (`coupling_eval_effective_mass_block`) as the mass MPM's contact solve sees. That is the
+        quantity plan §11.1 says EXECOsim cannot supply from a URDF link — and the reason it does
+        not have to be supplied is that the rigid solver computing it is now in this process.
+
+        ⚠ THE SAND IS BUILT THE SIDECAR'S WAY, deliberately: same `_spawn_sand`, same particles per
+        cell, same density, same voxel size, same `SolverImplicitMPM.Config`. If this used the
+        probe's bed instead, a difference between this and the live run could always be blamed on
+        the material rather than on the coupling, which is the confusion the whole exercise exists
+        to remove.
+        """
+        report_newton_provenance()
+        import newton
+        from newton.solvers import SolverImplicitMPM, SolverMuJoCo
+        from newton.solvers.experimental.coupled import SolverCoupledProxy
+
+        import own_vehicle as OV
+
+        spec = OV.VehicleSpec.load(self.args.own_vehicle)
+        if self.args.own_vehicle_sand_links is not None:
+            spec.sand_links = self.args.own_vehicle_sand_links
+        if self.args.own_vehicle_wheel_torque is not None:
+            spec.wheel_max_torque = float(self.args.own_vehicle_wheel_torque)
+        if self.args.own_vehicle_wheel_kd is not None:
+            spec.wheel_kd = float(self.args.own_vehicle_wheel_kd)
+        if self.args.own_vehicle_wheel_friction is not None:
+            spec.wheel_friction = float(self.args.own_vehicle_wheel_friction)
+        self.vehicle = OV.OwnVehicle(spec)
+
+        # ⚠ Newton wants target DOFs in the coordinate layout for a velocity-driven wheel; the
+        # probe sets this before building anything and so must this.
+        newton.use_coord_layout_targets = True
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        builder.gravity = float(self.args.gravity)
+        builder.default_shape_cfg.mu = float(spec.body_friction)
+        # ⚠ BEFORE the particles, per Newton's own requirement — custom attributes must be
+        # registered before anything that carries them exists.
+        SolverImplicitMPM.register_custom_attributes(builder)
+
+        z = self.args.own_vehicle_z
+        if z is None:
+            z = spec.start_z
+        self.vehicle.add_to(builder, self.args.own_vehicle_x, self.args.own_vehicle_y, z,
+                            self.args.own_vehicle_yaw)
+
+        # ⚠ THE GROUND IS PRESENT, ON PURPOSE. The question D15 exists to answer is whether sand
+        # support and rigid ground support can coexist without one cancelling the other, so
+        # removing the ground would assume the answer. Its height is the bottom of the bed, which
+        # is where the sand needs support — same rule build() uses.
+        ground_z = self.args.ground_z
+        if ground_z is None:
+            ground_z = self.args.patch_z - self.args.patch_depth * 0.5
+        builder.add_ground_plane(
+            height=float(ground_z),
+            cfg=newton.ModelBuilder.ShapeConfig(mu=float(self.args.ground_friction)))
+        self.ground_z = float(ground_z)
+        print(f"ground plane at z = {self.ground_z:.3f} m, mu = {self.args.ground_friction}")
+
+        # The cull needs world-space shapes; `_spawn_sand` consumes exactly this list.
+        self._collider_volumes = self.vehicle.collider_volumes(builder)
+        self._spawn_sand(builder)
+
+        self.model = builder.finalize()
+        self.particle_count = len(self.model.particle_q) if self.model.particle_q is not None else 0
+        self.vehicle.bind(self.model)
+
+        # ⚠ D13 MATERIAL, filled BEFORE the solver is constructed so no notify_model_changed is
+        # needed. The sand's internal friction sets its ANGLE OF REPOSE, atan(mu).
+        if self.args.sand_friction > 0.0:
+            self.model.mpm.friction.fill_(float(self.args.sand_friction))
+            print(f"sand internal friction mu = {self.args.sand_friction} "
+                  f"-> angle of repose {math.degrees(math.atan(self.args.sand_friction)):.1f} deg")
+
+        config = SolverImplicitMPM.Config()      # identical to build()'s, on purpose
+        config.voxel_size = float(self.args.voxel_size)
+        config.tolerance = 1.0e-4
+        config.transfer_scheme = "pic"
+        config.max_iterations = 50
+        config.critical_fraction = 0.0
+        config.air_drag = 1.0
+        config.collider_velocity_mode = "forward"
+
+        bodies = list(self.vehicle.bodies)
+        self.solver = SolverCoupledProxy(
+            model=self.model,
+            entries=[
+                SolverCoupledProxy.Entry(
+                    name="mjc",
+                    solver=lambda v: SolverMuJoCo(model=v, use_mujoco_contacts=False, njmax=200),
+                    bodies=bodies, joints=list(range(self.model.joint_count)),
+                    substeps=int(self.args.own_vehicle_substeps)),
+                SolverCoupledProxy.Entry(
+                    name="mpm",
+                    solver=lambda v: SolverImplicitMPM(model=v, config=config),
+                    particles=list(range(self.model.particle_count)), in_place=True),
+            ],
+            coupling=SolverCoupledProxy.Config(
+                proxies=[SolverCoupledProxy.Proxy(
+                    source="mjc", destination="mpm", bodies=bodies,
+                    mass_scale=float(self.args.own_vehicle_mass_scale), mode="lagged",
+                    collision_pipeline=lambda _m: None)],
+                iterations=int(self.args.own_vehicle_proxy_iterations)),
+        )
+        self.mpm = self.solver.solver("mpm")
+
+        self.state_0 = self.model.state()
+        # ⚠ ONE STATE, STEPPED IN PLACE. `SolverCoupledProxy` runs its MPM entry with
+        # `in_place=True`, so the double-buffered swap the wire loop does would hand the next step
+        # a half-updated state. state_1 is kept pointing at the same object so anything that reads
+        # either (the sand-support check, the viewer) sees the live one.
+        self.state_1 = self.state_0
+        self.control = self.model.control()
+        self.pipeline = newton.CollisionPipeline(self.model, soft_contact_max=0)
+        self.contacts = self.pipeline.contacts()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+
+        print(f"built: vehicle '{spec.name}' + {self.particle_count} sand particles, "
+              f"voxel {config.voxel_size} m, {self.args.own_vehicle_proxy_iterations} "
+              f"fixed-point coupling iteration(s)")
+
+        if self.args.render_to:
+            self._setup_offline_viewer()
+
+    def _own_vehicle_wheel_speed(self, t: float) -> float:
+        """⚠ RAMPED, NOT STEPPED. A step from 0 to 6 rad/s is an impulse through the contact law;
+        the ramp costs half a second and makes the approach to the bed comparable between runs."""
+        settle = float(self.args.own_vehicle_settle)
+        if t < settle:
+            return 0.0
+        return float(self.args.own_vehicle_rad_s) * min(1.0, (t - settle) / 0.5)
+
+    def _own_vehicle_sand_force(self, frame_dt: float):
+        """Total sand reaction on the vehicle, in newtons.
+
+        ⚠ THE SAME REDUCTION publish_impulses does, so the number is directly comparable with the
+        live bridge's. `collect_collider_impulses` returns `-cell_volume * impulse_field` per
+        contacting GRID NODE — already the reaction ON the collider, so it is summed, not negated —
+        and dividing by the frame step turns N.s into N.
+        """
+        import numpy as np
+
+        try:
+            imp, _pos, cid = self.mpm.collect_collider_impulses(self.state_0)
+            body_of = self.mpm.collider_body_index.numpy()
+        except Exception as error:
+            print(f"  ⚠ could not collect collider impulses: {error}")
+            return float("nan"), 0
+        j = imp.numpy()
+        c = cid.numpy()
+        valid = (c >= 0) & (c < body_of.shape[0])
+        if not np.any(valid):
+            return 0.0, 0
+        j = j[valid]
+        # ⚠ THE GROUND PLANE IS A COLLIDER TOO, and summing every collider measures it instead of
+        # the vehicle. A buried probe run once reported a rock-steady -6442 N, which is the weight
+        # of the bed itself — the ground holding the SAND up, not the sand pushing the ROVER down.
+        mine = np.isin(body_of[c[valid]], np.asarray(self.vehicle.bodies))
+        if not np.any(mine):
+            return 0.0, 0
+        j = j[mine]
+        return float(np.sum(j[:, 2]) / frame_dt), int(j.shape[0])
+
+    def _own_vehicle_sample(self, t: float, frame_dt: float) -> dict:
+        """⚠ METRICS ARE COMPUTED ON A DECIMATED COPY, and must be. Measured on the 1.37 M-particle
+        mound, pulling every particle to the host and evaluating an N x wheels x 3 distance
+        temporary made the instrumentation several times more expensive than the solver it was
+        measuring — the GPU sat at 10 % while the run crawled. Every metric here is a RATIO or a
+        PERCENTILE, and both are invariant under uniform decimation, so a fixed stride costs
+        nothing in fidelity."""
+        import numpy as np
+
+        q = self.state_0.body_q.numpy()[self.vehicle.body_start]
+        p_all = self.state_0.particle_q.numpy()
+        stride = max(1, len(p_all) // max(1000, int(self.args.own_vehicle_metric_particles)))
+        p = p_all[::stride]
+
+        wq = self.state_0.body_q.numpy()[self.vehicle.wheel_bodies][:, :3]
+        R = float(self.vehicle.spec.wheel_radius)
+        # ⚠ IS THE WHEEL A BOUNDARY AT ALL? Density of sand inside the wheel radius against an
+        # equal-volume shell just outside it. A solid collider excludes sand and reads ~0; a
+        # collider the grid cannot resolve reads ~1 and the sand flows straight through it.
+        dd = np.min(np.linalg.norm(p[:, None, :] - wq[None, :, :], axis=2), axis=1)
+        n_in = int((dd < R).sum())
+        n_sh = int(((dd >= R) & (dd < R * 2 ** (1 / 3))).sum())
+
+        fz, nodes = self._own_vehicle_sand_force(frame_dt)
+        return dict(
+            t=round(t, 4), x=float(q[0]), y=float(q[1]), z=float(q[2]),
+            sand_fz=fz, contact_nodes=nodes,
+            penetration=(n_in / n_sh) if n_sh else float("nan"),
+            n_inside=n_in, n_shell=n_sh,
+            # ⚠ A MAX IS ONE PARTICLE, AND IT LIED. `sand_max` once reported the authored depth for
+            # a whole run — reading as "the bed never slumped" — while the render showed it
+            # collapsing within a second. One ejected grain held the maximum the entire time.
+            sand_p999=float(np.percentile(p[:, 2], 99.9)),
+            sand_max=float(p[:, 2].max()), sand_min=float(p[:, 2].min()))
+
+    def run_own_vehicle(self) -> int:
+        """Standalone: no shared memory, no simulator, no wire. D15 step 1.
+
+        ⚠ DELIBERATELY NOT ATTACHED. The claim this run has to establish is that a sidecar-owned
+        vehicle reproduces Newton's coupled-solver support inside THIS process with THIS sand
+        configuration. Putting a wire in the experiment would make a null result ambiguous again,
+        which is precisely the ambiguity D15 exists to remove. Joint commands and link poses go on
+        the wire in step 2, once there is a number here to compare against.
+        """
+        import csv
+
+        import warp as wp
+
+        if not wp.get_device().is_cuda:
+            print("--own-vehicle needs a GPU", file=sys.stderr)
+            return 1
+
+        self.build_own_vehicle()
+
+        frame_dt = 1.0 / float(self.args.fps)
+        steps = int(self.args.own_vehicle_seconds * self.args.fps)
+        every = max(1, int(self.args.fps / max(1.0, float(self.args.own_vehicle_sample_hz))))
+        rows = []
+        started = time.time()
+
+        try:
+            for i in range(steps):
+                t = i * frame_dt
+                self.vehicle.drive(self.control, self._own_vehicle_wheel_speed(t))
+                self.state_0.clear_forces()
+                self.pipeline.collide(self.state_0, self.contacts)
+                self.solver.step(self.state_0, self.state_0, self.control, self.contacts, frame_dt)
+                self.sidecar_step += 1
+                self.sidecar_time += frame_dt
+
+                if i % every == 0:
+                    rows.append(self._own_vehicle_sample(t, frame_dt))
+                if self.viewer is not None and i % max(1, self.args.render_every) == 0:
+                    self._render_frame(self.state_0, t)
+                if self.sidecar_step % 60 == 0:
+                    self._check_sand_is_supported()
+                # ⚠ LIVE, AND FLUSHED. Python buffers stdout when it is piped, so a long run wrote
+                # ONE line to its log and looked hung from outside.
+                if i % (10 * every) == 0 and rows:
+                    el = time.time() - started
+                    print(f"  t={t:5.2f}s  x={rows[-1]['x']:+.3f}  z={rows[-1]['z']:.3f}  "
+                          f"Fz={rows[-1]['sand_fz']:8.1f} N  [{i}/{steps} steps, {el:.0f}s "
+                          f"elapsed, {(steps - i) * el / max(i, 1):.0f}s left]", flush=True)
+        finally:
+            # ⚠ ENCODE AND WRITE WHATEVER WE GOT. A run killed at minute nine still has nine
+            # minutes of evidence, and losing it to a traceback means paying for the run again.
+            if rows:
+                path = os.path.abspath(self.args.own_vehicle_csv)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                    w.writeheader()
+                    w.writerows(rows)
+                print(f"\n{len(rows)} samples -> {path}")
+
+        self._summarise_own_vehicle(rows)
+        return 0
+
+    def _summarise_own_vehicle(self, rows) -> None:
+        if not rows:
+            print("no samples")
+            return
+
+        # ⚠ CLAMPED. A settle longer than the run left this empty once and the summary died on a
+        # divide-by-zero AFTER the expensive part had already finished.
+        ref = min(float(self.args.own_vehicle_settle), rows[-1]["t"])
+        settled = [r for r in rows if ref - 0.4 <= r["t"] <= ref] or rows[:1]
+        final = rows[-8:]
+        z0 = sum(r["z"] for r in settled) / len(settled)
+        zf = sum(r["z"] for r in final) / len(final)
+        print(f"\n  before driving : x {settled[-1]['x']:+.3f}  z {z0:.3f}")
+        print(f"  at the end     : x {final[-1]['x']:+.3f}  z {zf:.3f}")
+        print(f"  travelled      : {final[-1]['x'] - settled[-1]['x']:+.3f} m in x")
+        print(f"  height change  : {zf - z0:+.3f} m")
+
+        fz = sorted(r["sand_fz"] for r in rows if r["sand_fz"] == r["sand_fz"])
+        if fz:
+            W = self.vehicle.mass * 9.81
+            med = fz[len(fz) // 2]
+            print(f"  sand Fz on the vehicle: median {med:.1f} N  min {fz[0]:.1f} N  "
+                  f"max {fz[-1]:.1f} N")
+            # ⚠ THE HEADLINE NUMBER OF D15. The kinematic-collider bridge measured 0.015x the
+            # vehicle's weight on this bed; Newton's coupled solver measured 0.99x. A ratio near 1
+            # while the vehicle is standing on sand means the sand is holding it up.
+            print(f"  vehicle weight {W:.1f} N -> median sand support is {med / W:.3f}x weight "
+                  f"(kinematic-collider bridge measured 0.015x on the same bed)")
+        pens = sorted(r["penetration"] for r in rows if r["penetration"] == r["penetration"])
+        if pens:
+            print(f"  wheel PENETRATION: median {pens[len(pens)//2]:.3f}  min {pens[0]:.3f}  "
+                  f"max {pens[-1]:.3f}   (0 = solid boundary, ~1 = sand flows through)")
+        print(f"  lowest particle: {min(r['sand_min'] for r in rows):+.4f} m "
+              f"(below the ground plane at {self.ground_z:.3f} means sand fell through it)")
 
     def _check_sand_is_supported(self) -> None:
         """Warn if the sand has fallen below the ground it is supposed to rest on.
@@ -1228,6 +1581,8 @@ class Sidecar:
         for segment in (self.registry_seg, self.state_seg, self.status_seg, self.particle_seg):
             if segment is not None:
                 segment.close()
+        if self.vehicle is not None:
+            self.vehicle.close()
 
 
 def main() -> int:
@@ -1242,7 +1597,14 @@ def main() -> int:
     parser.add_argument("--patch-y", type=float, default=0.0)
     parser.add_argument("--patch-z", type=float, default=0.0)
     parser.add_argument("--patch-size", type=float, default=1.0,
-                        help="half-extent of the sand patch in x and y, metres")
+                        help="half-extent of the sand patch in x, metres (and in y unless "
+                             "--patch-size-y is given)")
+    # ⚠ THE WIRE HAS ALWAYS CARRIED INDEPENDENT HALF-EXTENTS and the CLI fallback could only
+    # express a square. That made it impossible to reproduce the reference bed — the 2.0 x 1.6 m
+    # mound every probe result is measured on — from the command line, which is exactly what a
+    # standalone run needs to do to be comparable.
+    parser.add_argument("--patch-size-y", type=float, default=None,
+                        help="half-extent in y, metres. Defaults to --patch-size.")
     parser.add_argument("--patch-depth", type=float, default=0.2, help="sand depth, metres")
     parser.add_argument("--ground-z", type=float, default=None,
                         help="ground plane height. Defaults to the BOTTOM of the sand patch "
@@ -1327,6 +1689,84 @@ def main() -> int:
     parser.add_argument("--render-every", type=int, default=4,
                         help="capture one frame every N solves. Rasterising is CPU-bound here, so "
                              "capturing every solve makes the sidecar the slow part of the link.")
+    parser.add_argument("--render-particle-stride", type=int, default=1,
+                        help="draw every Nth sand particle. 1 draws them all, which is fine for an "
+                             "85k bed and roughly 5x slower than the solve on a 1.4M one. Radius "
+                             "is grown by the cube root of the stride so the bed still reads solid.")
+
+    # ---- D15 step 1: the sidecar owns the vehicle ----------------------------------------
+    #
+    # ⚠ THESE PUT THE ROBOT IN THIS PROCESS, which is the only way the sand solve can be told what
+    # the robot weighs. A wire collider is kinematic by construction (mass 0 = infinite), so it
+    # feels only the reaction to its own MOTION: 8 N under a 52 kg Scout where Newton's coupled
+    # solver measured 507 N on the identical bed. See build_own_vehicle().
+    own = parser.add_argument_group(
+        "own vehicle (D15 step 1)",
+        "Build a URDF robot inside the sidecar and couple it to the sand with "
+        "SolverCoupledProxy. Standalone: no shared memory, no simulator, no wire.")
+    own.add_argument("--own-vehicle", default=None, metavar="SPEC",
+                     help="vehicle spec: a name under mpm_sidecar/vehicles/ ('scout', 'exomy') or "
+                          "a path to a .json. Setting this switches the whole process into "
+                          "standalone own-vehicle mode.")
+    own.add_argument("--own-vehicle-x", type=float, default=-1.2)
+    own.add_argument("--own-vehicle-y", type=float, default=0.0)
+    own.add_argument("--own-vehicle-z", type=float, default=None,
+                     help="spawn height of the base link; defaults to the spec's start_z. ⚠ A "
+                          "Scout dropped from an ExoMy's 0.12 m spawns with its 0.33 m wheels "
+                          "already through the floor.")
+    own.add_argument("--own-vehicle-yaw", type=float, default=0.0, metavar="DEG")
+    own.add_argument("--own-vehicle-sand-links", choices=["all", "wheels"], default=None,
+                     help="which links touch sand; overrides the spec's sand_links. 'all' lets the "
+                          "chassis belly out on a mound, which is a real rover failure mode and "
+                          "costs two collision primitives, not the visual meshes. 'wheels' mirrors "
+                          "UrdfLinkPhysics/InteractWithMPM in the live settings and is what the "
+                          "507 N reference run used — use it when comparing against that number.")
+    own.add_argument("--own-vehicle-seconds", type=float, default=30.0)
+    own.add_argument("--own-vehicle-settle", type=float, default=4.0,
+                     help="seconds of no drive at the start, to let the authored slab slump to its "
+                          "angle of repose before anything drives into it")
+    own.add_argument("--own-vehicle-rad-s", type=float, default=6.0,
+                     help="wheel velocity target, rad/s, ramped over 0.5 s")
+    # ⚠ ON THE COMMAND LINE BECAUSE IT DECIDES THE RUN, not because it is a tuning knob. The spec's
+    # value is the probe's argparse default of 1 N.m, chosen for a 1.68 kg ExoMy and inherited by a
+    # 52 kg Scout, where it is the binding constraint: at 3 rad/s the vehicle never reaches its
+    # commanded 0.495 m/s and stalls at the toe of the mound without rising.
+    own.add_argument("--own-vehicle-wheel-torque", type=float, default=None, metavar="NM",
+                     help="per-wheel effort ceiling, N.m; overrides the spec's wheel_max_torque")
+    # ⚠ THIS IS THE THRUST LIMITER, NOT THE CEILING ABOVE IT, and mistaking the two cost a whole
+    # sweep. A velocity target applies kd * (target - qd), so a STALLED wheel can only ever produce
+    # kd * target: at the spec's kd 0.3 and 3 rad/s that is 0.9 N.m, which is already below the
+    # 1 N.m ceiling. Raising the ceiling to 2 and then 4 N.m moved the stall position by less than
+    # a millimetre, because the ceiling was never what bound. The runs that actually climb this
+    # mound use kd 8.0 with a 40 N.m ceiling.
+    # ⚠ THE CLIMB LIMIT, and the one parameter that decides whether this vehicle gets up the mound
+    # at all. A heap rests at atan(mu_sand); a vehicle climbs at most atan(mu_wheel). Measured on
+    # this Scout and this bed with everything else identical: mu 0.5 slips, digs in and BURIES the
+    # wheels (penetration 0.97, stuck at x=+1.14); mu 1.2 shears the soil, crests and drives off.
+    own.add_argument("--own-vehicle-wheel-friction", type=float, default=None, metavar="MU",
+                     help="wheel-on-sand friction; overrides the spec's wheel_friction")
+    own.add_argument("--own-vehicle-wheel-kd", type=float, default=None, metavar="KD",
+                     help="velocity-target gain per wheel; overrides the spec's wheel_kd. Torque "
+                          "at a stalled wheel is kd * target_rad_s, so THIS sets available thrust "
+                          "and --own-vehicle-wheel-torque only caps it.")
+    own.add_argument("--own-vehicle-substeps", type=int, default=4,
+                     help="rigid-solver substeps per MPM frame")
+    own.add_argument("--own-vehicle-proxy-iterations", type=int, default=2,
+                     help="fixed-point iterations between the rigid and MPM solvers per frame")
+    own.add_argument("--own-vehicle-mass-scale", type=float, default=1.0,
+                     help="scale on the effective mass MPM sees through the proxy. 1.0 is the "
+                          "articulated effective inertia the rigid solver computed; a very large "
+                          "value reproduces the kinematic-collider bridge's infinite inertia, "
+                          "which is how the 8 N vs 507 N gap gets measured rather than asserted.")
+    own.add_argument("--own-vehicle-sample-hz", type=float, default=10.0)
+    own.add_argument("--own-vehicle-metric-particles", type=int, default=60000,
+                     help="particles sampled for the metrics; ratios and percentiles are "
+                          "stride-invariant, so this costs no fidelity")
+    own.add_argument("--own-vehicle-csv", default=None, metavar="PATH",
+                     help="where the per-sample metrics go. Defaults to "
+                          "<repo>/PhysicsEngineDiscussion/newton_probes/results/"
+                          "sidecar_own_<vehicle>.csv, next to the probe results it has to be "
+                          "compared against.")
     args = parser.parse_args()
 
     # ⚠ RESOLVED ONCE, HERE, so every later read sees a concrete choice rather than "auto".
@@ -1334,7 +1774,11 @@ def main() -> int:
     # solved against infinite inertia and the resulting impulse is applied to a light wheel. It is
     # still reachable with an explicit --collider-mass kinematic, because reproducing the old
     # behaviour is how the fix gets measured.
-    if args.collider_mass == "auto":
+    # ⚠ NOT IN OWN-VEHICLE MODE. There are no wire colliders there, and printing a resolution for
+    # a switch that governs nothing would suggest the run is still on the kinematic path.
+    if args.collider_mass == "auto" and args.own_vehicle:
+        args.collider_mass = "kinematic"
+    elif args.collider_mass == "auto":
         # ⚠ ALWAYS 'kinematic', INCLUDING WITH --two-way. This briefly resolved to 'real' when
         # two-way was on, on the theory that infinite collider mass was what produced 1443 N
         # reactions. It does cut the force — to ~24 N — but it buys that by making the wheel SOFT
@@ -1352,8 +1796,24 @@ def main() -> int:
         args.collider_mass = "kinematic"
         print("--collider-mass auto -> 'kinematic' (hard boundary; see the note in main())")
 
+    if args.own_vehicle:
+        if args.own_vehicle_csv is None:
+            import own_vehicle as _ov
+            name = os.path.splitext(os.path.basename(args.own_vehicle))[0]
+            args.own_vehicle_csv = os.path.join(
+                _ov.REPO, "PhysicsEngineDiscussion", "newton_probes", "results",
+                f"sidecar_own_{name}.csv")
+        # ⚠ SAID OUT LOUD, because every other invocation of this file talks to a simulator and
+        # this one does not. A run that quietly ignored a --dir would look like a link that had
+        # attached and gone idle.
+        print("OWN-VEHICLE MODE (D15 step 1): the robot is built in THIS process and coupled to "
+              "the sand by SolverCoupledProxy. Shared memory is not attached and no simulator is "
+              "involved.")
+
     sidecar = Sidecar(args)
     try:
+        if args.own_vehicle:
+            return sidecar.run_own_vehicle()
         return sidecar.run_replay() if args.replay_poses else sidecar.run()
     except P.SegmentError as error:
         print(f"LINK ERROR: {error}", file=sys.stderr)

@@ -1,0 +1,17 @@
+{
+  "urdf": "urdf_physics/models/scout/scout_v2_sim.urdf",
+  "packages": {
+    "package://scout_description/": "PhysicsEngineDiscussion/scout_ros2/scout_description/"
+  },
+  "drive": ["front_right_wheel", "front_left_wheel", "rear_left_wheel", "rear_right_wheel"],
+  "drive_sign": [1.0, -1.0, -1.0, 1.0],
+  "wheel_marker": "wheel",
+  "start_z": 0.30,
+  "rest_z": 0.165,
+  "wheel_radius": 0.165,
+  "wheel_friction": 1.2,
+  "wheel_kd": 0.3,
+  "wheel_max_torque": 1.0,
+  "body_friction": 0.5,
+  "mass_scale": 1.0
+}

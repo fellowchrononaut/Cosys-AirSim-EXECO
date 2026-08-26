@@ -1,0 +1,18 @@
+{
+  "urdf": "PhysicsEngineDiscussion/ExoMy_Model/exomy_sim/models/exomy_model/exomy_model.urdf",
+  "packages": {
+    "package://exomy_sim/": "PhysicsEngineDiscussion/ExoMy_Model/exomy_sim/"
+  },
+  "drive": ["DRV_LF_joint", "DRV_RF_joint", "DRV_LM_joint",
+            "DRV_RM_joint", "DRV_LR_joint", "DRV_RR_joint"],
+  "drive_sign": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  "wheel_marker": "DRV_",
+  "start_z": 0.12,
+  "rest_z": 0.101,
+  "wheel_radius": 0.045,
+  "wheel_friction": 1.2,
+  "wheel_kd": 0.3,
+  "wheel_max_torque": 1.0,
+  "body_friction": 0.5,
+  "mass_scale": 1.0
+}
