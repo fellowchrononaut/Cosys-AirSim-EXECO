@@ -1,0 +1,526 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+# Configuration file for the Sphinx documentation builder.
+#
+# For the full list of built-in configuration values, see the documentation:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html
+
+import datetime
+import importlib
+import inspect
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+import docutils.nodes
+
+# Set environment variable to indicate we're in a Sphinx build.
+# This is inherited by subprocesses (e.g., Jupyter kernels run by nbsphinx).
+os.environ["NEWTON_SPHINX_BUILD"] = "1"
+
+# Determine the Git version/tag from CI environment variables.
+# 1. Check for GitHub Actions' variable.
+# 2. Check for GitLab CI's variable.
+# 3. Fallback to 'main' for local builds.
+github_version = os.environ.get("GITHUB_REF_NAME") or os.environ.get("CI_COMMIT_REF_NAME") or "main"
+
+# -- Project information -----------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
+
+project = "Newton Physics"
+copyright = f"{datetime.date.today().year}, The Newton Developers. Documentation licensed under CC-BY-4.0"
+author = "The Newton Developers"
+
+# Read version from pyproject.toml
+# TODO: When minimum Python version is >=3.11, replace with:
+#   import tomllib
+#   with open(project_root / "pyproject.toml", "rb") as f:
+#       project_version = tomllib.load(f)["project"]["version"]
+project_root = Path(__file__).parent.parent
+try:
+    with open(project_root / "pyproject.toml", encoding="utf-8") as f:
+        content = f.read()
+    project_section = re.search(r"^\[project\]\s*\n(.*?)(?=^\[|\Z)", content, re.MULTILINE | re.DOTALL)
+    if not project_section:
+        raise ValueError("Could not find [project] section in pyproject.toml")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', project_section.group(1), re.MULTILINE)
+    if not match:
+        raise ValueError("Could not find version in [project] section of pyproject.toml")
+    project_version = match.group(1)
+except Exception as e:
+    print(f"Error reading version from pyproject.toml: {e}", file=sys.stderr)
+    sys.exit(1)
+
+release = project_version
+
+# -- Nitpicky mode -----------------------------------------------------------
+# Set nitpicky = True to warn about all broken cross-references (e.g. missing
+# intersphinx targets, typos in :class:/:func:/:attr: roles, etc.).  Useful for
+# auditing docs but noisy during regular development.
+nitpicky = False
+
+# -- General configuration ---------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
+
+# Add docs/ and docs/_ext to Python import path so custom extensions and
+# sibling scripts (e.g. generate_api) can be imported.
+_docs_path = str(Path(__file__).parent)
+if _docs_path not in sys.path:
+    sys.path.append(_docs_path)
+_ext_path = Path(__file__).parent / "_ext"
+if str(_ext_path) not in sys.path:
+    sys.path.append(str(_ext_path))
+
+extensions = [
+    "myst_parser",  # Parse markdown files
+    "nbsphinx",  # Process Jupyter notebooks
+    "sphinx.ext.autodoc",
+    "sphinx.ext.napoleon",  # Convert docstrings to reStructuredText
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.extlinks",  # Markup to shorten external links
+    "sphinx.ext.githubpages",
+    "sphinx.ext.doctest",  # Test code snippets in docs
+    "sphinx.ext.mathjax",  # Math rendering support
+    "sphinx.ext.linkcode",  # Add GitHub source links to documentation
+    "sphinxcontrib.mermaid",
+    "sphinx_copybutton",
+    "sphinx_design",
+    "sphinx_tabs.tabs",
+    "autodoc_filter",
+    "autodoc_wpfunc",
+    "experimental",
+]
+
+# -- nbsphinx configuration ---------------------------------------------------
+
+# Configure notebook execution mode for nbsphinx
+nbsphinx_execute = "auto"
+
+# Timeout for notebook execution (in seconds)
+nbsphinx_timeout = 600
+
+# Allow errors in notebook execution (useful for development)
+nbsphinx_allow_errors = False
+
+nbsphinx_prolog = r"""
+{% if env.docname.startswith("tutorials/") %}
+{% set notebook_name = env.docname.split("/")[-1] + ".ipynb" %}
+{% set notebook_path = "docs/" + env.docname + ".ipynb" %}
+{% set github_url = "https://github.com/newton-physics/newton/blob/" + env.config.github_version + "/" + notebook_path %}
+{% set colab_url = "https://colab.research.google.com/github/newton-physics/newton/blob/" + env.config.github_version + "/" + notebook_path %}
+
+.. raw:: html
+
+   <div class="notebook-link-bar">
+      <a href="{{ notebook_name }}">Download notebook</a>
+      <a href="{{ github_url }}">View on GitHub</a>
+      <a href="{{ colab_url }}">Open in Colab</a>
+   </div>
+{% endif %}
+"""
+
+
+templates_path = ["_templates"]
+exclude_patterns = [
+    "_build",
+    "Thumbs.db",
+    ".DS_Store",
+    "superpowers",
+    "sphinx-env/**",
+    "sphinx-env",
+    "**/site-packages/**",
+    "**/lib/**",
+    # Included from index.rst via ``.. include::`` — not a standalone document.
+    "api/_toctree.rst",
+]
+
+
+def _ensure_pandoc_on_path() -> str | None:
+    """Return a usable pandoc executable path, preferring the bundled docs dependency."""
+
+    # Try the bundled pypandoc_binary first so local docs builds work out of
+    # the box even when a stale or incompatible system pandoc is on PATH.
+    try:
+        import pypandoc  # noqa: PLC0415
+
+        bundled_path = Path(pypandoc.get_pandoc_path())
+        search_dir = bundled_path.parent
+        if search_dir.is_dir():
+            resolved_path = shutil.which("pandoc", path=str(search_dir))
+            if resolved_path is not None:
+                existing_path = os.environ.get("PATH", "")
+                os.environ["PATH"] = str(Path(resolved_path).parent) + os.pathsep + existing_path
+                os.environ.setdefault("PYPANDOC_PANDOC", resolved_path)
+                return resolved_path
+    except (ImportError, OSError):
+        pass
+
+    # Fall back to whatever pandoc is already on PATH.
+    return shutil.which("pandoc")
+
+
+# nbsphinx requires pandoc to convert Jupyter notebooks.  When pandoc is not
+# installed we exclude the notebook tutorials so the rest of the docs can still
+# be built locally without a hard error.  CI workflows install pandoc explicitly
+# so published docs always include the tutorials.  Prefer the bundled
+# ``pypandoc_binary`` executable when available so local docs builds work out of
+# the box in the docs environment.
+#
+# Set NEWTON_REQUIRE_PANDOC=1 to turn the missing-pandoc warning into an error
+# (used in CI to guarantee tutorials are never silently skipped).
+pandoc_path = _ensure_pandoc_on_path()
+if pandoc_path is None:
+    if os.environ.get("NEWTON_REQUIRE_PANDOC", "") == "1":
+        raise RuntimeError(
+            "pandoc is required but not found. Install pandoc "
+            "(https://pandoc.org/installing.html) or unset NEWTON_REQUIRE_PANDOC."
+        )
+    exclude_patterns.append("tutorials/**")
+    print(
+        "WARNING: pandoc not found - Jupyter notebook tutorials will be "
+        "skipped.  Install pandoc (https://pandoc.org/installing.html) to "
+        "build the complete documentation."
+    )
+
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+    "numpy": ("https://numpy.org/doc/stable", None),
+    "jax": ("https://docs.jax.dev/en/latest", None),
+    "pytorch": ("https://pytorch.org/docs/stable", None),
+    "warp": ("https://nvidia.github.io/warp/stable", None),
+    "usd": ("https://docs.omniverse.nvidia.com/kit/docs/pxr-usd-api/latest", None),
+}
+
+# Map short USD type names (from ``from pxr import Usd``) to their fully-qualified
+# ``pxr.*`` paths so intersphinx can resolve them against the USD inventory.
+# Note: this only affects annotations processed by autodoc, not autosummary stubs.
+autodoc_type_aliases = {
+    "Usd.Prim": "pxr.Usd.Prim",
+    "Usd.Stage": "pxr.Usd.Stage",
+    "UsdGeom.XformCache": "pxr.UsdGeom.XformCache",
+    "UsdGeom.Mesh": "pxr.UsdGeom.Mesh",
+    "UsdShade.Material": "pxr.UsdShade.Material",
+    "UsdShade.Shader": "pxr.UsdShade.Shader",
+    "State": "newton.State",
+}
+
+
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "markdown",
+}
+
+extlinks = {
+    "github": (f"https://github.com/newton-physics/newton/blob/{github_version}/%s", "%s"),
+}
+
+rst_epilog = f"""
+.. |intro-colab| image:: https://colab.research.google.com/assets/colab-badge.svg
+   :target: https://colab.research.google.com/github/newton-physics/newton/blob/{github_version}/docs/tutorials/00_introduction.ipynb
+   :alt: Open in Colab
+
+.. |robotics-colab| image:: https://colab.research.google.com/assets/colab-badge.svg
+   :target: https://colab.research.google.com/github/newton-physics/newton/blob/{github_version}/docs/tutorials/01_robotics.ipynb
+   :alt: Open in Colab
+"""
+
+doctest_global_setup = """
+import warnings
+from typing import Any
+import numpy as np
+import warp as wp
+import newton
+
+warnings.filterwarnings("ignore")
+
+wp.config.log_level = wp.LOG_WARNING
+wp.init()
+"""
+
+# -- Autodoc configuration ---------------------------------------------------
+
+# put type hints inside the description instead of the signature (easier to read)
+autodoc_typehints = "description"
+# default argument values of functions will be not evaluated on generating document
+autodoc_preserve_defaults = True
+
+autodoc_typehints_description_target = "documented"
+
+toc_object_entries_show_parents = "hide"
+
+autodoc_default_options = {
+    "members": True,
+    "member-order": "groupwise",
+    "special-members": "__init__",
+    "undoc-members": False,
+    "exclude-members": "__weakref__, State",
+    "imported-members": True,
+    "autosummary": True,
+}
+
+# fixes errors with Enum docstrings
+autodoc_inherit_docstrings = False
+
+# Mock imports for modules that are not installed by default
+autodoc_mock_imports = ["jax", "torch", "paddle"]
+
+autosummary_generate = True
+autosummary_ignore_module_all = False
+autosummary_imported_members = True
+
+# -- Options for HTML output -------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
+
+html_title = "Newton Physics"
+html_theme = "pydata_sphinx_theme"
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
+html_js_files = [*globals().get("html_js_files", []), "mermaid-nbsphinx.js"]
+html_show_sourcelink = False
+
+# PyData theme configuration
+html_theme_options = {
+    # Remove navigation from the top navbar
+    # "navbar_start": ["navbar-logo"],
+    # "navbar_center": [],
+    # "navbar_end": ["search-button"],
+    # Navigation configuration
+    # "font_size": "14px",  # or smaller
+    "navigation_depth": 1,
+    "show_nav_level": 1,
+    "show_toc_level": 2,
+    "collapse_navigation": False,
+    # Show the indices in the sidebar
+    "show_prev_next": False,
+    "use_edit_page_button": False,
+    "logo": {
+        "image_light": "_static/newton-logo-light.png",
+        "image_dark": "_static/newton-logo-dark.png",
+        "text": f"Newton Physics <span style='font-size: 0.8em; color: #888;'>({release})</span>",
+        "alt_text": "Newton Physics Logo",
+    },
+    # Keep the right-hand page TOC on by default, but remove it on the
+    # solver overview where several wide comparison tables benefit from the
+    # extra content width.
+    "secondary_sidebar_items": {
+        "**": ["page-toc", "edit-this-page", "sourcelink"],
+        "solvers/index": [],
+    },
+    # "primary_sidebar_end": ["indices.html", "sidebar-ethical-ads.html"],
+}
+
+
+html_sidebars = {"**": ["sidebar-nav-bs.html"], "index": ["sidebar-nav-bs.html"]}
+
+# Version switcher configuration for multi-version docs on GitHub Pages
+# See: https://pydata-sphinx-theme.readthedocs.io/en/stable/user_guide/version-dropdown.html
+
+# Determine if we're in a CI build and which version
+_is_ci = os.environ.get("GITHUB_ACTIONS") == "true"
+_is_release = os.environ.get("GITHUB_REF", "").startswith("refs/tags/v")
+
+# Configure version switcher
+html_theme_options["switcher"] = {
+    "json_url": "https://newton-physics.github.io/newton/switcher.json",
+    "version_match": release if _is_release else "dev",
+}
+
+# Add version switcher to navbar
+html_theme_options["navbar_end"] = ["theme-switcher", "version-switcher", "navbar-icon-links"]
+
+# Footer configuration — show copyright (includes CC-BY-4.0 notice)
+html_theme_options["footer_start"] = ["copyright"]
+html_theme_options["footer_end"] = ["theme-version"]
+
+# Disable switcher JSON validation during local builds (file not accessible locally)
+if not _is_ci:
+    html_theme_options["check_switcher"] = False
+
+# -- Math configuration -------------------------------------------------------
+
+# MathJax configuration for proper LaTeX rendering
+mathjax3_config = {
+    "tex": {
+        "packages": {"[+]": ["amsmath", "amssymb", "amsfonts"]},
+        "inlineMath": [["$", "$"], ["\\(", "\\)"]],
+        "displayMath": [["$$", "$$"], ["\\[", "\\]"]],
+        "processEscapes": True,
+        "processEnvironments": True,
+        "tags": "ams",
+        "macros": {
+            "RR": "{\\mathbb{R}}",
+            "bold": ["{\\mathbf{#1}}", 1],
+            "vec": ["{\\mathbf{#1}}", 1],
+        },
+    },
+    "options": {
+        "processHtmlClass": ("tex2jax_process|mathjax_process|math|output_area"),
+        "ignoreHtmlClass": "annotation",
+    },
+}
+
+# -- Linkcode configuration --------------------------------------------------
+# create back links to the Github Python source file
+# called automatically by sphinx.ext.linkcode
+
+
+def linkcode_resolve(domain: str, info: dict[str, str]) -> str | None:
+    """
+    Determine the URL corresponding to Python object using introspection
+    """
+
+    if domain != "py":
+        return None
+    if not info["module"]:
+        return None
+
+    module_name = info["module"]
+
+    # Only handle newton modules
+    if not module_name.startswith("newton"):
+        return None
+
+    try:
+        # Import the module and get the object
+        module = importlib.import_module(module_name)
+
+        if "fullname" in info:
+            # Get the specific object (function, class, etc.)
+            obj_name = info["fullname"]
+            if hasattr(module, obj_name):
+                obj = getattr(module, obj_name)
+            else:
+                return None
+        else:
+            # No specific object, link to the module itself
+            obj = module
+
+        # Get the file where the object is actually defined
+        source_file = None
+        line_number = None
+
+        try:
+            source_file = inspect.getfile(obj)
+            # Get line number if possible
+            try:
+                _, line_number = inspect.getsourcelines(obj)
+            except (TypeError, OSError):
+                pass
+        except (TypeError, OSError):
+            # Check if it's a Warp function with wrapped original function
+            if hasattr(obj, "func") and callable(obj.func):
+                try:
+                    original_func = obj.func
+                    source_file = inspect.getfile(original_func)
+                    try:
+                        _, line_number = inspect.getsourcelines(original_func)
+                    except (TypeError, OSError):
+                        pass
+                except (TypeError, OSError):
+                    pass
+
+            # If still no source file, fall back to the module file
+            if not source_file:
+                try:
+                    source_file = inspect.getfile(module)
+                except (TypeError, OSError):
+                    return None
+
+        if not source_file:
+            return None
+
+        # Convert absolute path to relative path from project root
+        project_root = os.path.dirname(os.path.dirname(__file__))
+        rel_path = os.path.relpath(source_file, project_root)
+
+        # Normalize path separators for URLs
+        rel_path = rel_path.replace("\\", "/")
+
+        # Add line fragment if we have a line number
+        line_fragment = f"#L{line_number}" if line_number else ""
+
+        # Construct GitHub URL
+        github_base = "https://github.com/newton-physics/newton"
+        return f"{github_base}/blob/{github_version}/{rel_path}{line_fragment}"
+
+    except (ImportError, AttributeError, TypeError):
+        return None
+
+
+def _copy_viser_client_into_output_static(*, outdir: Path) -> None:
+    """Ensure the Viser web client assets are available at `{outdir}/_static/viser/`.
+
+    This avoids relying on repo-relative `html_static_path` entries (which can break under `uv`),
+    avoids writing generated assets into `docs/_static` in the working tree, and
+    keeps the copied client aligned with the installed `viser` package.
+    """
+
+    dest_dir = outdir / "_static" / "viser"
+
+    try:
+        from newton.viewer import ViewerViser  # noqa: PLC0415
+
+        src_dir = ViewerViser.get_viser_client_dir()
+    except Exception as e:
+        # Don't hard-fail doc builds; the viewer docs can still build without the embedded client.
+        print(
+            f"Warning: could not find installed Viser client assets to copy: {e}",
+            file=sys.stderr,
+        )
+        return
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src_dir, dest_dir, dirs_exist_ok=True)
+
+
+def _on_builder_inited(_app: Any) -> None:
+    outdir = Path(_app.builder.outdir)
+    _copy_viser_client_into_output_static(outdir=outdir)
+
+
+_RE_REPR_ADDRESS = re.compile(r"<([\w.]+) object at 0x[0-9a-f]+>")
+
+
+def strip_repr_addresses(app: Any, doctree: Any, docname: str) -> None:
+    """Drop memory addresses from default-repr leaks in the resolved doctree.
+
+    When an attribute or default is documented without an explicit type
+    annotation, autodoc falls back to ``repr(obj)``.  For an object whose class
+    has no ``__repr__`` that yields ``<some.module.Class object at 0x7f...>``
+    (or ``<property object at 0x...>`` for a descriptor).  The address differs
+    every Python process (ASLR), which makes the rendered HTML byte-unstable
+    across builds -- every deploy to ``gh-pages`` then writes a different tree
+    even when the docs haven't changed (GH-2726).
+
+    ``sphinx.ext.autodoc.typehints`` injects these directly into the doctree via
+    the ``object-description-transform`` event, bypassing the
+    ``autodoc-process-signature`` / ``autodoc-process-docstring`` hooks (and not
+    covered by ``autodoc_preserve_defaults``), so the cleanup has to happen at
+    the doctree level.  Newton's public API does not currently surface such an
+    object; this runs as defense-in-depth so a future one can't silently
+    reintroduce per-build churn.
+    """
+    for text_node in list(doctree.findall(docutils.nodes.Text)):
+        original = text_node.astext()
+        if "object at 0x" not in original:
+            continue
+        cleaned = _RE_REPR_ADDRESS.sub(r"<\1 object>", original)
+        if cleaned != original:
+            text_node.parent.replace(text_node, docutils.nodes.Text(cleaned))
+
+
+def setup(app: Any) -> None:
+    app.add_config_value("github_version", github_version, "env")
+
+    # Regenerate API .rst files so builds always reflect the current public API.
+    from generate_api import generate_all  # noqa: PLC0415
+
+    generate_all()
+
+    app.connect("builder-inited", _on_builder_inited)
+    app.connect("doctree-resolved", strip_repr_addresses)

@@ -234,17 +234,42 @@ void describeMuJoCoColliders(const mjModel_* model, const mjData_* data,
         // how the view and the registry would start describing different shapes. It costs one pass
         // over `ngeom` per body, which is fine because this runs at scenario build, not per step.
         {
+            // ⚠ THIS BODY'S GEOMS ONLY, AND SKIPPED BEFORE THEY COST ANYTHING. This used to ask
+            // for `include_world = true` with a labeller that reported `world = false` for
+            // everything, so every geom in the model — including the mirrored level — was
+            // COLLECTED as "other" and then discarded by the `label != "self"` test below. That
+            // works until the model has more geoms than `filter.max_geoms` (4000), at which point
+            // the walk fills up on level geometry and never reaches the robot's own wheels.
+            //
+            // Legacy is exactly that case: `UrdfMirrorStaticWorld` emits one thin convex prism per
+            // level triangle, thousands of them, all earlier in the geom array than the links. The
+            // result on 2026-08-26 was six MuJoCo wheels described with shape_count = 0 — correct
+            // ids, correct mass, live poses, no geometry — while the debug overlay showed those
+            // same wheels perfectly, because the overlay clips by radius and never fills the cap.
+            // Coordinated mode hid it too: its shared ground is ONE height field, not thousands of
+            // prisms.
+            //
+            // Reporting anything that is not this body as `world` lets the include_world test skip
+            // it at the top of the loop, before it is built or counted.
             CollisionDebugFilter everything;
-            everything.include_world = true;
+            everything.include_world = false;
             everything.include_robots = true;
             CollisionDebugSnapshot geoms;
             readMuJoCoCollisionGeometry(model, data, everything,
                                         [b](int id, bool& world) {
-                                            world = false;
+                                            world = (id != b);
                                             return id == b ? std::string("self")
                                                            : std::string("other");
                                         },
                                         geoms);
+            // ⚠ If this ever trips, the cap is being hit by ONE body's own geometry, which is a
+            // different and much stranger problem than the one above.
+            if (geoms.omitted > 0) {
+                // Not silent: a truncated shape list is a collider that is partly invisible.
+                out.undescribed.push_back(
+                    collider.stable_id + " (geom walk omitted " + std::to_string(geoms.omitted) +
+                    " geoms; its collision description is incomplete)");
+            }
 
             mjtNum body_mat[9];
             mju_quat2Mat(body_mat, data->xquat + 4 * b);

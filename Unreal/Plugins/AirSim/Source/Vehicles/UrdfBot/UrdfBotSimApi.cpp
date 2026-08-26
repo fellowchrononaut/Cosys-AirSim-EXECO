@@ -2398,6 +2398,19 @@ void UrdfBotSimApi::resetImplementation()
     if (built_) settleAndPublish();
 }
 
+bool UrdfBotSimApi::applyLinkWrench(size_t link_index, const urdf::Wrench& wrench)
+{
+    // ⚠ SAME LOCK AS EVERY OTHER BACKEND TOUCH. resetImplementation() destroys and rebuilds every
+    // solver body; pushing a wrench at a link index while that happens writes through a dangling
+    // table. The MPM impulse path runs on the game thread and reset can come from an RPC thread, so
+    // this is a real race rather than a theoretical one.
+    std::lock_guard<std::mutex> lock(backend_mutex_);
+    if (backend_ == nullptr || !backend_state_available_)
+        return false;
+    backend_->applyExternalWrench(link_index, wrench);
+    return true;
+}
+
 bool UrdfBotSimApi::describeColliders(urdf::PhysicsColliderSet& out) const
 {
     // ⚠ Same lock as every other backend read. resetImplementation() destroys and rebuilds every

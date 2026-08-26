@@ -1,0 +1,299 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+import unittest
+import warnings
+from unittest.mock import Mock, patch
+
+# ruff: noqa: PLC0415
+
+
+class TestViewerRerunInitArgs(unittest.TestCase):
+    """Unit tests for ViewerRerun initialization parameters."""
+
+    def setUp(self):
+        """Create a fresh mock rerun object for each test."""
+        self.mock_rr = Mock()
+        self.mock_rr.init = Mock()
+        self.mock_rr.spawn = Mock()
+        self.mock_rr.connect_grpc = Mock()
+        self.mock_rr.serve_grpc = Mock(return_value="rerun+http://127.0.0.1:9876/proxy")
+        self.mock_rr.set_time = Mock()
+        self.mock_rr.save = Mock()
+        self.mock_print = self.enterContext(patch("builtins.print"))
+
+        # Mock blueprint module and components
+        self.mock_rrb = Mock()
+        self.mock_blueprint = Mock()
+        self.mock_rrb.Blueprint = Mock(return_value=self.mock_blueprint)
+        self.mock_rrb.Horizontal = Mock(return_value=Mock())
+        self.mock_rrb.Spatial3DView = Mock(return_value=Mock())
+        self.mock_rrb.TimePanel = Mock(return_value=Mock())
+        self.mock_rrb.TimeSeriesView = Mock(return_value=Mock())
+
+    def test_default_serves_web_viewer(self):
+        """Test that ViewerRerun() with no arguments servers a web viewer."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    # Suppress deprecation warnings for cleaner test output
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun()
+
+                    # Verify rr.init was called with app_id as positional arg and blueprint
+                    from unittest.mock import ANY
+
+                    self.mock_rr.init.assert_called_once_with("newton-viewer", recording_id=None, default_blueprint=ANY)
+
+                    # Verify rr.serve_grpc() was called
+                    self.mock_rr.serve_grpc.assert_called_once()
+                    # Verify rr.serve_web_viewer() was called
+                    self.mock_rr.serve_web_viewer.assert_called_once()
+                    self.mock_print.assert_called_once_with(
+                        "Rerun web viewer running at: "
+                        "http://127.0.0.1:9090/?url=rerun%2Bhttp%3A%2F%2F127.0.0.1%3A9876%2Fproxy",
+                        flush=True,
+                    )
+
+                    # Verify rr.connect_grpc() was NOT called
+                    self.mock_rr.connect_grpc.assert_not_called()
+                    # Verify rr.spawn() was NOT called
+                    self.mock_rr.spawn.assert_not_called()
+
+    def test_native_viewer(self):
+        """Test that ViewerRerun() with no arguments spawns a viewer."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    # Suppress deprecation warnings for cleaner test output
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun(serve_web_viewer=False)
+
+                    # Verify rr.init was called with app_id as positional arg and blueprint
+                    from unittest.mock import ANY
+
+                    self.mock_rr.init.assert_called_once_with("newton-viewer", recording_id=None, default_blueprint=ANY)
+
+                    # Verify rr.spawn() was called
+                    self.mock_rr.spawn.assert_called_once()
+
+                    # Verify rr.connect_grpc() was NOT called
+                    self.mock_rr.connect_grpc.assert_not_called()
+
+    def test_custom_address_connects_grpc(self):
+        """Test that ViewerRerun(address='...') connects via gRPC."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    test_address = "localhost:9876"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun(address=test_address)
+
+                    # Verify rr.init was called with app_id as positional arg and blueprint
+                    from unittest.mock import ANY
+
+                    self.mock_rr.init.assert_called_once_with("newton-viewer", recording_id=None, default_blueprint=ANY)
+
+                    # Verify rr.connect_grpc() was called with the address
+                    self.mock_rr.connect_grpc.assert_called_once_with(test_address)
+
+                    # Verify rr.spawn() was NOT called
+                    self.mock_rr.spawn.assert_not_called()
+
+    def test_custom_address_connects_grpc_in_jupyter(self):
+        """Test that ViewerRerun(address='...') connects via gRPC even in Jupyter notebooks."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=True):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    test_address = "localhost:9876"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun(address=test_address)
+
+                    # Verify viewer detected Jupyter environment
+                    self.assertTrue(viewer.is_jupyter_notebook)
+
+                    # Verify rr.connect_grpc() was called with the address even in Jupyter
+                    self.mock_rr.connect_grpc.assert_called_once_with(test_address)
+
+                    # Verify rr.spawn() was NOT called
+                    self.mock_rr.spawn.assert_not_called()
+
+    def test_custom_app_id_used(self):
+        """Test that custom app_id is passed to rr.init."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    custom_app_id = "my-simulation-123"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun(app_id=custom_app_id)
+
+                    # Verify rr.init was called with custom app_id as positional arg and blueprint
+                    from unittest.mock import ANY
+
+                    self.mock_rr.init.assert_called_once_with(custom_app_id, recording_id=None, default_blueprint=ANY)
+
+                    # Verify the viewer stored the app_id correctly
+                    self.assertEqual(viewer.app_id, custom_app_id)
+
+    def test_blueprint_passed_to_init(self):
+        """Test that blueprint is created and passed to rr.init()."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun()
+
+                    # Verify blueprint components were created
+                    self.mock_rrb.Blueprint.assert_called_once()
+                    self.mock_rrb.Spatial3DView.assert_called()
+                    self.mock_rrb.TimePanel.assert_called()
+
+                    # Verify blueprint was passed to rr.init
+                    call_args = self.mock_rr.init.call_args
+                    self.assertIn("default_blueprint", call_args[1])
+                    self.assertEqual(call_args[1]["default_blueprint"], self.mock_blueprint)
+
+    def test_record_to_rrd_calls_save(self):
+        """Test that providing record_to_rrd calls rr.save() with blueprint."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    test_path = "test_recording.rrd"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        _ = ViewerRerun(record_to_rrd=test_path)
+
+                    # Verify rr.save was called
+                    self.mock_rr.save.assert_called_once()
+                    call_args = self.mock_rr.save.call_args
+                    self.assertEqual(call_args[0][0], test_path)
+                    self.assertIn("default_blueprint", call_args[1])
+                    self.assertEqual(call_args[1]["default_blueprint"], self.mock_blueprint)
+
+    def test_jupyter_notebook_skips_spawn(self):
+        """Test that viewer is not spawned in Jupyter notebook environment."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=True):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun()
+
+                    # Verify viewer detected Jupyter environment
+                    self.assertTrue(viewer.is_jupyter_notebook)
+
+                    # Verify rr.spawn() was NOT called in Jupyter
+                    self.mock_rr.spawn.assert_not_called()
+
+                    # Verify rr.connect_grpc() was NOT called
+                    self.mock_rr.connect_grpc.assert_not_called()
+
+    def test_non_jupyter_serves_web_viewer(self):
+        """Test that viewer serves web viewer in non-Jupyter environment."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun()
+
+                    # Verify viewer detected non-Jupyter environment
+                    self.assertFalse(viewer.is_jupyter_notebook)
+
+                    # Verify rr.serve_grpc() WAS called in non-Jupyter
+                    self.mock_rr.serve_grpc.assert_called_once()
+                    # Verify rr.serve_web_viewer() WAS called in non-Jupyter
+                    self.mock_rr.serve_web_viewer.assert_called_once()
+
+    def test_keep_historical_data_stored(self):
+        """Test that keep_historical_data parameter is stored correctly."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer_true = ViewerRerun(keep_historical_data=True)
+                        viewer_false = ViewerRerun(keep_historical_data=False)
+
+                    # Verify parameters were stored correctly
+                    self.assertTrue(viewer_true.keep_historical_data)
+                    self.assertFalse(viewer_false.keep_historical_data)
+
+    def test_keep_scalar_history_stored(self):
+        """Test that keep_scalar_history parameter is stored correctly."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer_true = ViewerRerun(keep_scalar_history=True)
+                        viewer_false = ViewerRerun(keep_scalar_history=False)
+
+                    # Verify parameters were stored correctly
+                    self.assertTrue(viewer_true.keep_scalar_history)
+                    self.assertFalse(viewer_false.keep_scalar_history)
+
+    def test_custom_rec_id_used(self):
+        """Test that custom rec_id is stored and passed to rr.init."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    custom_rec_id = "shared-recording-42"
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun(rec_id=custom_rec_id)
+
+                    from unittest.mock import ANY
+
+                    self.mock_rr.init.assert_called_once_with(
+                        "newton-viewer", recording_id=custom_rec_id, default_blueprint=ANY
+                    )
+
+                    self.assertEqual(viewer.rec_id, custom_rec_id)
+
+    def test_default_rec_id_is_none(self):
+        """Test that rec_id defaults to None when not provided."""
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            with patch("newton._src.viewer.viewer_rerun.rrb", self.mock_rrb):
+                with patch("newton._src.viewer.viewer_rerun.is_jupyter_notebook", return_value=False):
+                    from newton._src.viewer.viewer_rerun import ViewerRerun
+
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        viewer = ViewerRerun()
+
+                    self.assertIsNone(viewer.rec_id)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,24 @@
+header:
+  license:
+    spdx-id: Apache-2.0
+    copyright-owner: The Newton Developers
+
+    content: |
+      # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+      # SPDX-License-Identifier: Apache-2.0
+
+    # Pattern is matched against lowercased text where "(c)" is normalized
+    # to the word "copyright", so "Copyright (c)" becomes "copyright copyright".
+    pattern: |
+      spdx-filecopyrighttext: copyright copyright \d{4} the newton developers
+      spdx-license-identifier: apache-2\.0
+
+  paths:
+    - "**/*.py"
+
+  paths-ignore:
+    - "newton/_version.py"
+    - "asv/benchmarks/**/__init__.py"
+    - "newton/tests/thirdparty/__init__.py"
+
+  comment: on-failure

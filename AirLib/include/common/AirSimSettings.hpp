@@ -652,6 +652,40 @@ namespace airlib
             int rigid_ticks_per_mpm_step = 0;
         };
 
+        /// How the simulator launches and owns the MPM sidecar process (plan D14).
+        ///
+        /// ⚠ WHY THE SIMULATOR OWNS IT. Two independently started processes sharing /dev/shm files
+        /// produced four distinct defects on 2026-08-26, all of the same shape: a segment outliving
+        /// whichever end died first. A child born with the world cannot disagree with it about
+        /// which world it is in. See COORDINATOR-IMPLEMENTATION-LOG.md, 2026-08-26.
+        struct DeformableTerrainSidecarSetting
+        {
+            /// Opt-in. Absent or false leaves the sidecar entirely to the operator, which is how it
+            /// is debugged and how every run before D14 worked.
+            bool auto_start = false;
+            /// Interpreter to run. Machine-specific, so it has no useful default and is REQUIRED
+            /// when auto_start is true rather than guessed.
+            std::string python;
+            /// Sidecar script. Empty resolves to <repo>/mpm_sidecar/sidecar.py.
+            std::string script;
+            /// Where the child's stdout/stderr go. Empty resolves beside the project's Saved/Logs.
+            std::string log_file;
+
+            /// ⚠ PLAN D13: these decide both fidelity and cost, and until now they lived only in
+            /// whatever command line the operator happened to type — so a run was not reproducible
+            /// from its settings file. Passing them as launch arguments is what fixes that.
+            double voxel_size = 0.02;
+            double density = 2500.0;
+            double fps = 120.0;
+            int particle_every = 2;
+            int max_render_particles = 40000;
+
+            /// Appended verbatim, for flags this schema does not model yet.
+            std::string extra_args;
+
+            bool has_sidecar = false;
+        };
+
         struct DeformableTerrainSetting
         {
             std::string terrain_id;
@@ -662,6 +696,7 @@ namespace airlib
             DeformableTerrainCouplingSetting coupling;
             DeformableTerrainRigidSurfacePolicy rigid_surface_policy =
                 DeformableTerrainRigidSurfacePolicy::AuthoredReplacementPatch;
+            DeformableTerrainSidecarSetting sidecar;
 
             // Seed/region/coupling values have no scientific defaults. Disabled placeholders may
             // omit them; enabled terrains must provide them explicitly.
@@ -2103,7 +2138,7 @@ namespace airlib
                 const std::vector<std::string> keys = getStrictObjectKeys(terrain_json, path);
                 validateStrictKeys(keys,
                                    { "Enabled", "Backend", "Seed", "Region", "Coupling",
-                                     "RigidSurfacePolicy" },
+                                     "RigidSurfacePolicy", "Sidecar" },
                                    path);
 
                 DeformableTerrainSetting terrain;
@@ -2171,6 +2206,49 @@ namespace airlib
                             ".RigidSurfacePolicy' currently supports only 'AuthoredReplacementPatch'");
                     terrain.rigid_surface_policy =
                         DeformableTerrainRigidSurfacePolicy::AuthoredReplacementPatch;
+                }
+
+                if (terrain_json.hasKey("Sidecar")) {
+                    const std::string spath = path + ".Sidecar";
+                    Settings sidecar_json;
+                    if (!getStrictObject(terrain_json, "Sidecar", spath, sidecar_json))
+                        throw std::invalid_argument("Settings key '" + spath +
+                                                    "' must be a JSON object");
+                    validateStrictKeys(getStrictObjectKeys(sidecar_json, spath),
+                                       { "AutoStart", "Python", "Script", "LogFile", "VoxelSize",
+                                         "Density", "Fps", "ParticleEvery", "MaxRenderParticles",
+                                         "ExtraArgs" },
+                                       spath);
+
+                    auto& sc = terrain.sidecar;
+                    sc.has_sidecar = true;
+                    sc.auto_start = getStrictBool(sidecar_json, "AutoStart", spath, false);
+                    sc.python = getStrictString(sidecar_json, "Python", spath, "", false);
+                    sc.script = getStrictString(sidecar_json, "Script", spath, "", false);
+                    sc.log_file = getStrictString(sidecar_json, "LogFile", spath, "", false);
+                    sc.extra_args = getStrictString(sidecar_json, "ExtraArgs", spath, "", false);
+                    sc.voxel_size = getStrictDouble(sidecar_json, "VoxelSize", spath, 0.02, false);
+                    sc.density = getStrictDouble(sidecar_json, "Density", spath, 2500.0, false);
+                    sc.fps = getStrictDouble(sidecar_json, "Fps", spath, 120.0, false);
+                    sc.particle_every =
+                        getStrictInt(sidecar_json, "ParticleEvery", spath, 2, false);
+                    sc.max_render_particles =
+                        getStrictInt(sidecar_json, "MaxRenderParticles", spath, 40000, false);
+
+                    // ⚠ REQUIRED, NOT GUESSED. The interpreter needs a Newton/warp environment and
+                    // its path is machine-specific; inventing one would fail at launch with a
+                    // message about a missing module rather than about a missing setting.
+                    if (sc.auto_start && sc.python.empty())
+                        throw std::invalid_argument(
+                            "Settings key '" + spath +
+                            ".Python' is required when AutoStart is true — it must name an "
+                            "interpreter with the mpm_sidecar requirements installed");
+                    if (sc.voxel_size <= 0.0)
+                        throw std::invalid_argument("Settings key '" + spath +
+                                                    ".VoxelSize' must be greater than zero");
+                    if (sc.fps <= 0.0)
+                        throw std::invalid_argument("Settings key '" + spath +
+                                                    ".Fps' must be greater than zero");
                 }
 
                 if (terrain.enabled &&

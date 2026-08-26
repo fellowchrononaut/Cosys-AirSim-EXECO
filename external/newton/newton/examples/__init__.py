@@ -1,0 +1,1023 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+import ast
+import copy
+import gc
+import importlib
+import math
+import os
+import sys
+import time
+import warnings
+from collections import defaultdict
+from collections.abc import Callable
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton.tests.unittest_utils import find_nan_members
+
+_DEPRECATED_WARP_CONFIG_KEYS = {"quiet", "verbose"}
+
+
+def get_source_directory() -> str:
+    return os.path.realpath(os.path.dirname(__file__))
+
+
+def get_asset_directory() -> str:
+    return os.path.join(get_source_directory(), "assets")
+
+
+def get_asset(filename: str) -> str:
+    return os.path.join(get_asset_directory(), filename)
+
+
+def _enable_example_deprecation_warnings() -> None:
+    """Show Newton deprecations during example runs.
+
+    Skipped when the interpreter already has an explicit warnings policy -- any
+    ``-W`` flag or ``PYTHONWARNINGS``, both surfaced via ``sys.warnoptions`` --
+    so that ``test_examples.py``, or a user running ``python -W error ...``, can
+    escalate warnings to errors without this "default" filter shadowing their
+    policy (it is installed after startup, so it would otherwise take
+    precedence).
+    """
+    if sys.warnoptions or getattr(_enable_example_deprecation_warnings, "_installed", False):
+        return
+
+    warnings.filterwarnings("default", category=DeprecationWarning, module=r"newton(\.|$)")
+    _enable_example_deprecation_warnings._installed = True
+
+
+def download_external_git_folder(git_url: str, folder_path: str, force_refresh: bool = False, ref: str = "main"):
+    """Download a folder from a Git repository.
+
+    Args:
+        git_url: Git repository URL.
+        folder_path: Path within the repository.
+        force_refresh: Whether to refresh the cached download.
+        ref: Git branch, tag, or commit SHA to download.
+    """
+    from newton._src.utils.download_assets import download_git_folder  # noqa: PLC0415
+
+    return download_git_folder(git_url, folder_path, ref=ref, force_refresh=force_refresh)
+
+
+def test_body_state(
+    model: newton.Model,
+    state: newton.State,
+    test_name: str,
+    test_fn: wp.Function | Callable[[wp.transform, wp.spatial_vectorf], bool],
+    indices: list[int] | None = None,
+    show_body_q: bool = False,
+    show_body_qd: bool = False,
+):
+    """
+    Test the position and velocity coordinates of the given bodies by applying the given test function to each body.
+    The function will raise a ``ValueError`` if the test fails for any of the given bodies.
+
+    Args:
+        model: The model to test.
+        state: The state to test.
+        test_name: The name of the test.
+        test_fn: The test function to evaluate. Maps from the body pose and twist to a boolean.
+        indices: The indices of the bodies to test. If None, all bodies will be tested.
+        show_body_q: Whether to print the body pose in the error message.
+        show_body_qd: Whether to print the body twist in the error message.
+    """
+
+    # construct a Warp kernel to evaluate the test function for the given body indices
+    if isinstance(test_fn, wp.Function):
+        warp_test_fn = test_fn
+    else:
+        warp_test_fn, _ = wp.utils.create_warp_function(test_fn)
+    if indices is None:
+        indices = np.arange(model.body_count, dtype=np.int32).tolist()
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def test_fn_kernel(
+        body_q: wp.array[wp.transform],
+        body_qd: wp.array[wp.spatial_vector],
+        indices: wp.array[int],
+        # output
+        failures: wp.array[bool],
+    ):
+        world_id = wp.tid()
+        index = indices[world_id]
+        result = warp_test_fn(body_q[index], body_qd[index])
+        failures[world_id] = not wp.bool(result)
+
+    body_q = state.body_q
+    body_qd = state.body_qd
+    if body_q is None or body_qd is None:
+        raise ValueError("Body state is not available")
+    with wp.ScopedDevice(body_q.device):
+        failures = wp.zeros(len(indices), dtype=bool)
+        indices_array = wp.array(indices, dtype=int)
+        wp.launch(
+            test_fn_kernel,
+            dim=len(indices),
+            inputs=[body_q, body_qd, indices_array],
+            outputs=[failures],
+        )
+        failures_np = failures.numpy()
+        if np.any(failures_np):
+            body_label = np.array(model.body_label)[indices]
+            body_q = body_q.numpy()[indices]
+            body_qd = body_qd.numpy()[indices]
+            failed_indices = np.where(failures_np)[0]
+            failed_details = []
+            for index in failed_indices:
+                detail = body_label[index]
+                extras = []
+                if show_body_q:
+                    extras.append(f"q={body_q[index]}")
+                if show_body_qd:
+                    extras.append(f"qd={body_qd[index]}")
+                if len(extras) > 0:
+                    failed_details.append(f"{detail} ({', '.join(extras)})")
+                else:
+                    failed_details.append(detail)
+            raise ValueError(f'Test "{test_name}" failed for the following bodies: [{", ".join(failed_details)}]')
+
+
+def test_particle_state(
+    state: newton.State,
+    test_name: str,
+    test_fn: wp.Function | Callable[[wp.vec3, wp.vec3], bool],
+    indices: list[int] | None = None,
+):
+    """
+    Test the position and velocity coordinates of the given particles by applying the given test function to each particle.
+    The function will raise a ``ValueError`` if the test fails for any of the given particles.
+
+    Args:
+        state: The state to test.
+        test_name: The name of the test.
+        test_fn: The test function to evaluate. Maps from the particle position and velocity to a boolean.
+        indices: The indices of the particles to test. If None, all particles will be tested.
+    """
+
+    # construct a Warp kernel to evaluate the test function for the given body indices
+    if isinstance(test_fn, wp.Function):
+        warp_test_fn = test_fn
+    else:
+        warp_test_fn, _ = wp.utils.create_warp_function(test_fn)
+    if indices is None:
+        indices = np.arange(state.particle_count, dtype=np.int32).tolist()
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def test_fn_kernel(
+        particle_q: wp.array[wp.vec3],
+        particle_qd: wp.array[wp.vec3],
+        indices: wp.array[int],
+        # output
+        failures: wp.array[bool],
+    ):
+        world_id = wp.tid()
+        index = indices[world_id]
+        result = warp_test_fn(particle_q[index], particle_qd[index])
+        failures[world_id] = not wp.bool(result)
+
+    particle_q = state.particle_q
+    particle_qd = state.particle_qd
+    if particle_q is None or particle_qd is None:
+        raise ValueError("Particle state is not available")
+    with wp.ScopedDevice(particle_q.device):
+        failures = wp.zeros(len(indices), dtype=bool)
+        indices_array = wp.array(indices, dtype=int)
+        wp.launch(
+            test_fn_kernel,
+            dim=len(indices),
+            inputs=[particle_q, particle_qd, indices_array],
+            outputs=[failures],
+        )
+        failures_np = failures.numpy()
+        if np.any(failures_np):
+            failed_particles = np.where(failures_np)[0]
+            raise ValueError(f'Test "{test_name}" failed for {len(failed_particles)} out of {len(indices)} particles')
+
+
+_COUPLED_VIEW_COMBINED = "combined"
+
+
+def add_coupled_view_args(parser) -> None:
+    """Add the standard coupled-solver view selection argument to an example parser.
+
+    Args:
+        parser: Argument parser to extend.
+    """
+    parser.add_argument(
+        "--coupled-view",
+        type=str,
+        default=_COUPLED_VIEW_COMBINED,
+        metavar="NAME",
+        help="Coupled solver view to render: 'combined' or one sub-solver entry name.",
+    )
+
+
+def configure_coupled_view(example, args=None, view_name: str | None = None):
+    """Configure an example viewer for combined or entry-local coupled rendering.
+
+    Args:
+        example: Example instance with ``viewer``, ``model``, ``state_0`` and
+            optionally a coupled ``solver``.
+        args: Parsed arguments that may contain ``coupled_view``.
+        view_name: Explicit view name overriding ``args.coupled_view``.
+
+    Returns:
+        Model or ModelView passed to the viewer.
+
+    Raises:
+        ValueError: If an entry view is requested for a non-coupled solver or
+            the entry name does not exist.
+    """
+    name = _coupled_view_name(args, view_name)
+    model = _coupled_view_model(example, name)
+    example._coupled_view_name = name
+    example.viewer.set_model(model)
+    return model
+
+
+def is_coupled_view_combined(example) -> bool:
+    """Return whether an example is rendering the combined parent model."""
+    return getattr(example, "_coupled_view_name", _COUPLED_VIEW_COMBINED) == _COUPLED_VIEW_COMBINED
+
+
+def get_coupled_view_state(example):
+    """Return the state matching an example's selected coupled render view.
+
+    Args:
+        example: Example instance configured with :func:`configure_coupled_view`.
+
+    Returns:
+        Parent-model state for the combined view or entry-local state for an
+        individual coupled solver view.
+    """
+    name = getattr(example, "_coupled_view_name", _COUPLED_VIEW_COMBINED)
+    return _coupled_view_state(example, name)
+
+
+def apply_coupled_viewer_forces(example, state: newton.State) -> None:
+    """Apply viewer-driven forces when the viewer is bound to the parent model.
+
+    Entry-local render views can compact ids, so picking and wind forces are not
+    mapped back to the parent state in that mode.
+
+    Args:
+        example: Example instance with ``viewer`` and coupled-view metadata.
+        state: Parent-model state to receive viewer forces.
+    """
+    if is_coupled_view_combined(example):
+        example.viewer.apply_forces(state)
+
+
+def log_coupled_view(example, contacts=None, *, log_contacts: bool = True) -> None:
+    """Log the currently selected coupled view for an example frame.
+
+    Args:
+        example: Example instance with ``viewer``, ``model``, ``state_0`` and
+            optionally a coupled ``solver``.
+        contacts: Parent-model contacts to log when compatible with the
+            selected view.
+        log_contacts: Whether to log compatible contacts.
+    """
+    name = getattr(example, "_coupled_view_name", _COUPLED_VIEW_COMBINED)
+    state = _coupled_view_state(example, name)
+    example.viewer.log_state(state)
+
+    if not log_contacts:
+        return
+
+    view_contacts = contacts
+    if name != _COUPLED_VIEW_COMBINED:
+        solver = getattr(example, "solver", None)
+        entry_contacts = getattr(solver, "entry_contacts", None)
+        view_contacts = None if not callable(entry_contacts) else entry_contacts(name, contacts)
+    if view_contacts is not None:
+        example.viewer.log_contacts(view_contacts, state)
+
+
+def _coupled_view_name(args, view_name: str | None) -> str:
+    if view_name is not None:
+        return str(view_name)
+    return str(getattr(args, "coupled_view", _COUPLED_VIEW_COMBINED))
+
+
+def _coupled_entry_names(solver) -> tuple[str, ...]:
+    entry_names = getattr(solver, "entry_names", None)
+    if not callable(entry_names):
+        return ()
+    return tuple(str(name) for name in entry_names())
+
+
+def _coupled_view_model(example, name: str):
+    if name == _COUPLED_VIEW_COMBINED:
+        return example.model
+
+    solver = getattr(example, "solver", None)
+    entry_names = _coupled_entry_names(solver)
+    if not entry_names:
+        raise ValueError("--coupled-view requires a coupled solver when not set to 'combined'")
+    if name not in entry_names:
+        choices = ", ".join((_COUPLED_VIEW_COMBINED, *entry_names))
+        raise ValueError(f"Unknown coupled solver view {name!r}; choose one of: {choices}")
+
+    return solver.view(name)
+
+
+def _coupled_view_state(example, name: str):
+    if name == _COUPLED_VIEW_COMBINED:
+        return example.state_0
+
+    solver = example.solver
+    output_valid = getattr(solver, "entry_output_state_valid", None)
+    sync_entry_states = getattr(solver, "sync_entry_states", None)
+    if callable(output_valid) and callable(sync_entry_states) and not output_valid():
+        sync_entry_states(example.state_0)
+    return solver.entry_state(name)
+
+
+class _ExampleBrowser:
+    """Manages the example browser UI and switching/reset logic for the run loop."""
+
+    def __init__(self, viewer, args=None):
+        self.viewer = viewer
+        self.switch_target: str | None = None
+        self._reset_requested = False
+        self.callback = None
+        self._tree: dict[str, list[tuple[str, str]]] = {}
+        # Deep-copy so later mutations to the caller's namespace (or to
+        # nested mutable fields like ``args.warp_config``) do not change
+        # what Reset restores.
+        self._initial_args = copy.deepcopy(args) if args is not None else None
+
+        if not hasattr(viewer, "register_ui_callback"):
+            return
+
+        examples = get_examples()
+        tree: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for name, module_path in examples.items():
+            parts = module_path.split(".")
+            category = parts[2] if len(parts) > 2 else "other"
+            tree[category].append((name, module_path))
+        self._tree = dict(sorted(tree.items()))
+
+        def _browser_ui(imgui):
+            imgui.set_next_item_open(False, imgui.Cond_.appearing)
+            if imgui.collapsing_header("Examples"):
+                for category in sorted(self._tree.keys()):
+                    if imgui.tree_node(category):
+                        for name, module_path in self._tree[category]:
+                            clicked, _ = imgui.selectable(name, False)
+                            if clicked:
+                                self.switch_target = module_path
+                        imgui.tree_pop()
+
+        self.callback = _browser_ui
+        viewer.register_ui_callback(_browser_ui, position="panel")
+        if hasattr(viewer, "set_reset_callback"):
+            viewer.set_reset_callback(lambda: setattr(self, "_reset_requested", True))
+
+    def _register_ui(self, example):
+        """Re-register the example's GUI callback (panel callbacks survive clear_model)."""
+        if hasattr(example, "gui") and hasattr(self.viewer, "register_ui_callback"):
+            self.viewer.register_ui_callback(lambda ui, ex=example: ex.gui(ui), position="side")
+
+    def _show_splash(self, text):
+        # Raise the splash and pump a couple of frames so it actually paints
+        # before the upcoming blocking work (importlib + Example construction
+        # can take several seconds when Warp kernels recompile).
+        if not hasattr(self.viewer, "show_loading_splash"):
+            return
+        self.viewer.show_loading_splash(text)
+        for _ in range(2):
+            self.viewer.begin_frame(0.0)
+            self.viewer.end_frame()
+
+    def _hide_splash(self):
+        if hasattr(self.viewer, "hide_loading_splash"):
+            self.viewer.hide_loading_splash()
+
+    def _clear_viewer_scene(self):
+        if hasattr(self.viewer, "clear_all_layers"):
+            self.viewer.clear_all_layers()
+        else:
+            self.viewer.clear_model()
+
+    def switch(self, example_class):
+        """Switch to the selected example. Returns (new_example, new_class) or (None, example_class)."""
+        module_path, self.switch_target = self.switch_target, None
+        self._show_splash(f"Loading {module_path.rsplit('.', 1)[-1]}...")
+        self._clear_viewer_scene()
+        try:
+            mod = importlib.import_module(module_path)
+            parser = getattr(mod.Example, "create_parser", create_parser)()
+            new_args = default_args(parser)
+            example = mod.Example(self.viewer, new_args)
+        except Exception as e:
+            warnings.warn(f"Failed to load example {module_path}: {e}", stacklevel=2)
+            self._hide_splash()
+            return None, example_class
+        # Track the args used to launch the current example so a subsequent
+        # Reset reuses the new example's args, not the originally launched
+        # example's args (different parsers expose different fields).
+        self._initial_args = copy.deepcopy(new_args)
+        self._register_ui(example)
+        self._hide_splash()
+        return example, type(example)
+
+    def reset(self, example_class):
+        """Reset the current example by re-creating it. Returns the new example or None.
+
+        The caller must drop its reference to the old example before calling
+        this method.
+        """
+        self._reset_requested = False
+        self._show_splash("Resetting...")
+        self._clear_viewer_scene()
+        try:
+            if self._initial_args is not None:
+                # Re-create the example with the user's original CLI args so
+                # options like --world-count survive a reset; deep-copy so
+                # the new instance cannot mutate the snapshot.
+                args = copy.deepcopy(self._initial_args)
+            else:
+                parser = getattr(example_class, "create_parser", create_parser)()
+                args = default_args(parser)
+            new_example = example_class(self.viewer, args)
+        except Exception as e:
+            warnings.warn(f"Failed to reset example: {e}", stacklevel=2)
+            self._hide_splash()
+            return None
+        self._register_ui(new_example)
+        self._hide_splash()
+        return new_example
+
+
+def _format_fps(fps: float) -> str:
+    """Format an FPS value with sufficient significant digits."""
+    if fps >= 10:
+        return f"{fps:.1f}"
+    if fps >= 1:
+        return f"{fps:.2f}"
+    return f"{fps:.3f}"
+
+
+def _positive_float(value: str) -> float:
+    """Parse a finite, positive float for example CLI arguments."""
+    import argparse  # noqa: PLC0415
+
+    try:
+        result = float(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid float") from e
+
+    if not math.isfinite(result) or result <= 0.0:
+        raise argparse.ArgumentTypeError("must be a finite value greater than 0")
+
+    return result
+
+
+def _throttle_render_fps(
+    frame_start_time: float,
+    render_fps: float | None,
+    *,
+    time_fn: Callable[[], float] = time.perf_counter,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> float:
+    """Sleep to cap a render loop to ``render_fps``.
+
+    Args:
+        frame_start_time: Wall-clock time at the start of the current frame.
+        render_fps: Maximum render rate in frames per second, or ``None`` for
+            no cap.
+        time_fn: Clock function used to measure elapsed frame time.
+        sleep_fn: Sleep function used to delay the next frame.
+
+    Returns:
+        The sleep duration in seconds, or ``0.0`` when no sleep was needed.
+
+    Raises:
+        ValueError: If ``render_fps`` is not finite and positive.
+    """
+    if render_fps is None:
+        return 0.0
+
+    if not math.isfinite(render_fps) or render_fps <= 0.0:
+        raise ValueError("render_fps must be a finite value greater than 0")
+
+    target_period = 1.0 / render_fps
+    sleep_time = target_period - (time_fn() - frame_start_time)
+    if sleep_time <= 0.0:
+        return 0.0
+
+    sleep_fn(sleep_time)
+    return sleep_time
+
+
+def run(example, args):
+    viewer = example.viewer
+    example_class = type(example)
+    render_fps = getattr(args, "render_fps", None)
+
+    if hasattr(viewer, "hide_loading_splash"):
+        viewer.hide_loading_splash()
+
+    perform_test = args is not None and args.test
+    test_post_step = perform_test and hasattr(example, "test_post_step")
+    test_final = perform_test and hasattr(example, "test_final")
+
+    browser = _ExampleBrowser(viewer, args) if not perform_test else None
+
+    if hasattr(example, "gui") and hasattr(viewer, "register_ui_callback"):
+        viewer.register_ui_callback(lambda ui, ex=example: ex.gui(ui), position="side")
+
+    while viewer.is_running():
+        frame_start_time = time.perf_counter()
+
+        if browser is not None and browser.switch_target is not None:
+            example, example_class = browser.switch(example_class)
+            continue
+
+        if browser is not None and browser._reset_requested:
+            # Drop our reference and force cycle collection so the old
+            # example's destructors finish before reset() enters the new
+            # CUDA graph capture; otherwise late texture/array __del__
+            # calls could fire mid-capture and CUDA rejects them.
+            example = None
+            gc.collect()
+            example = browser.reset(example_class)
+            continue
+
+        if example is None:
+            viewer.begin_frame(0.0)
+            viewer.end_frame()
+            _throttle_render_fps(frame_start_time, render_fps)
+            continue
+
+        if viewer.should_step():
+            with wp.ScopedTimer("step", active=False):
+                example.step()
+        if test_post_step:
+            example.test_post_step()
+
+        with wp.ScopedTimer("render", active=False):
+            example.render()
+
+        _throttle_render_fps(frame_start_time, render_fps)
+
+    if perform_test:
+        if test_final:
+            example.test_final()
+        elif not (test_post_step or test_final):
+            raise NotImplementedError("Example does not have a test_final or test_post_step method")
+
+    viewer.close()
+
+    if hasattr(viewer, "benchmark_result"):
+        result = viewer.benchmark_result()
+        if result is not None:
+            print(
+                f"Benchmark: {_format_fps(result['fps'])} FPS ({result['frames']} frames in {result['elapsed']:.2f}s)"
+            )
+
+    if perform_test:
+        # generic tests for finiteness of Newton objects
+        if hasattr(example, "state_0"):
+            nan_members = find_nan_members(example.state_0)
+            if nan_members:
+                raise ValueError(f"NaN members found in state_0: {nan_members}")
+        if hasattr(example, "state_1"):
+            nan_members = find_nan_members(example.state_1)
+            if nan_members:
+                raise ValueError(f"NaN members found in state_1: {nan_members}")
+        if hasattr(example, "model"):
+            nan_members = find_nan_members(example.model)
+            if nan_members:
+                raise ValueError(f"NaN members found in model: {nan_members}")
+        if hasattr(example, "control"):
+            nan_members = find_nan_members(example.control)
+            if nan_members:
+                raise ValueError(f"NaN members found in control: {nan_members}")
+        if hasattr(example, "contacts"):
+            nan_members = find_nan_members(example.contacts)
+            if nan_members:
+                raise ValueError(f"NaN members found in contacts: {nan_members}")
+
+
+def get_examples() -> dict[str, str]:
+    """Return a dict mapping example short names to their full module paths."""
+    example_map = {}
+    examples_dir = get_source_directory()
+    for module in sorted(os.listdir(examples_dir)):
+        module_dir = os.path.join(examples_dir, module)
+        if not os.path.isdir(module_dir) or module.startswith("_"):
+            continue
+        for filename in sorted(os.listdir(module_dir)):
+            if filename.startswith("example_") and filename.endswith(".py"):
+                example_name = filename[8:-3]
+                example_map[example_name] = f"newton.examples.{module}.{filename[:-3]}"
+    return example_map
+
+
+def _print_examples(examples: dict[str, str]) -> None:
+    print("Available examples:")
+    for name in examples:
+        print(f"  {name}")
+
+
+def create_parser():
+    """Create a base argument parser with common parameters for Newton examples.
+
+    Individual examples can use this as a parent parser and add their own
+    specific arguments.
+
+    Returns:
+        argparse.ArgumentParser: Base parser with common arguments
+    """
+    import argparse  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(add_help=True, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
+    parser.add_argument(
+        "--viewer",
+        type=str,
+        default="gl",
+        choices=["gl", "usd", "rtx", "rerun", "null", "viser"],
+        help="Viewer to use (gl, usd, rtx, rerun, null, or viser).",
+    )
+    parser.add_argument(
+        "--rerun-address",
+        type=str,
+        default=None,
+        help="Connect to an external Rerun server. (e.g., 'rerun+http://127.0.0.1:9876/proxy').",
+    )
+    parser.add_argument(
+        "--output-path", type=str, default="output.usd", help="Path to the output USD file (required for usd viewer)."
+    )
+    parser.add_argument("--num-frames", type=int, default=100, help="Total number of frames.")
+    parser.add_argument(
+        "--render-fps",
+        type=_positive_float,
+        default=None,
+        help="Maximum render rate in frames per second. Does not change simulation frame timing.",
+    )
+    parser.add_argument(
+        "--headless",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to initialize the viewer headless (for OpenGL viewer only).",
+    )
+    parser.add_argument(
+        "--test",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to run the example in test mode.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Suppress Warp compilation messages.",
+    )
+    parser.add_argument(
+        "--paused",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Start the viewer in a paused state.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        type=int,
+        default=False,
+        nargs="?",
+        const=None,
+        metavar="SECONDS",
+        help="Run in benchmark mode: measure FPS after a warmup period. If SECONDS is given, stop after that many seconds or --num-frames, whichever comes first.",
+    )
+    parser.add_argument(
+        "--warp-config",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a warp.config attribute (repeatable).",
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        default=False,
+        help="Use the most aggressive process priority in benchmark mode.",
+    )
+
+    return parser
+
+
+def add_broad_phase_arg(parser):
+    """Add ``--broad-phase`` argument to *parser*."""
+    parser.add_argument(
+        "--broad-phase",
+        type=str,
+        default="explicit",
+        choices=["nxn", "sap", "explicit"],
+        help="Broad phase for collision detection.",
+    )
+    return parser
+
+
+def add_mujoco_contacts_arg(parser):
+    """Add ``--use-mujoco-contacts`` argument to *parser*."""
+    import argparse  # noqa: PLC0415
+
+    parser.add_argument(
+        "--use-mujoco-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use MuJoCo's native contact solver instead of Newton contacts (default: use Newton contacts).",
+    )
+    return parser
+
+
+def add_kamino_contacts_arg(parser):
+    """Add ``--use-kamino-contacts`` argument to *parser*."""
+    import argparse  # noqa: PLC0415  — needed for BooleanOptionalAction
+
+    parser.add_argument(
+        "--use-kamino-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Kamino's collision-detection wrapper instead of Newton contacts (default: use Newton contacts).",
+    )
+    return parser
+
+
+def add_world_count_arg(parser):
+    """Add ``--world-count`` argument to *parser*."""
+    parser.add_argument(
+        "--world-count",
+        type=int,
+        default=1,
+        help="Number of simulation worlds.",
+    )
+    return parser
+
+
+def add_max_worlds_arg(parser):
+    """Add ``--max-worlds`` argument to *parser*."""
+    parser.add_argument(
+        "--max-worlds",
+        type=int,
+        default=None,
+        help="Maximum number of worlds to render (for performance with many environments).",
+    )
+    return parser
+
+
+def default_args(parser=None):
+    """Return an args namespace populated with defaults from the given parser.
+
+    Used by the example browser to create proper args when switching examples,
+    so that ``Example(viewer, args)`` always receives a fully-populated namespace.
+    If *parser* is ``None``, the base :func:`create_parser` is used.
+    """
+    if parser is None:
+        parser = create_parser()
+    return parser.parse_known_args([])[0]
+
+
+def _apply_warp_config(parser, args):
+    """Apply ``--warp-config`` overrides to :obj:`warp.config`.
+
+    Each entry in ``args.warp_config`` must have the form ``KEY=VALUE``.  The
+    key is validated to be an existing attribute of :obj:`warp.config`.  The
+    value is parsed with :func:`ast.literal_eval`; if that fails the raw
+    string is kept.
+
+    Args:
+        parser: The argument parser, used for error reporting.
+        args: Parsed argument namespace containing ``warp_config``.
+    """
+    if not args.warp_config:
+        return
+
+    for entry in args.warp_config:
+        if "=" not in entry:
+            parser.error(f"invalid --warp-config format '{entry}': expected KEY=VALUE")
+
+        key, value_str = entry.split("=", 1)
+
+        if key in _DEPRECATED_WARP_CONFIG_KEYS:
+            parser.error(f"invalid --warp-config key '{key}': use 'log_level' instead")
+
+        if not hasattr(wp.config, key):
+            parser.error(f"invalid --warp-config key '{key}': not a recognized warp.config setting")
+
+        try:
+            value = ast.literal_eval(value_str)
+        except (ValueError, SyntaxError):
+            value = value_str
+
+        setattr(wp.config, key, value)
+
+
+def _raise_benchmark_priority(realtime=False):
+    """Raise process/thread priority for stable benchmark measurements.
+
+    When *realtime* is True, try to use the most aggressive process priority; failure to raise priority is a fatal error.
+    """
+    import sys  # noqa: PLC0415
+
+    def _fail(msg):
+        if realtime:
+            raise SystemExit(f"Error: {msg}")
+        print(f"Warning: Benchmark running at default process priority. Results may vary. {msg}")
+
+    if sys.platform == "win32":
+        try:
+            import psutil  # noqa: PLC0415
+
+            priority = psutil.REALTIME_PRIORITY_CLASS if realtime else psutil.HIGH_PRIORITY_CLASS
+            psutil.Process().nice(priority)
+        except ModuleNotFoundError:
+            _fail("Install 'psutil' to automatically raise priority.")
+    elif sys.platform == "linux":
+        try:
+            os.nice(-20 if realtime else -15)
+        except PermissionError:
+            _fail("Run with elevated privileges to automatically raise priority.")
+    elif sys.platform == "darwin":
+        import ctypes  # noqa: PLC0415
+        import ctypes.util  # noqa: PLC0415
+
+        try:
+            libsystem = ctypes.CDLL(ctypes.util.find_library("System"))
+            # From <sys/qos.h>
+            QOS_CLASS_USER_INITIATED = 0x19
+            QOS_CLASS_USER_INTERACTIVE = 0x21
+            qos = QOS_CLASS_USER_INTERACTIVE if realtime else QOS_CLASS_USER_INITIATED
+            rc = libsystem.pthread_set_qos_class_self_np(qos, 0)
+            if rc != 0:
+                _fail(f"Failed to automatically raise priority (error {rc}).")
+        except OSError as e:
+            _fail(f"Failed to automatically raise priority: {e}")
+
+
+def init(parser=None):
+    """Initialize Newton example components from parsed arguments.
+
+    Args:
+        parser: An argparse.ArgumentParser instance (should include arguments from
+              create_parser()). If None, a default parser is created.
+
+    Returns:
+        tuple: (viewer, args) where viewer is configured based on args.viewer
+
+    Raises:
+        ValueError: If invalid viewer type or missing required arguments
+    """
+    import warp as wp  # noqa: PLC0415
+
+    import newton.viewer  # noqa: PLC0415
+
+    _enable_example_deprecation_warnings()
+
+    # parse args
+    if parser is None:
+        parser = create_parser()
+        args = parser.parse_known_args()[0]
+    else:
+        # When parser is provided, use parse_args() to properly handle --help
+        args = parser.parse_args()
+
+    # Apply --warp-config overrides before any Warp API calls
+    _apply_warp_config(parser, args)
+
+    # Suppress Warp compilation messages if requested
+    if args.quiet:
+        wp.config.log_level = max(wp.config.log_level, wp.LOG_WARNING)
+
+    # Set device if specified
+    if args.device:
+        wp.set_device(args.device)
+
+    # Benchmark mode forces null viewer and raises process/thread priority
+    if args.benchmark is not False:
+        args.viewer = "null"
+        _raise_benchmark_priority(realtime=args.realtime)
+
+    # Create viewer based on type
+    visible_gl = args.viewer == "gl" and not args.headless
+    if args.viewer == "gl":
+        viewer = newton.viewer.ViewerGL(headless=args.headless, paused=args.paused, num_frames=args.num_frames)
+    elif args.viewer == "usd":
+        if args.output_path is None:
+            raise ValueError("--output-path is required when using usd viewer")
+        viewer = newton.viewer.ViewerUSD(output_path=args.output_path, num_frames=args.num_frames)
+    elif args.viewer == "rtx":
+        viewer = newton.viewer.ViewerRTX(headless=args.headless, paused=args.paused, num_frames=args.num_frames)
+    elif args.viewer == "rerun":
+        viewer = newton.viewer.ViewerRerun(address=args.rerun_address)
+    elif args.viewer == "null":
+        viewer = newton.viewer.ViewerNull(
+            num_frames=args.num_frames,
+            benchmark=args.benchmark is not False,
+            benchmark_timeout=args.benchmark or None,
+        )
+    elif args.viewer == "viser":
+        viewer = newton.viewer.ViewerViser()
+    else:
+        raise ValueError(f"Invalid viewer: {args.viewer}")
+
+    if visible_gl:
+        viewer.show_loading_splash("Loading...")
+        # Pump a few frames so the OS maps the GL surface before kernel
+        # compilation blocks the main thread.  No portable "window is on
+        # screen" signal exists across X11/Wayland/macOS; three frames is
+        # a best-effort heuristic that may still come up blank on slow
+        # compositors (silently absent, not wrong).
+        for _ in range(3):
+            viewer.begin_frame(0.0)
+            viewer.end_frame()
+
+    return viewer, args
+
+
+def create_collision_pipeline(model, args=None, broad_phase=None, **kwargs):
+    """Create a collision pipeline, optionally using --broad-phase from args.
+
+    Args:
+        model: The Newton model to create the pipeline for.
+        args: Parsed arguments from create_parser() (optional).
+        broad_phase: Override broad phase ("nxn", "sap", "explicit"). Default from args or "explicit".
+        **kwargs: Additional keyword arguments passed to CollisionPipeline.
+
+    Returns:
+        CollisionPipeline instance.
+    """
+
+    if broad_phase is None:
+        broad_phase = (getattr(args, "broad_phase", None) if args else None) or "explicit"
+
+    return newton.CollisionPipeline(model, broad_phase=broad_phase, **kwargs)
+
+
+def main():
+    """Main entry point for running examples via 'python -m newton.examples <example_name>'."""
+    import runpy  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    _enable_example_deprecation_warnings()
+
+    examples = get_examples()
+
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
+        print("Usage: python -m newton.examples <example_name> [options]")
+        print("       python -m newton.examples          # run default basic_pendulum")
+        print("       python -m newton.examples --list   # print available examples")
+        print()
+        print("Run 'python -m newton.examples <example_name> --help' to see the")
+        print("options supported by a given example.")
+        sys.exit(0)
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--list":
+        _print_examples(examples)
+        sys.exit(0)
+
+    if len(sys.argv) < 2:
+        example_name = "basic_pendulum"
+    else:
+        example_name = sys.argv[1]
+
+    if example_name not in examples:
+        print(f"Error: Unknown example '{example_name}'\n")
+        _print_examples(examples)
+        sys.exit(1)
+
+    # Set up sys.argv for the target script
+    target_module = examples[example_name]
+    # Keep the module name as argv[0] and pass remaining args
+    sys.argv = [target_module, *sys.argv[2:]]
+
+    # Run the target example module
+    runpy.run_module(target_module, run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "add_broad_phase_arg",
+    "add_max_worlds_arg",
+    "add_mujoco_contacts_arg",
+    "add_world_count_arg",
+    "create_parser",
+    "default_args",
+    "get_examples",
+    "init",
+    "run",
+    "test_body_state",
+    "test_particle_state",
+]

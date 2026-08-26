@@ -1,0 +1,235 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import io
+import os
+import warnings
+from urllib.parse import unquote, urlparse
+from urllib.request import urlopen
+
+import numpy as np
+
+_texture_url_cache: dict[str, bytes] = {}
+
+
+def _is_http_url(path: str) -> bool:
+    parsed = urlparse(path)
+    return parsed.scheme in ("http", "https")
+
+
+def _resolve_file_url(path: str) -> str:
+    parsed = urlparse(path)
+    if parsed.scheme != "file":
+        return path
+    return unquote(parsed.path)
+
+
+def _is_usd_package_path(path: str) -> bool:
+    """Return whether *path* addresses an asset inside a USD package (e.g. ``scene.usdz[tex.png]``)."""
+    # Cheap bracket check first so the pxr import is only paid for real packages.
+    if "[" not in path:
+        return False
+    try:
+        from pxr import Ar
+    except ImportError:
+        return False
+    return Ar.IsPackageRelativePath(path)
+
+
+def _read_usd_package_asset_bytes(path: str) -> bytes | None:
+    """Read the raw bytes of an asset packaged inside a USD file (e.g. a texture in a ``.usdz``).
+
+    ``.usdz`` archives address their contents with package-relative paths of the
+    form ``archive.usdz[inner/path.png]``, which are not valid filesystem paths.
+    Resolve them through USD's asset resolver, which also handles nested packages.
+    """
+    try:
+        from pxr import Ar
+    except ImportError:
+        return None
+    try:
+        asset = Ar.GetResolver().OpenAsset(Ar.ResolvedPath(path))
+        if not asset:
+            warnings.warn(f"Failed to read packaged texture image: {path} (not found in package)", stacklevel=3)
+            return None
+        return bytes(asset.GetBuffer())
+    except Exception as exc:
+        warnings.warn(f"Failed to read packaged texture image: {path} ({exc})", stacklevel=3)
+        return None
+
+
+def _download_texture_from_file_bytes(url: str) -> bytes | None:
+    if url in _texture_url_cache:
+        return _texture_url_cache[url]
+    try:
+        with urlopen(url, timeout=10) as response:
+            data = response.read()
+        _texture_url_cache[url] = data
+        return data
+    except Exception as exc:
+        warnings.warn(f"Failed to download texture image: {url} ({exc})", stacklevel=2)
+        return None
+
+
+def load_texture_from_file(texture_path: str | None) -> np.ndarray | None:
+    """Load a texture image from disk or URL into a numpy array.
+
+    Args:
+        texture_path: Path or URL to the texture image.
+
+    Returns:
+        Texture image as uint8 RGBA numpy array (H, W, 4), or None if load fails.
+    """
+    if texture_path is None:
+        return None
+    try:
+        from PIL import Image
+
+        if _is_http_url(texture_path):
+            data = _download_texture_from_file_bytes(texture_path)
+            if data is None:
+                return None
+            with Image.open(io.BytesIO(data)) as source_img:
+                img = source_img.convert("RGBA")
+                return np.array(img)
+
+        if _is_usd_package_path(texture_path):
+            data = _read_usd_package_asset_bytes(texture_path)
+            if data is None:
+                return None
+            with Image.open(io.BytesIO(data)) as source_img:
+                img = source_img.convert("RGBA")
+                return np.array(img)
+
+        texture_path = _resolve_file_url(texture_path)
+        with Image.open(texture_path) as source_img:
+            img = source_img.convert("RGBA")
+            return np.array(img)
+    except Exception as exc:
+        warnings.warn(f"Failed to load texture image: {texture_path} ({exc})", stacklevel=2)
+        return None
+
+
+def load_texture(texture: str | os.PathLike[str] | np.ndarray | None) -> np.ndarray | None:
+    """Normalize a texture input into a contiguous image array.
+
+    Args:
+        texture: Path/URL to a texture image or an array (H, W, C).
+
+    Returns:
+        np.ndarray | None: Contiguous image array, or None if unavailable.
+    """
+    if texture is None:
+        return None
+
+    if isinstance(texture, os.PathLike):
+        texture = os.fspath(texture)
+
+    if isinstance(texture, str):
+        loaded = load_texture_from_file(texture)
+        if loaded is None:
+            return None
+        return np.ascontiguousarray(loaded)
+
+    return np.ascontiguousarray(np.asarray(texture))
+
+
+def linear_texture_to_srgb(texture_image: np.ndarray | None) -> np.ndarray | None:
+    """Convert RGB channels from linear light to sRGB/display encoding."""
+    if texture_image is None:
+        return None
+
+    image = np.asarray(texture_image)
+    if image.ndim < 3 or image.shape[-1] < 3 or image.size == 0:
+        return np.ascontiguousarray(image)
+
+    out = image.copy()
+    if np.issubdtype(out.dtype, np.integer):
+        scale = float(np.iinfo(out.dtype).max)
+        rgb = np.clip(out[..., :3].astype(np.float32) / scale, 0.0, 1.0)
+        srgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+        out[..., :3] = np.clip(np.round(srgb * scale), 0.0, scale).astype(out.dtype)
+        return np.ascontiguousarray(out)
+
+    out = out.astype(np.float32, copy=False)
+    rgb = np.clip(out[..., :3], 0.0, 1.0)
+    out[..., :3] = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+    return np.ascontiguousarray(out.astype(image.dtype, copy=False))
+
+
+def normalize_texture(
+    texture_image: np.ndarray | None,
+    *,
+    flip_vertical: bool = False,
+    require_channels: bool = False,
+    scale_unit_range: bool = True,
+) -> np.ndarray | None:
+    """Normalize a texture array for rendering.
+
+    Args:
+        texture_image: Texture image array (H, W, C) or None.
+        flip_vertical: Whether to flip the image vertically.
+        require_channels: Whether to enforce 3/4-channel images and expand grayscale.
+        scale_unit_range: Whether to scale unit-range floats to 0-255.
+
+    Returns:
+        np.ndarray | None: Normalized uint8 image array or None if unavailable.
+    """
+    if texture_image is None:
+        return None
+
+    image = np.asarray(texture_image)
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0.0, 255.0)
+        if scale_unit_range and image.max() <= 1.0:
+            image = image * 255.0
+        image = image.astype(np.uint8)
+
+    if require_channels:
+        if image.ndim == 2:
+            image = np.repeat(image[:, :, None], 3, axis=2)
+        if image.ndim < 2 or image.shape[0] == 0 or image.shape[1] == 0:
+            raise ValueError("Texture image has invalid dimensions.")
+        if image.shape[2] not in (3, 4):
+            raise ValueError(f"Unsupported texture channels: {image.shape[2]}")
+
+    if flip_vertical:
+        image = np.flipud(image)
+
+    return np.ascontiguousarray(image)
+
+
+def compute_texture_hash(texture: str | os.PathLike[str] | np.ndarray | None) -> int:
+    """Compute a stable hash for a texture (path or array).
+
+    Args:
+        texture: Texture path/URL string, PathLike, or image array (H, W, C), or None.
+
+    Returns:
+        Hash of the texture path or array contents, or 0 for None.
+    """
+    if texture is None:
+        return 0
+
+    # Handle string paths and PathLike - hash the path string without decoding
+    if isinstance(texture, os.PathLike):
+        return hash(os.fspath(texture))
+    if isinstance(texture, str):
+        return hash(texture)
+
+    # Array input - hash based on shape and sampled content
+    texture = np.ascontiguousarray(texture)
+    flat_size = texture.size
+    if flat_size == 0:
+        sample_bytes = b""
+    else:
+        # Only sample a small portion of the texture to avoid hashing large textures in full.
+        flat = texture.ravel()
+        max_samples = 1024
+        step = max(1, flat.size // max_samples)
+        sample = flat[::step]
+        sample_bytes = sample.tobytes()
+
+    return hash((texture.shape, texture.dtype.str, sample_bytes))

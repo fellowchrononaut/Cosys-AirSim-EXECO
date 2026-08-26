@@ -1,0 +1,617 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+import unittest
+import warnings
+
+import numpy as np
+import warp as wp
+
+import newton
+from newton._src.solvers.mujoco.equality import (
+    MJC_OBJ_BODY,
+    MJC_OBJ_JOINT,
+    MjcEqualityTargetKind,
+    _add_equality_constraint,
+)
+
+
+def _eq_value(builder, name, idx):
+    """Read the equality-constraint value at ``idx`` (default-filled) from the custom-attr table."""
+    attr = builder.custom_attributes[f"mujoco:{name}"]
+    if not attr.values or idx >= len(attr.values):
+        return attr.default
+    value = attr.values[idx]
+    return attr.default if value is None else value
+
+
+class TestEqualityConstraints(unittest.TestCase):
+    def test_eq_type_deprecation(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            legacy_type = newton.EqType.CONNECT
+            scoped_type = newton.solvers.SolverMuJoCo.EqType.CONNECT
+
+        self.assertEqual(legacy_type, scoped_type)
+        self.assertEqual(len(caught), 1)
+        self.assertTrue(issubclass(caught[0].category, DeprecationWarning))
+        self.assertIn(
+            "newton.EqType is deprecated in Newton 1.4; use newton.solvers.SolverMuJoCo.EqType instead",
+            str(caught[0].message),
+        )
+
+    def test_equality_constraint_references_use_namespaced_frequency(self):
+        def make_builder(references):
+            builder = newton.ModelBuilder()
+            builder.add_custom_frequency(newton.ModelBuilder.CustomFrequency(name="ref", namespace="test"))
+            builder.add_custom_attribute(
+                newton.ModelBuilder.CustomAttribute(
+                    name="equality_index",
+                    dtype=wp.int32,
+                    frequency="test:ref",
+                    namespace="test",
+                    references=references,
+                )
+            )
+            body1 = builder.add_body()
+            body2 = builder.add_body()
+            _add_equality_constraint(
+                builder,
+                constraint_type=newton.solvers.SolverMuJoCo.EqType.CONNECT,
+                body1=body1,
+                body2=body2,
+            )
+            builder.add_custom_values(**{"test:equality_index": 0})
+            return builder
+
+        with self.assertRaisesRegex(ValueError, "Unknown references value 'equality_constraint'"):
+            newton.ModelBuilder().add_world(make_builder("equality_constraint"))
+
+        main_builder = newton.ModelBuilder()
+        namespaced_builder = make_builder("mujoco:equality_constraint")
+        main_builder.add_world(namespaced_builder)
+        main_builder.add_world(namespaced_builder)
+        np.testing.assert_array_equal(main_builder.finalize().test.equality_index.numpy(), [0, 1])
+
+    def test_multiple_constraints(self):
+        self.sim_time = 0.0
+        self.frame_dt = 1 / 60
+        self.sim_dt = self.frame_dt / 10
+
+        builder = newton.ModelBuilder()
+
+        builder.add_mjcf(
+            os.path.join(os.path.dirname(__file__), "assets", "constraints.xml"),
+            ignore_names=["floor", "ground"],
+            up_axis="Z",
+            skip_equality_constraints=False,
+            convert_mjc_equality_constraints=False,
+        )
+
+        self.model = builder.finalize()
+
+        eq_keys = self.model.mujoco.equality_constraint_label
+        eq_body1 = self.model.mujoco.equality_constraint_body1.numpy()
+        eq_body2 = self.model.mujoco.equality_constraint_body2.numpy()
+        eq_anchors = self.model.mujoco.equality_constraint_anchor.numpy()
+        eq_torquescale = self.model.mujoco.equality_constraint_torquescale.numpy()
+
+        c_site_idx = eq_keys.index("c_site")
+        self.assertEqual(eq_body1[c_site_idx], -1)
+        self.assertEqual(eq_body2[c_site_idx], 0)
+        np.testing.assert_allclose(eq_anchors[c_site_idx], [0.0, 0.0, 1.0], rtol=1e-5)
+
+        w_site_idx = eq_keys.index("w_site")
+        self.assertEqual(eq_body1[w_site_idx], -1)
+        self.assertEqual(eq_body2[w_site_idx], 1)
+        np.testing.assert_allclose(eq_anchors[w_site_idx], [0.0, 0.0, 0.0], rtol=1e-5)
+        self.assertAlmostEqual(eq_torquescale[w_site_idx], 0.1, places=5)
+
+        self.solver = newton.solvers.SolverMuJoCo(
+            self.model,
+            use_mujoco_cpu=True,
+            solver="newton",
+            integrator="euler",
+            iterations=100,
+            ls_iterations=50,
+            njmax=100,
+            nconmax=50,
+        )
+
+        self.control = self.model.control()
+        self.state_0, self.state_1 = self.model.state(), self.model.state()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+
+        for _ in range(200):
+            for _ in range(10):
+                self.state_0.clear_forces()
+                self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+                self.state_0, self.state_1 = self.state_1, self.state_0
+
+            self.sim_time += self.frame_dt
+
+        self.assertEqual(self.solver.mj_model.eq_type.shape[0], 5)
+
+        # Check constraint violations
+        nefc = self.solver.mj_data.nefc  # number of active constraints
+        if nefc > 0:
+            efc_pos = self.solver.mj_data.efc_pos[:nefc]  # constraint violations
+            max_violation = np.max(np.abs(efc_pos))
+            self.assertLess(max_violation, 0.01, f"Maximum constraint violation {max_violation} exceeds threshold")
+
+        # Check constraint forces
+        if nefc > 0:
+            efc_force = self.solver.mj_data.efc_force[:nefc]
+            max_force = np.max(np.abs(efc_force))
+            self.assertLess(max_force, 1000.0, f"Maximum constraint force {max_force} seems unreasonably large")
+
+    def test_target_and_objtype_defaults(self):
+        # Pure equality rows default to MjcEqualityTargetKind.NONE / target -1 and carry the
+        # objtype implied by their EqType (BODY for connect/weld, JOINT for joint).
+        builder = newton.ModelBuilder()
+        b0 = builder.add_link()
+        j0 = builder.add_joint_free(b0)
+        b1 = builder.add_link()
+        j1 = builder.add_joint_free(b1)
+        builder.add_articulation([j0])
+        builder.add_articulation([j1])
+
+        _add_equality_constraint(
+            builder, constraint_type=newton.solvers.SolverMuJoCo.EqType.CONNECT, body1=b0, body2=b1
+        )
+        _add_equality_constraint(builder, constraint_type=newton.solvers.SolverMuJoCo.EqType.WELD, body1=b0, body2=b1)
+        _add_equality_constraint(
+            builder,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.JOINT,
+            joint1=j0,
+            joint2=j1,
+            polycoef=[0.0, 1.0, 0.0, 0.0, 0.0],
+        )
+
+        model = builder.finalize()
+
+        np.testing.assert_array_equal(
+            model.mujoco.equality_constraint_objtype.numpy(),
+            [MJC_OBJ_BODY, MJC_OBJ_BODY, MJC_OBJ_JOINT],
+        )
+        np.testing.assert_array_equal(
+            model.mujoco.equality_constraint_target_kind.numpy(),
+            [int(MjcEqualityTargetKind.NONE)] * 3,
+        )
+        np.testing.assert_array_equal(model.mujoco.equality_constraint_target.numpy(), [-1, -1, -1])
+
+    def test_equality_constraints_not_duplicated_per_world(self):
+        """Test that equality constraints are not duplicated for each world when using separate_worlds=True"""
+        # Create a simple robot builder with equality constraints
+        robot = newton.ModelBuilder()
+
+        # Add bodies with shapes
+        base = robot.add_link(xform=wp.transform((0, 0, 0)), mass=1.0, label="base")
+        robot.add_shape_box(base, hx=0.5, hy=0.5, hz=0.5)
+
+        link1 = robot.add_link(xform=wp.transform((1, 0, 0)), mass=1.0, label="link1")
+        robot.add_shape_box(link1, hx=0.5, hy=0.5, hz=0.5)
+
+        link2 = robot.add_link(xform=wp.transform((2, 0, 0)), mass=1.0, label="link2")
+        robot.add_shape_box(link2, hx=0.5, hy=0.5, hz=0.5)
+
+        # Add joints - connect base to world (-1) first
+        joint1 = robot.add_joint_fixed(
+            parent=-1,  # world
+            child=base,
+            parent_xform=wp.transform((0, 0, 0)),
+            child_xform=wp.transform((0, 0, 0)),
+            label="joint_fixed",
+        )
+        joint2 = robot.add_joint_revolute(
+            parent=base,
+            child=link1,
+            parent_xform=wp.transform((0.5, 0, 0)),
+            child_xform=wp.transform((-0.5, 0, 0)),
+            axis=(0, 0, 1),
+            label="joint1",
+        )
+        joint3 = robot.add_joint_revolute(
+            parent=link1,
+            child=link2,
+            parent_xform=wp.transform((0.5, 0, 0)),
+            child_xform=wp.transform((-0.5, 0, 0)),
+            axis=(0, 0, 1),
+            label="joint2",
+        )
+
+        # Add articulation
+        robot.add_articulation([joint1, joint2, joint3], label="articulation")
+
+        # Add 2 equality constraints
+        _add_equality_constraint(
+            robot,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.CONNECT,
+            body1=base,
+            body2=link2,
+            anchor=wp.vec3(0.5, 0, 0),
+            label="connect_constraint",
+        )
+        _add_equality_constraint(
+            robot,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.JOINT,
+            joint1=1,  # joint1 (base to link1)
+            joint2=2,  # joint2 (link1 to link2)
+            polycoef=[1.0, -1.0, 0, 0, 0],
+            label="joint_constraint",
+        )
+
+        # Build main model with multiple worlds
+        main_builder = newton.ModelBuilder()
+
+        # Add ground plane (global, world -1)
+        main_builder.add_ground_plane()
+
+        # Add multiple robot instances
+        world_count = 3
+        for i in range(world_count):
+            main_builder.add_world(robot, xform=wp.transform((i * 5, 0, 0)))
+
+        # Finalize the model
+        model = main_builder.finalize()
+
+        # Check that equality constraints count is correct in the Newton model
+        # Should be 2 constraints per world * 3 worlds = 6 total
+        self.assertEqual(model.mujoco.equality_constraint_count, 2 * world_count)
+
+        # Create MuJoCo solver with separate_worlds=True
+        solver = newton.solvers.SolverMuJoCo(
+            model,
+            use_mujoco_cpu=True,
+            separate_worlds=True,
+            njmax=100,  # Should be enough for 2 constraints, not 6
+            nconmax=50,
+        )
+
+        # Check that the MuJoCo model has the correct number of equality constraints
+        # With separate_worlds=True, it should only have constraints from one world (2)
+        self.assertEqual(
+            solver.mj_model.neq, 2, f"Expected 2 equality constraints in MuJoCo model, got {solver.mj_model.neq}"
+        )
+
+        # Verify that indices are correctly remapped for each world
+        # Each world adds 3 bodies, so body indices should be offset by 3 * world_index
+        # The first world's base body should be at index 0, second at 3, third at 6
+        eq_body1 = model.mujoco.equality_constraint_body1.numpy()
+        eq_body2 = model.mujoco.equality_constraint_body2.numpy()
+        eq_joint1 = model.mujoco.equality_constraint_joint1.numpy()
+        eq_joint2 = model.mujoco.equality_constraint_joint2.numpy()
+
+        for world_idx in range(world_count):
+            # Each world has 2 constraints
+            constraint_idx = world_idx * 2
+
+            # For connect constraint: body1 should be base (offset by 3 * world_idx)
+            # body2 should be link2 (offset by 3 * world_idx + 2)
+            expected_body1 = world_idx * 3 + 0  # base body
+            expected_body2 = world_idx * 3 + 2  # link2 body
+            self.assertEqual(
+                eq_body1[constraint_idx], expected_body1, f"World {world_idx} connect constraint body1 index incorrect"
+            )
+            self.assertEqual(
+                eq_body2[constraint_idx], expected_body2, f"World {world_idx} connect constraint body2 index incorrect"
+            )
+
+            # For joint constraint: joint1 and joint2 should be offset by 3 * world_idx
+            # (each robot has 3 joints: fixed, revolute1, revolute2)
+            expected_joint1 = world_idx * 3 + 1  # joint1 (base to link1)
+            expected_joint2 = world_idx * 3 + 2  # joint2 (link1 to link2)
+            self.assertEqual(
+                eq_joint1[constraint_idx + 1],
+                expected_joint1,
+                f"World {world_idx} joint constraint joint1 index incorrect",
+            )
+            self.assertEqual(
+                eq_joint2[constraint_idx + 1],
+                expected_joint2,
+                f"World {world_idx} joint constraint joint2 index incorrect",
+            )
+
+    def test_add_builder_preserves_sparse_attribute_alignment(self):
+        """Sparse equality attributes keep row alignment when merging builders.
+
+        A builder that leaves an optional attribute (e.g. ``mujoco:eq_solref``) at its default
+        stores no explicit value, yet still contributes a row to the equality-constraint count.
+        ``add_builder`` must pad the merged value list to that row count before appending a later
+        builder's explicit value, otherwise the later value collapses onto an earlier row.
+        """
+
+        def make_builder(solref):
+            b = newton.ModelBuilder()
+            body1 = b.add_body()
+            body2 = b.add_body()
+            custom = {"mujoco:eq_solref": wp.vec2(*solref)} if solref is not None else None
+            _add_equality_constraint(
+                b,
+                constraint_type=newton.solvers.SolverMuJoCo.EqType.WELD,
+                body1=body1,
+                body2=body2,
+                custom_attributes=custom,
+            )
+            return b
+
+        default_solref = [0.02, 1.0]
+
+        # Builder A leaves solref at its default (sparse), builder B sets a custom value.
+        main = newton.ModelBuilder()
+        main.add_builder(make_builder(None))
+        main.add_builder(make_builder((9.0, 9.0)))
+        solref = main.finalize().mujoco.eq_solref.numpy()
+        np.testing.assert_allclose(solref[0], default_solref)
+        np.testing.assert_allclose(solref[1], [9.0, 9.0])
+
+        # Two sparse rows followed by a custom one must shift the custom value to row 2.
+        main = newton.ModelBuilder()
+        main.add_builder(make_builder(None))
+        main.add_builder(make_builder(None))
+        main.add_builder(make_builder((7.0, 7.0)))
+        solref = main.finalize().mujoco.eq_solref.numpy()
+        np.testing.assert_allclose(solref[0], default_solref)
+        np.testing.assert_allclose(solref[1], default_solref)
+        np.testing.assert_allclose(solref[2], [7.0, 7.0])
+
+    def test_zero_constraint_model_exposes_shape_stable_equality_arrays(self):
+        """A constraint-free finalized model still exposes the equality namespace arrays.
+
+        The canonical ``model.mujoco.equality_constraint_*`` fields stay shape-stable (empty
+        arrays) even when no constraints are present.
+        """
+        model = newton.ModelBuilder().finalize()
+
+        self.assertEqual(model.mujoco.equality_constraint_count, 0)
+
+        # Each per-row field must be present and read back as an empty (zero-row) array rather
+        # than being absent. Vector-typed fields additionally keep their per-row width.
+        fields = [
+            ("equality_constraint_type", ()),
+            ("equality_constraint_body1", ()),
+            ("equality_constraint_anchor", (3,)),
+            ("equality_constraint_polycoef", ()),
+            ("equality_constraint_enabled", ()),
+            ("equality_constraint_world", ()),
+            ("eq_solref", (2,)),
+            ("eq_solimp", (5,)),
+        ]
+        for name, row_shape in fields:
+            self.assertTrue(hasattr(model.mujoco, name), f"model.mujoco.{name} should exist at zero rows")
+            arr = getattr(model.mujoco, name).numpy()
+            self.assertEqual(arr.shape[0], 0, f"model.mujoco.{name} should be empty at zero rows")
+            self.assertEqual(arr.shape[1:], row_shape, f"model.mujoco.{name} per-row shape should be stable")
+
+    def test_default_equality_constraint_torquescale_is_numeric(self):
+        builder = newton.ModelBuilder()
+
+        base = builder.add_link()
+        link1 = builder.add_link()
+        link2 = builder.add_link()
+
+        joint0 = builder.add_joint_free(parent=-1, child=base)
+        joint1 = builder.add_joint_revolute(parent=base, child=link1, axis=(0, 0, 1))
+        joint2 = builder.add_joint_revolute(parent=link1, child=link2, axis=(0, 0, 1))
+        builder.add_articulation([joint0, joint1, joint2])
+
+        _add_equality_constraint(
+            builder,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.CONNECT,
+            body1=base,
+            body2=link1,
+            anchor=wp.vec3(0.0, 0.0, 0.0),
+        )
+        _add_equality_constraint(
+            builder, constraint_type=newton.solvers.SolverMuJoCo.EqType.JOINT, joint1=joint1, joint2=joint2
+        )
+        _add_equality_constraint(
+            builder, constraint_type=newton.solvers.SolverMuJoCo.EqType.WELD, body1=link1, body2=link2
+        )
+
+        model = builder.finalize()
+        np.testing.assert_allclose(
+            model.mujoco.equality_constraint_torquescale.numpy(),
+            np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            rtol=1e-6,
+        )
+
+    def test_collapse_fixed_joints_with_equality_constraints(self):
+        """Test that equality constraints are properly remapped after collapse_fixed_joints,
+        including correct transformation of anchor points and relpose."""
+        builder = newton.ModelBuilder()
+
+        # Create chain: world -> base (fixed) -> link1 (revolute) -> link2 (fixed) -> link3
+        base = builder.add_link(xform=wp.transform((0, 0, 0)), mass=1.0, label="base")
+        builder.add_shape_box(base, hx=0.5, hy=0.5, hz=0.5)
+
+        link1 = builder.add_link(xform=wp.transform((1, 0, 0)), mass=1.0, label="link1")
+        builder.add_shape_box(link1, hx=0.3, hy=0.3, hz=0.3)
+
+        link2 = builder.add_link(xform=wp.transform((2, 0, 0)), mass=1.0, label="link2")
+        builder.add_shape_box(link2, hx=0.3, hy=0.3, hz=0.3)
+
+        link3 = builder.add_link(xform=wp.transform((3, 0, 0)), mass=1.0, label="link3")
+        builder.add_shape_box(link3, hx=0.3, hy=0.3, hz=0.3)
+
+        # Fixed joint between link1 and link2 - defines the merge transform
+        fixed_parent_xform = wp.transform((0.5, 0.1, 0.0), wp.quat_identity())
+        fixed_child_xform = wp.transform((-0.3, 0.0, 0.0), wp.quat_identity())
+
+        joint_fixed_base = builder.add_joint_fixed(
+            parent=-1,
+            child=base,
+            parent_xform=wp.transform_identity(),
+            child_xform=wp.transform_identity(),
+            label="j_base",
+        )
+        joint1 = builder.add_joint_revolute(
+            parent=base,
+            child=link1,
+            parent_xform=wp.transform((0.5, 0, 0)),
+            child_xform=wp.transform((-0.5, 0, 0)),
+            axis=(0, 0, 1),
+            label="j1",
+        )
+        joint_fixed_link2 = builder.add_joint_fixed(
+            parent=link1,
+            child=link2,
+            parent_xform=fixed_parent_xform,
+            child_xform=fixed_child_xform,
+            label="j2_fixed",
+        )
+        joint3 = builder.add_joint_revolute(
+            parent=link2,
+            child=link3,
+            parent_xform=wp.transform((0.5, 0, 0)),
+            child_xform=wp.transform((-0.5, 0, 0)),
+            axis=(0, 0, 1),
+            label="j3",
+        )
+
+        builder.add_articulation([joint_fixed_base, joint1, joint_fixed_link2, joint3], label="articulation")
+
+        original_anchor = wp.vec3(0.1, 0.2, 0.3)
+        original_relpose = wp.transform((0.5, 0.1, -0.2), wp.quat_from_axis_angle(wp.vec3(0, 0, 1), 0.3))
+
+        eq_connect = _add_equality_constraint(
+            builder,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.CONNECT,
+            body1=base,
+            body2=link3,
+            anchor=wp.vec3(0.5, 0, 0),
+            label="connect_base_link3",
+        )
+        eq_joint = _add_equality_constraint(
+            builder,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.JOINT,
+            joint1=joint1,
+            joint2=joint3,
+            polycoef=[1.0, -1.0, 0, 0, 0],
+            label="couple_j1_j3",
+        )
+        eq_weld = _add_equality_constraint(
+            builder,
+            constraint_type=newton.solvers.SolverMuJoCo.EqType.WELD,
+            body1=link2,
+            body2=link3,
+            anchor=original_anchor,
+            relpose=original_relpose,
+            label="weld_link2_link3",
+        )
+
+        # Compute expected merge transform: parent_xform * inverse(child_xform)
+        merge_xform = fixed_parent_xform * wp.transform_inverse(fixed_child_xform)
+        expected_anchor = original_anchor
+        expected_relpose = merge_xform * original_relpose
+
+        # Verify initial state
+        self.assertEqual(builder.body_count, 4)
+        self.assertEqual(builder.joint_count, 4)
+        self.assertEqual(builder._equality_constraint_count, 3)
+
+        # Collapse fixed joints
+        result = builder.collapse_fixed_joints(verbose=False)
+        body_remap = result["body_remap"]
+        joint_remap = result["joint_remap"]
+
+        self.assertEqual(builder.body_count, 3)
+        self.assertEqual(builder.joint_count, 3)
+
+        # Verify link2 was merged into link1
+        self.assertIn(link2, result["body_merged_parent"])
+        self.assertEqual(result["body_merged_parent"][link2], link1)
+
+        # Check index remapping
+        new_base = body_remap.get(base, base)
+        new_link1 = body_remap.get(link1, link1)
+        new_link3 = body_remap.get(link3, link3)
+        new_joint1 = joint_remap.get(joint1, -1)
+        new_joint3 = joint_remap.get(joint3, -1)
+
+        self.assertNotEqual(new_joint1, -1)
+        self.assertNotEqual(new_joint3, -1)
+        self.assertEqual(_eq_value(builder, "equality_constraint_joint1", eq_joint), new_joint1)
+        self.assertEqual(_eq_value(builder, "equality_constraint_joint2", eq_joint), new_joint3)
+        self.assertEqual(_eq_value(builder, "equality_constraint_body1", eq_connect), new_base)
+        self.assertEqual(_eq_value(builder, "equality_constraint_body2", eq_connect), new_link3)
+        self.assertEqual(_eq_value(builder, "equality_constraint_body1", eq_weld), new_link1)
+        self.assertEqual(_eq_value(builder, "equality_constraint_body2", eq_weld), new_link3)
+
+        # Verify anchor was transformed correctly
+        actual_anchor = _eq_value(builder, "equality_constraint_anchor", eq_weld)
+        np.testing.assert_allclose(
+            [actual_anchor[0], actual_anchor[1], actual_anchor[2]],
+            [expected_anchor[0], expected_anchor[1], expected_anchor[2]],
+            rtol=1e-5,
+            err_msg="Anchor not correctly transformed after body merge",
+        )
+
+        # Verify relpose was transformed correctly
+        actual_relpose = _eq_value(builder, "equality_constraint_relpose", eq_weld)
+        expected_p = wp.transform_get_translation(expected_relpose)
+        expected_q = wp.transform_get_rotation(expected_relpose)
+        actual_p = wp.transform_get_translation(actual_relpose)
+        actual_q = wp.transform_get_rotation(actual_relpose)
+
+        np.testing.assert_allclose(
+            [actual_p[0], actual_p[1], actual_p[2]],
+            [expected_p[0], expected_p[1], expected_p[2]],
+            rtol=1e-5,
+            err_msg="Relpose translation not correctly transformed after body merge",
+        )
+        np.testing.assert_allclose(
+            [actual_q[0], actual_q[1], actual_q[2], actual_q[3]],
+            [expected_q[0], expected_q[1], expected_q[2], expected_q[3]],
+            rtol=1e-5,
+            err_msg="Relpose rotation not correctly transformed after body merge",
+        )
+
+        # Finalize and verify
+        model = builder.finalize()
+        self.assertEqual(model.body_count, 3)
+        self.assertEqual(model.joint_count, 3)
+        self.assertEqual(model.mujoco.equality_constraint_count, 3)
+
+    def test_collapse_fixed_joints_sparse_optional_fields(self):
+        """collapse_fixed_joints must not crash when anchor/relpose are omitted (issue #3054)."""
+        builder = newton.ModelBuilder()
+        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        shape_cfg = newton.ModelBuilder.ShapeConfig(density=1.0)
+
+        root = builder.add_link()
+        builder.add_shape_box(body=root, hx=0.5, hy=0.5, hz=0.5, cfg=shape_cfg)
+        root_joint = builder.add_joint_revolute(parent=-1, child=root, axis=wp.vec3(0.0, 1.0, 0.0))
+
+        merged = builder.add_link()
+        builder.add_shape_box(body=merged, hx=0.2, hy=0.2, hz=0.2, cfg=shape_cfg)
+        fixed_joint = builder.add_joint_fixed(parent=root, child=merged)
+
+        target = builder.add_link()
+        builder.add_shape_box(body=target, hx=0.5, hy=0.5, hz=0.5, cfg=shape_cfg)
+        target_joint = builder.add_joint_revolute(parent=root, child=target, axis=wp.vec3(0.0, 0.0, 1.0))
+
+        builder.add_articulation([root_joint, fixed_joint, target_joint])
+
+        builder.add_custom_values(
+            **{
+                "mujoco:equality_constraint_type": int(newton.solvers.SolverMuJoCo.EqType.WELD),
+                "mujoco:equality_constraint_body1": merged,
+                "mujoco:equality_constraint_body2": target,
+                "mujoco:equality_constraint_enabled": True,
+                "mujoco:equality_constraint_world": 0,
+                # anchor and relpose intentionally omitted -- they have defaults
+            }
+        )
+
+        # Must not raise IndexError
+        builder.collapse_fixed_joints(verbose=False)
+
+        # After collapse the constraint should still be present and finalizable
+        model = builder.finalize()
+        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

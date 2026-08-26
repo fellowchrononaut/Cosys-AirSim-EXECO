@@ -1,0 +1,317 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+###########################################################################
+# Example Basic Joints
+#
+# Shows how to use the ModelBuilder API to programmatically create different
+# joint types: BALL, DISTANCE, PRISMATIC, and REVOLUTE.
+#
+# Command: python -m newton.examples basic_joints
+#
+###########################################################################
+
+import warp as wp
+
+import newton
+import newton.examples
+
+
+@wp.func
+def _ball_body_stays_on_joint_sphere(q: wp.transform, qd: wp.spatial_vector):
+    return abs(wp.length(wp.transform_get_translation(q) - wp.vec3(0.0, 3.0, 2.05)) - 0.75) < 5e-3
+
+
+@wp.func
+def _slider_constrained_motion_has_stopped(q: wp.transform, qd: wp.spatial_vector):
+    return (
+        wp.length(wp.cross(wp.spatial_top(qd), wp.vec3(0.0, 0.0, 1.0))) < 1e-5
+        and wp.length(wp.spatial_bottom(qd)) < 1e-5
+    )
+
+
+class Example:
+    def __init__(self, viewer, args):
+        newton.use_coord_layout_targets = True
+        # setup simulation parameters first
+        self.fps = 100
+        self.frame_dt = 1.0 / self.fps
+        self.sim_time = 0.0
+        self.sim_substeps = 10
+        self.sim_dt = self.frame_dt / self.sim_substeps
+
+        self.viewer = viewer
+        self.args = args
+
+        builder = newton.ModelBuilder()
+
+        static_cfg = newton.ModelBuilder.ShapeConfig()
+        static_cfg.density = 0.0
+
+        # add ground plane
+        builder.add_ground_plane()
+
+        # common geometry settings
+        cuboid_hx = 0.1
+        cuboid_hy = 0.1
+        cuboid_hz = 0.75
+        upper_hz = 0.25 * cuboid_hz
+
+        # layout positions (y-rows)
+        rows = [-3.0, 0.0, 3.0]
+        drop_z = 2.0
+
+        # -----------------------------
+        # REVOLUTE (hinge) joint demo
+        # -----------------------------
+        y = rows[0]
+
+        a_rev = builder.add_link(xform=wp.transform(p=wp.vec3(0.0, y, drop_z + upper_hz), q=wp.quat_identity()))
+        b_rev = builder.add_link(
+            xform=wp.transform(
+                p=wp.vec3(0.0, y, drop_z - cuboid_hz), q=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.15)
+            ),
+            label="b_rev",
+        )
+        builder.add_shape_box(a_rev, hx=cuboid_hx, hy=cuboid_hy, hz=upper_hz, cfg=static_cfg)
+        builder.add_shape_box(b_rev, hx=cuboid_hx, hy=cuboid_hy, hz=cuboid_hz)
+
+        j_fixed_rev = builder.add_joint_fixed(
+            parent=-1,
+            child=a_rev,
+            parent_xform=wp.transform(p=wp.vec3(0.0, y, drop_z + upper_hz), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
+            label="fixed_revolute_anchor",
+        )
+        j_revolute = builder.add_joint_revolute(
+            parent=a_rev,
+            child=b_rev,
+            axis=wp.vec3(1.0, 0.0, 0.0),
+            parent_xform=wp.transform(p=wp.vec3(0.0, 0.0, -upper_hz), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, +cuboid_hz), q=wp.quat_identity()),
+            label="revolute_a_b",
+        )
+        # Create articulation from joints
+        builder.add_articulation([j_fixed_rev, j_revolute], label="revolute_articulation")
+
+        # set initial joint angle
+        builder.joint_q[-1] = wp.pi * 0.5
+
+        # -----------------------------
+        # PRISMATIC (slider) joint demo
+        # -----------------------------
+        y = rows[1]
+        a_pri = builder.add_link(xform=wp.transform(p=wp.vec3(0.0, y, drop_z + upper_hz), q=wp.quat_identity()))
+        b_pri = builder.add_link(
+            xform=wp.transform(
+                p=wp.vec3(0.0, y, drop_z - cuboid_hz), q=wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.12)
+            ),
+            label="b_prismatic",
+        )
+        builder.add_shape_box(a_pri, hx=cuboid_hx, hy=cuboid_hy, hz=upper_hz, cfg=static_cfg)
+        builder.add_shape_box(b_pri, hx=cuboid_hx, hy=cuboid_hy, hz=cuboid_hz)
+
+        j_fixed_pri = builder.add_joint_fixed(
+            parent=-1,
+            child=a_pri,
+            parent_xform=wp.transform(p=wp.vec3(0.0, y, drop_z + upper_hz), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
+            label="fixed_prismatic_anchor",
+        )
+        j_prismatic = builder.add_joint_prismatic(
+            parent=a_pri,
+            child=b_pri,
+            axis=wp.vec3(0.0, 0.0, 1.0),  # slide along Z
+            parent_xform=wp.transform(p=wp.vec3(0.0, 0.0, -upper_hz), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, +cuboid_hz), q=wp.quat_identity()),
+            limit_lower=-0.3,
+            limit_upper=0.3,
+            limit_kd=1.0e3,
+            label="prismatic_a_b",
+        )
+        # Create articulation from joints
+        builder.add_articulation([j_fixed_pri, j_prismatic], label="prismatic_articulation")
+
+        # -----------------------------
+        # BALL joint demo (sphere + cuboid)
+        # -----------------------------
+        y = rows[2]
+        radius = 0.3
+        z_offset = -1.0  # Shift down by 2 units
+
+        # kinematic (massless) sphere as the parent anchor
+        a_ball = builder.add_link(
+            xform=wp.transform(p=wp.vec3(0.0, y, drop_z + radius + cuboid_hz + z_offset), q=wp.quat_identity())
+        )
+        b_ball = builder.add_link(
+            xform=wp.transform(
+                p=wp.vec3(0.0, y, drop_z + radius + z_offset), q=wp.quat_from_axis_angle(wp.vec3(1.0, 1.0, 0.0), 0.1)
+            ),
+            label="b_ball",
+        )
+
+        builder.add_shape_sphere(a_ball, radius=radius, cfg=static_cfg)
+        builder.add_shape_box(b_ball, hx=cuboid_hx, hy=cuboid_hy, hz=cuboid_hz)
+
+        # Connect parent to world
+        j_fixed_ball = builder.add_joint_fixed(
+            parent=-1,
+            child=a_ball,
+            parent_xform=wp.transform(p=wp.vec3(0.0, y, drop_z + radius + cuboid_hz + z_offset), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
+            label="fixed_ball_anchor",
+        )
+        j_ball = builder.add_joint_ball(
+            parent=a_ball,
+            child=b_ball,
+            parent_xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.0), q=wp.quat_identity()),
+            child_xform=wp.transform(p=wp.vec3(0.0, 0.0, +cuboid_hz), q=wp.quat_identity()),
+            label="ball_a_b",
+        )
+
+        # Create articulation from joints
+        builder.add_articulation([j_fixed_ball, j_ball], label="ball_articulation")
+
+        # set initial joint angle
+        builder.joint_q[-4:] = wp.quat_rpy(0.5, 0.6, 0.7)
+
+        # finalize model
+        builder.color()
+        self.model = builder.finalize()
+        # SolverVBD uses model.body_q as its structural rest pose, so keep it
+        # consistent with the joint_q edits above before constructing the solver.
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
+
+        solver_type = getattr(args, "solver", "xpbd") if args is not None else "xpbd"
+        if solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=2,
+                rigid_compliant_alm=True,
+                rigid_joint_linear_ke=1.0e6,
+                rigid_joint_angular_ke=1.0e6,
+            )
+        else:
+            self.solver = newton.solvers.SolverXPBD(self.model)
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.control = self.model.control()
+
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+
+        self.collision_pipeline = newton.CollisionPipeline(self.model)
+        self.contacts = self.collision_pipeline.contacts()
+
+        self.viewer.set_model(self.model)
+
+        self.capture()
+
+    def capture(self):
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
+
+    def simulate(self):
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+
+            # apply forces to the model
+            self.viewer.apply_forces(self.state_0)
+
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+
+            # swap states
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def step(self):
+        if self.graph:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+
+        self.sim_time += self.frame_dt
+
+    def test_post_step(self):
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "revolute motion in plane",
+            lambda q, qd: wp.length(abs(wp.cross(wp.spatial_bottom(qd), wp.vec3(1.0, 0.0, 0.0)))) < 1e-5,
+            indices=[self.model.body_label.index("b_rev")],
+        )
+
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "linear motion on axis",
+            _slider_constrained_motion_has_stopped,
+            indices=[self.model.body_label.index("b_prismatic")],
+        )
+
+    def test_final(self):
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "ball body stays on joint sphere",
+            _ball_body_stays_on_joint_sphere,
+            indices=[self.model.body_label.index("b_ball")],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "static bodies are not moving",
+            lambda q, qd: max(abs(qd)) == 0.0,
+            indices=[2, 4],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "fixed link body has come to a rest",
+            lambda q, qd: max(abs(qd)) < 1e-2,
+            indices=[0],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "slider link constrained motion has come to a rest",
+            _slider_constrained_motion_has_stopped,
+            indices=[3],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "slider link free-axis motion is slow",
+            lambda q, qd: abs(wp.dot(wp.spatial_top(qd), wp.vec3(0.0, 0.0, 1.0))) < 1e-2,
+            indices=[3],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "movable links are not moving too fast",
+            lambda q, qd: max(abs(qd)) < 3.0,
+            indices=[1, 5],
+        )
+
+    def render(self):
+        self.viewer.begin_frame(self.sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.log_contacts(self.contacts, self.state_0)
+        self.viewer.end_frame()
+
+
+if __name__ == "__main__":
+    # Parse arguments and initialize viewer
+    parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--solver",
+        type=str,
+        choices=["xpbd", "vbd"],
+        default="xpbd",
+        help="Solver backend to use.",
+    )
+    viewer, args = newton.examples.init(parser)
+
+    # Create viewer and run
+    newton.examples.run(Example(viewer, args), args)

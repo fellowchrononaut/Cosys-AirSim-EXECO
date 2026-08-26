@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from typing import Any
+
+import numpy as np
+import warp as wp
+
+from ..core.types import Axis
+from .download_assets import clear_git_cache, download_asset
+from .texture import load_texture, normalize_texture
+from .topology import topological_sort, topological_sort_undirected
+
+
+def check_conditional_graph_support():
+    """
+    Check if conditional graph support is available in the current world.
+
+    Returns:
+        bool: True if conditional graph support is available, False otherwise.
+    """
+    return wp.is_conditional_graph_supported()
+
+
+def is_graph_capture_allocation_enabled(device) -> bool:
+    """Whether device allocation during graph capture is safe on ``device``.
+
+    CUDA needs its stream-ordered memory pool active so that
+    ``cudaMallocAsync`` can be captured as a memory-alloc node in the graph;
+    for CPU the concept does not apply -- plain host allocation is always
+    safe during CPU graph capture -- so this always returns ``True`` for CPU
+    devices. Solvers that grow internal buffers on demand should call this
+    before raising a "cannot allocate during capture" error.
+
+    Args:
+        device: A Warp device or device identifier.
+
+    Returns:
+        ``True`` if allocation during graph capture is currently safe on
+        ``device``; ``False`` otherwise.
+    """
+    device = wp.get_device(device)
+    if device.is_cpu:
+        return True
+    return device.is_mempool_enabled
+
+
+def compute_world_offsets(world_count: int, spacing: tuple[float, float, float], up_axis: Any = None):
+    """
+    Compute positional offsets for multiple worlds arranged in a grid.
+
+    This function computes 3D offsets for arranging multiple worlds based on the provided spacing.
+    The worlds are arranged in a regular grid pattern, with the layout automatically determined
+    based on the non-zero dimensions in the spacing tuple.
+
+    Args:
+        world_count: The number of worlds to arrange.
+        spacing: The spacing between worlds along each axis.
+            Non-zero values indicate active dimensions for the grid layout.
+        up_axis: The up axis to ensure worlds are not shifted below the ground plane.
+            If provided, the offset correction along this axis will be zero.
+
+    Returns:
+        np.ndarray: An array of shape (world_count, 3) containing the 3D offsets for each world.
+    """
+    # Handle edge case
+    if world_count <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    # Compute positional offsets per world
+    spacing = np.array(spacing, dtype=np.float32)
+    nonzeros = np.nonzero(spacing)[0]
+    num_dim = nonzeros.shape[0]
+
+    if num_dim > 0:
+        side_length = int(np.ceil(world_count ** (1.0 / num_dim)))
+        spacings = []
+
+        if num_dim == 1:
+            for i in range(world_count):
+                spacings.append(i * spacing)
+        elif num_dim == 2:
+            for i in range(world_count):
+                d0 = i // side_length
+                d1 = i % side_length
+                offset = np.zeros(3)
+                offset[nonzeros[0]] = d1 * spacing[nonzeros[0]]
+                offset[nonzeros[1]] = d0 * spacing[nonzeros[1]]
+                spacings.append(offset)
+        elif num_dim == 3:
+            for i in range(world_count):
+                d0 = i // (side_length * side_length)
+                d1 = (i // side_length) % side_length
+                d2 = i % side_length
+                offset = np.zeros(3)
+                offset[0] = d2 * spacing[0]
+                offset[1] = d1 * spacing[1]
+                offset[2] = d0 * spacing[2]
+                spacings.append(offset)
+
+        spacings = np.array(spacings, dtype=np.float32)
+    else:
+        spacings = np.zeros((world_count, 3), dtype=np.float32)
+
+    # Center the grid
+    min_offsets = np.min(spacings, axis=0)
+    correction = min_offsets + (np.max(spacings, axis=0) - min_offsets) / 2.0
+
+    # Ensure the worlds are not shifted below the ground plane
+    if up_axis is not None:
+        correction[Axis.from_any(up_axis)] = 0.0
+
+    spacings -= correction
+    return spacings
+
+
+__all__ = [
+    "check_conditional_graph_support",
+    "clear_git_cache",
+    "compute_world_offsets",
+    "download_asset",
+    "is_graph_capture_allocation_enabled",
+    "load_texture",
+    "normalize_texture",
+    "topological_sort",
+    "topological_sort_undirected",
+]

@@ -1,0 +1,462 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import warp as wp
+
+from ..geometry.support_function import GenericShapeData, GeoTypeEx
+
+
+def load_heightfield_elevation(
+    filename: str,
+    nrow: int,
+    ncol: int,
+) -> np.ndarray:
+    """Load elevation data from a PNG or binary file.
+
+    Supports two formats following MuJoCo conventions:
+    - PNG: Grayscale image where white=high, black=low
+      (normalized to [0, 1])
+    - Binary: MuJoCo custom format with int32 header
+      (nrow, ncol) followed by float32 data
+
+    Args:
+        filename: Path to the heightfield file (PNG or binary).
+        nrow: Expected number of rows.
+        ncol: Expected number of columns.
+
+    Returns:
+        (nrow, ncol) float32 array of elevation values.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext == ".png":
+        from PIL import Image
+
+        img = Image.open(filename).convert("L")
+        data = np.array(img, dtype=np.float32) / 255.0
+        if data.shape != (nrow, ncol):
+            raise ValueError(f"PNG heightfield dimensions {data.shape} don't match expected ({nrow}, {ncol})")
+        return data
+
+    # Default: MuJoCo binary format
+    # Header: (int32) nrow, (int32) ncol; payload: float32[nrow*ncol]
+    with open(filename, "rb") as f:
+        header = np.fromfile(f, dtype=np.int32, count=2)
+        if header.size != 2 or header[0] <= 0 or header[1] <= 0:
+            raise ValueError(
+                f"Invalid binary heightfield header in '{filename}': expected 2 positive int32 values, got {header}"
+            )
+        expected_count = int(header[0]) * int(header[1])
+        data = np.fromfile(f, dtype=np.float32, count=expected_count)
+        if data.size != expected_count:
+            raise ValueError(
+                f"Binary heightfield '{filename}' payload size mismatch: "
+                f"expected {expected_count} float32 values for {header[0]}x{header[1]} grid, got {data.size}"
+            )
+    return data.reshape(header[0], header[1])
+
+
+@wp.kernel
+def _rasterize_mesh_kernel(
+    mesh_id: wp.uint64,
+    x_min: wp.float32,
+    y_min: wp.float32,
+    dx: wp.float32,
+    dy: wp.float32,
+    z_start: wp.float32,
+    max_dist: wp.float32,
+    z_floor: wp.float32,
+    heights: wp.array2d[wp.float32],
+):
+    row, col = wp.tid()
+    origin = wp.vec3(x_min + wp.float32(col) * dx, y_min + wp.float32(row) * dy, z_start)
+    query = wp.mesh_query_ray(mesh_id, origin, wp.vec3(0.0, 0.0, -1.0), max_dist)
+    heights[row, col] = wp.where(query.result, z_start - query.t, z_floor)
+
+
+def rasterize_mesh_to_heightfield(
+    mesh: wp.Mesh,
+    resolution: float,
+    *,
+    max_cells_per_axis: int = 4096,
+) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """Rasterize a triangle mesh into a heightfield elevation grid.
+
+    Rays are cast straight down onto the mesh on a regular grid spanning the mesh's
+    XY bounding box. The grid follows Newton's heightfield convention (see
+    :class:`~newton.Heightfield`): ``heights[row, col]`` samples the surface at
+    ``x = x_min + col * dx`` (columns map to X) and ``y = y_min + row * dy`` (rows
+    map to Y). Rays that miss the mesh fall back to the mesh's minimum Z so that
+    nothing collides in gaps. This is only meaningful for surfaces that are
+    single-valued in Z (e.g. locomotion terrain).
+
+    Args:
+        mesh: Triangle mesh to rasterize. Its vertices are taken in their current
+            frame; transform the mesh into world space beforehand if needed.
+        resolution: Horizontal grid spacing [m]. Smaller values preserve more
+            detail at the cost of a larger grid.
+        max_cells_per_axis: Upper bound on grid rows/columns. If the mesh extent
+            would exceed this, the effective resolution is coarsened to fit.
+
+    Returns:
+        A tuple ``(heights, bounds)`` where ``heights`` is a ``(nrow, ncol)``
+        float32 array of world-space elevations [m] and ``bounds`` is the mesh's
+        XY bounding box as ``(x_min, y_min, x_max, y_max)`` [m].
+    """
+    if resolution <= 0.0:
+        raise ValueError(f"resolution must be positive, got {resolution}")
+    if max_cells_per_axis < 2:
+        raise ValueError(f"max_cells_per_axis must be at least 2, got {max_cells_per_axis}")
+
+    points = mesh.points.numpy()
+    x_min, y_min, z_min = (float(v) for v in points.min(axis=0))
+    x_max, y_max, z_max = (float(v) for v in points.max(axis=0))
+    size_x, size_y = x_max - x_min, y_max - y_min
+
+    ncol = max(2, min(int(round(size_x / resolution)) + 1, max_cells_per_axis))
+    nrow = max(2, min(int(round(size_y / resolution)) + 1, max_cells_per_axis))
+    dx = size_x / (ncol - 1)
+    dy = size_y / (nrow - 1)
+
+    z_start = z_max + 1.0
+    max_dist = (z_start - z_min) + 1.0
+
+    device = mesh.points.device
+    heights = wp.empty((nrow, ncol), dtype=wp.float32, device=device)
+    wp.launch(
+        _rasterize_mesh_kernel,
+        dim=(nrow, ncol),
+        inputs=[mesh.id, x_min, y_min, dx, dy, z_start, max_dist, z_min],
+        outputs=[heights],
+        device=device,
+    )
+    return heights.numpy(), (x_min, y_min, x_max, y_max)
+
+
+@wp.struct
+class HeightfieldData:
+    """Per-shape heightfield metadata for collision kernels.
+
+    The actual elevation data is stored in a separate concatenated array
+    passed to kernels. ``data_offset`` is the starting index into that array.
+    """
+
+    data_offset: wp.int32  # Offset into the concatenated elevation array
+    nrow: wp.int32
+    ncol: wp.int32
+    hx: wp.float32  # Half-extent X
+    hy: wp.float32  # Half-extent Y
+    min_z: wp.float32
+    max_z: wp.float32
+
+
+def create_empty_heightfield_data() -> HeightfieldData:
+    """Create an empty HeightfieldData for non-heightfield shapes."""
+    hd = HeightfieldData()
+    hd.data_offset = 0
+    hd.nrow = 0
+    hd.ncol = 0
+    hd.hx = 0.0
+    hd.hy = 0.0
+    hd.min_z = 0.0
+    hd.max_z = 0.0
+    return hd
+
+
+@wp.func
+def _heightfield_surface_query(
+    hfd: HeightfieldData,
+    elevation_data: wp.array[wp.float32],
+    pos: wp.vec3,
+) -> tuple[float, wp.vec3, float]:
+    """Core heightfield surface query returning (plane_dist, normal, lateral_dist_sq).
+
+    Computes the signed distance to the nearest triangle plane at the closest
+    point within the heightfield XY extent, plus the squared lateral distance
+    from the query point to that extent boundary.
+    """
+    if hfd.nrow <= 1 or hfd.ncol <= 1:
+        return 1.0e10, wp.vec3(0.0, 0.0, 1.0), 0.0
+
+    dx = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1)
+    dy = 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
+    z_range = hfd.max_z - hfd.min_z
+
+    # Clamp to heightfield XY extent and track lateral overshoot
+    cx = wp.clamp(pos[0], -hfd.hx, hfd.hx)
+    cy = wp.clamp(pos[1], -hfd.hy, hfd.hy)
+    out_x = pos[0] - cx
+    out_y = pos[1] - cy
+    lateral_dist_sq = out_x * out_x + out_y * out_y
+
+    col_f = (cx + hfd.hx) / dx
+    row_f = (cy + hfd.hy) / dy
+    col_f = wp.clamp(col_f, 0.0, wp.float32(hfd.ncol - 1))
+    row_f = wp.clamp(row_f, 0.0, wp.float32(hfd.nrow - 1))
+
+    col = wp.min(wp.int32(col_f), hfd.ncol - 2)
+    row = wp.min(wp.int32(row_f), hfd.nrow - 2)
+    fx = col_f - wp.float32(col)
+    fy = row_f - wp.float32(row)
+
+    base = hfd.data_offset
+    h00 = hfd.min_z + elevation_data[base + row * hfd.ncol + col] * z_range
+    h10 = hfd.min_z + elevation_data[base + row * hfd.ncol + col + 1] * z_range
+    h01 = hfd.min_z + elevation_data[base + (row + 1) * hfd.ncol + col] * z_range
+    h11 = hfd.min_z + elevation_data[base + (row + 1) * hfd.ncol + col + 1] * z_range
+
+    x0 = -hfd.hx + wp.float32(col) * dx
+    y0 = -hfd.hy + wp.float32(row) * dy
+
+    if fx >= fy:
+        v0 = wp.vec3(x0, y0, h00)
+        e1 = wp.vec3(dx, 0.0, h10 - h00)
+        e2 = wp.vec3(dx, dy, h11 - h00)
+    else:
+        v0 = wp.vec3(x0, y0, h00)
+        e1 = wp.vec3(dx, dy, h11 - h00)
+        e2 = wp.vec3(0.0, dy, h01 - h00)
+
+    normal = wp.normalize(wp.cross(e1, e2))
+    d_plane = wp.dot(pos - v0, normal)
+    return d_plane, normal, lateral_dist_sq
+
+
+@wp.func
+def sample_sdf_heightfield(
+    hfd: HeightfieldData,
+    elevation_data: wp.array[wp.float32],
+    pos: wp.vec3,
+) -> float:
+    """On-the-fly signed distance to a piecewise-planar heightfield surface.
+
+    Positive above the surface, negative below. Exact for the piecewise-linear
+    triangulation when the query point projects inside the heightfield XY extent.
+    Outside the extent the lateral gap is folded in, yielding a positive distance
+    that prevents false contacts.
+
+    Note: This means objects penetrating near the boundary will experience a
+    discontinuous contact loss at the edge (the distance jumps from negative to
+    positive). This is an intentional tradeoff to avoid ghost contacts outside
+    the heightfield footprint.
+    """
+    d_plane, _normal, lateral_dist_sq = _heightfield_surface_query(hfd, elevation_data, pos)
+    if lateral_dist_sq > 0.0:
+        return wp.sqrt(lateral_dist_sq + d_plane * d_plane)
+    return d_plane
+
+
+@wp.func
+def sample_sdf_grad_heightfield(
+    hfd: HeightfieldData,
+    elevation_data: wp.array[wp.float32],
+    pos: wp.vec3,
+) -> tuple[float, wp.vec3]:
+    """On-the-fly signed distance and gradient for a heightfield surface.
+
+    Inside the XY extent the gradient is the triangle face normal. Outside,
+    it blends the face normal with the lateral displacement direction.
+    """
+    d_plane, normal, lateral_dist_sq = _heightfield_surface_query(hfd, elevation_data, pos)
+    if lateral_dist_sq > 0.0:
+        dist = wp.sqrt(lateral_dist_sq + d_plane * d_plane)
+        cx = wp.clamp(pos[0], -hfd.hx, hfd.hx)
+        cy = wp.clamp(pos[1], -hfd.hy, hfd.hy)
+        lateral = wp.vec3(pos[0] - cx, pos[1] - cy, 0.0)
+        raw_grad = lateral + d_plane * normal
+        if wp.length_sq(raw_grad) > 1.0e-20:
+            grad = wp.normalize(raw_grad)
+        else:
+            grad = wp.vec3(0.0, 0.0, 1.0)
+        return dist, grad
+    return d_plane, normal
+
+
+@wp.func
+def get_triangle_shape_from_heightfield(
+    hfd: HeightfieldData,
+    elevation_data: wp.array[wp.float32],
+    X_ws: wp.transform,
+    tri_idx: int,
+) -> tuple[GenericShapeData, wp.vec3]:
+    """Extract a triangle from a heightfield by packed triangle index.
+
+    ``tri_idx`` encodes ``(row * (ncol - 1) + col) * 2 + tri_sub``.
+    Returns ``(GenericShapeData, v0_world)`` in the same format as
+    :func:`get_triangle_shape_from_mesh`, so GJK/MPR works unchanged.
+
+    Triangle layout for cell (row, col)::
+
+        p01 --- p11
+         |  \\ 1  |
+         | 0  \\  |
+        p00 --- p10
+
+        tri_sub=0: (p00, p10, p11)
+        tri_sub=1: (p00, p11, p01)
+    """
+    # Decode packed triangle index
+    cell_idx = tri_idx // 2
+    tri_sub = tri_idx - cell_idx * 2
+    cols = hfd.ncol - 1
+    row = cell_idx // cols
+    col = cell_idx - row * cols
+
+    # Grid spacing
+    dx = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1)
+    dy = 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
+    z_range = hfd.max_z - hfd.min_z
+
+    # Corner positions in local space
+    x0 = -hfd.hx + wp.float32(col) * dx
+    x1 = x0 + dx
+    y0 = -hfd.hy + wp.float32(row) * dy
+    y1 = y0 + dy
+
+    # Read elevation values from concatenated array
+    base = hfd.data_offset
+    h00 = elevation_data[base + row * hfd.ncol + col]
+    h10 = elevation_data[base + row * hfd.ncol + (col + 1)]
+    h01 = elevation_data[base + (row + 1) * hfd.ncol + col]
+    h11 = elevation_data[base + (row + 1) * hfd.ncol + (col + 1)]
+
+    # Convert to world Z: min_z + h * (max_z - min_z)
+    z00 = hfd.min_z + h00 * z_range
+    z10 = hfd.min_z + h10 * z_range
+    z01 = hfd.min_z + h01 * z_range
+    z11 = hfd.min_z + h11 * z_range
+
+    # Local-space corner positions
+    p00 = wp.vec3(x0, y0, z00)
+    p10 = wp.vec3(x1, y0, z10)
+    p01 = wp.vec3(x0, y1, z01)
+    p11 = wp.vec3(x1, y1, z11)
+
+    # Select triangle vertices
+    if tri_sub == 0:
+        v0_local = p00
+        v1_local = p10
+        v2_local = p11
+    else:
+        v0_local = p00
+        v1_local = p11
+        v2_local = p01
+
+    # Transform to world space
+    v0_world = wp.transform_point(X_ws, v0_local)
+
+    # Create triangle prism shape data with edges in heightfield-LOCAL space.
+    # The narrow phase passes orientation_a = heightfield rotation, so the
+    # support function operates in the heightfield's local frame where -Z
+    # is always the down direction — no extra arguments needed.
+    shape_data = GenericShapeData()
+    shape_data.shape_type = int(GeoTypeEx.TRIANGLE_PRISM)
+    shape_data.scale = v1_local - v0_local  # B - A in local space
+    shape_data.auxiliary = v2_local - v0_local  # C - A in local space
+    shape_data.center = wp.vec3(0.0, 0.0, 0.0)
+
+    return shape_data, v0_world
+
+
+@wp.func
+def heightfield_vs_convex_midphase(
+    hfield_shape: int,
+    other_shape: int,
+    hfd: HeightfieldData,
+    shape_transform: wp.array[wp.transform],
+    shape_collision_aabb_lower: wp.array[wp.vec3],
+    shape_collision_aabb_upper: wp.array[wp.vec3],
+    shape_data: wp.array[wp.vec4],
+    shape_gap: wp.array[float],
+    triangle_pairs: wp.array[wp.vec3i],
+    triangle_pairs_count: wp.array[int],
+):
+    """Find heightfield triangles that overlap with a convex shape's AABB.
+
+    Projects the convex shape's local AABB into heightfield-local space and
+    emits triangle pairs for each overlapping grid cell (two triangles per
+    cell).
+
+    The convex shape's *local* AABB (from
+    :attr:`Model.shape_collision_aabb_lower`/``upper``) is used rather than
+    a sphere centered on the shape's local origin.  Many imported assets
+    place collision hulls far from their body/shape frame, so an
+    origin-centered bounding sphere can fail to enclose the hull and miss
+    real heightfield collisions.  The local AABB is exact regardless of
+    where the authoring origin sits relative to the geometry.
+
+    Args:
+        hfield_shape: Index of the heightfield shape.
+        other_shape: Index of the convex shape.
+        hfd: Heightfield data struct.
+        shape_transform: World-space transforms for all shapes.
+        shape_collision_aabb_lower: Local-space AABB lower bounds for each
+            shape (scale already baked in).
+        shape_collision_aabb_upper: Local-space AABB upper bounds for each
+            shape (scale already baked in).
+        shape_data: Shape data array containing per-shape margins.
+        shape_gap: Per-shape contact gaps.
+        triangle_pairs: Output buffer for ``(hfield_shape, other_shape, tri_idx)`` triples.
+        triangle_pairs_count: Atomic counter for emitted triangle pairs.
+    """
+    X_hfield_ws = shape_transform[hfield_shape]
+    X_other_ws = shape_transform[other_shape]
+    X_other_in_hfield = wp.transform_multiply(wp.transform_inverse(X_hfield_ws), X_other_ws)
+
+    other_pos = wp.transform_get_translation(X_other_in_hfield)
+    other_rot = wp.transform_get_rotation(X_other_in_hfield)
+
+    local_lo = shape_collision_aabb_lower[other_shape]
+    local_hi = shape_collision_aabb_upper[other_shape]
+    local_center = 0.5 * (local_lo + local_hi)
+    local_half = 0.5 * (local_hi - local_lo)
+
+    center_in_hfield = wp.quat_rotate(other_rot, local_center) + other_pos
+
+    # Rotated AABB half-extents in heightfield-local space.  Standard
+    # OBB-to-AABB projection: |R| * half_extents, where R is the
+    # rotation from other-local to heightfield-local.
+    r0 = wp.quat_rotate(other_rot, wp.vec3(1.0, 0.0, 0.0))
+    r1 = wp.quat_rotate(other_rot, wp.vec3(0.0, 1.0, 0.0))
+    r2 = wp.quat_rotate(other_rot, wp.vec3(0.0, 0.0, 1.0))
+    half_in_hfield = wp.vec3(
+        wp.abs(r0[0]) * local_half[0] + wp.abs(r1[0]) * local_half[1] + wp.abs(r2[0]) * local_half[2],
+        wp.abs(r0[1]) * local_half[0] + wp.abs(r1[1]) * local_half[1] + wp.abs(r2[1]) * local_half[2],
+        wp.abs(r0[2]) * local_half[0] + wp.abs(r1[2]) * local_half[1] + wp.abs(r2[2]) * local_half[2],
+    )
+
+    gap_sum = shape_gap[hfield_shape] + shape_gap[other_shape]
+    margin_sum = shape_data[hfield_shape][3] + shape_data[other_shape][3]
+    contact_threshold = gap_sum + margin_sum
+    threshold_vec = wp.vec3(contact_threshold, contact_threshold, contact_threshold)
+
+    aabb_lower = center_in_hfield - half_in_hfield - threshold_vec
+    aabb_upper = center_in_hfield + half_in_hfield + threshold_vec
+
+    # Map AABB to grid cell indices
+    dx = 2.0 * hfd.hx / wp.float32(hfd.ncol - 1)
+    dy = 2.0 * hfd.hy / wp.float32(hfd.nrow - 1)
+
+    col_min_f = (aabb_lower[0] + hfd.hx) / dx
+    col_max_f = (aabb_upper[0] + hfd.hx) / dx
+    row_min_f = (aabb_lower[1] + hfd.hy) / dy
+    row_max_f = (aabb_upper[1] + hfd.hy) / dy
+
+    col_min = wp.max(wp.int32(wp.floor(col_min_f)), 0)
+    col_max = wp.min(wp.int32(wp.floor(col_max_f)), hfd.ncol - 2)
+    row_min = wp.max(wp.int32(wp.floor(row_min_f)), 0)
+    row_max = wp.min(wp.int32(wp.floor(row_max_f)), hfd.nrow - 2)
+
+    cols = hfd.ncol - 1
+    for r in range(row_min, row_max + 1):
+        for c in range(col_min, col_max + 1):
+            for tri_sub in range(2):
+                tri_idx = (r * cols + c) * 2 + tri_sub
+                out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+                if out_idx < triangle_pairs.shape[0]:
+                    triangle_pairs[out_idx] = wp.vec3i(hfield_shape, other_shape, tri_idx)

@@ -11,9 +11,11 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include <signal.h>
 #include "Materials/MaterialInterface.h"
 #include "Engine/World.h"
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -450,6 +452,7 @@ void ASimModeWorldBase::initializeForPlay()
         // be forced into. The world stamp is simply all-zero, and the sidecar compares whatever it
         // is given — a Legacy run is one epoch that never changes.
         openMpmSidecarLink();
+        startMpmSidecarProcess();
         publishMpmRegistry();
         return;
     }
@@ -475,6 +478,7 @@ void ASimModeWorldBase::initializeForPlay()
         // ⚠ Opened here — after the commit, because collider ids are only final once every
         // vehicle has joined — but the REGISTRY is published further down, after the world exists.
         openMpmSidecarLink();
+        startMpmSidecarProcess();
 
         // Assemble the world with its sole executor stopped. Manifest publication must complete
         // before any backend is allowed to advance, and the coordinator must be attached at
@@ -533,6 +537,12 @@ void ASimModeWorldBase::registerPhysicsBody(msr::airlib::VehicleSimApiBase* phys
 
 void ASimModeWorldBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    // ⚠ THE CHILD GOES FIRST. It reads the segments this object owns, and stopping it before the
+    // world is torn down is what makes "the sidecar cannot outlive its world" true rather than
+    // merely intended — the whole point of D14.
+    clearMpmImpulses();
+    stopMpmSidecarProcess();
+
     // Stop and join the sole executor before destroying either its world or coordinator callbacks.
     if (physics_world_)
         physics_world_->stopAsyncUpdator();
@@ -728,6 +738,7 @@ void ASimModeWorldBase::Tick(float DeltaSeconds)
     // the sidecar can consume — and it keeps this work off the thread whose period is the thing
     // being protected.
     publishMpmState();
+    applyMpmImpulses();
     updateMpmParticleRender();
 
     Super::Tick(DeltaSeconds);
@@ -774,6 +785,101 @@ TAutoConsoleVariable<int32> CVarMpmRenderMax(
 TAutoConsoleVariable<FString> CVarMpmRenderColor(
     TEXT("airsim.MpmRenderColor"), TEXT("0.72,0.56,0.33"),
     TEXT("Linear RGB of the MPM sand, comma separated (e.g. 0.72,0.56,0.33). Appearance only."),
+    ECVF_Default);
+
+/// Plan §M2 requires a timeout or epoch mismatch to PAUSE with a diagnostic, not merely to be
+/// reported. Reporting was what existed: an Error line once per episode while the sim carried on
+/// pushing sand with a sidecar that was no longer keeping up, or was in a world that no longer
+/// existed. The verb in the exit criterion is the point.
+TAutoConsoleVariable<int32> CVarMpmPauseOnStall(
+    TEXT("airsim.MpmPauseOnStall"), 1,
+    TEXT("Pause the simulation when the MPM sidecar stalls or reports a wrong world.\n"
+         "0: report only (pre-M2 behaviour)\n1: pause, per plan §M2"),
+    ECVF_Default);
+
+/// Plan §M2: "A sidecar restart forces global reset because MPM environmental memory was lost."
+/// A restarted sidecar rebuilds a PRISTINE bed while the rigid world carries on from wherever the
+/// robot had driven — so the rover's history includes deforming sand that no longer exists. The two
+/// halves disagree about the past, and only a global reset makes them agree again.
+/// Plan M3/M4. ⚠ EXPERIMENTAL: the articulated effective-inertia question in plan 11.1 is open, so
+/// a run with this enabled records LaggedImpulseTwoWay and never TwoWay.
+TAutoConsoleVariable<int32> CVarMpmTwoWay(
+    TEXT("airsim.MpmTwoWay"), 0,
+    TEXT("Apply the sand's reaction impulses back to the rover.\n0: off (M2 behaviour)\n"
+         "1: on — requires the sidecar to be running with --two-way"),
+    ECVF_Default);
+
+/// ⚠ NEITHER CONTRACT IS OBVIOUSLY RIGHT, which is why both exist. Newton reports impulses (N.s)
+/// accumulated over its own frame; both rigid backends accept newtons. Dividing by the wrong
+/// interval scales every force the sand applies, silently and plausibly.
+TAutoConsoleVariable<int32> CVarMpmImpulseContract(
+    TEXT("airsim.MpmImpulseContract"), 0,
+    TEXT("How an MPM impulse becomes a rigid-body force.\n"
+         "0: normalized force-hold — F = J / measured sim seconds since the last impulse, held "
+         "until the next one, cleared when stale\n"
+         "1: exact-once — F = J / one tick, applied for a single tick then cleared"),
+    ECVF_Default);
+
+/// Newton's own coupled-proxy solver never applies a harvested force raw — it blends it with the
+/// previous one (`proxy_utils.py: blend_proxy_forces_kernel`):
+///
+///     force = relaxation * harvested + (1 - relaxation) * previous
+///
+/// ⚠ Upstream defaults this to 1.0 (raw) and documents a usable floor of 0.1, so 1.0 is kept here
+/// too: a different default would be a silent physics choice made by this file rather than by an
+/// operator. Lower it when the coupling oscillates — which it does, because we also still have the
+/// double-support problem D10 describes, and relaxation bounds that fight without resolving it.
+TAutoConsoleVariable<float> CVarMpmImpulseRelaxation(
+    TEXT("airsim.MpmImpulseRelaxation"), 1.0f,
+    TEXT("Blend factor for the sand's reaction: 1.0 applies each frame's force raw, lower values "
+         "carry more of the previous frame. Newton's coupled proxy documents 0.1 as the floor."),
+    ECVF_Default);
+
+TAutoConsoleVariable<float> CVarMpmImpulseMaxForce(
+    TEXT("airsim.MpmImpulseMaxForce"), 150.0f,
+    TEXT("Refuse a sand reaction above this many newtons on any one link, and clear the force. A "
+         "guard against runaway energy injection, not a tuning knob — hitting it means the coupling "
+         "is unstable. 0 disables the check."),
+    ECVF_Default);
+
+TAutoConsoleVariable<float> CVarMpmImpulseScale(
+    TEXT("airsim.MpmImpulseScale"), 1.0f,
+    TEXT("Debug multiplier on the sand's reaction. ⚠ Anything but 1.0 makes the run physically "
+         "meaningless and is for bisecting instability only."),
+    ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarMpmResetOnSidecarRestart(
+    TEXT("airsim.MpmResetOnSidecarRestart"), 1,
+    TEXT("What to do when the MPM sidecar is replaced by a fresh one mid-run.\n"
+         "0: halt and let the operator decide\n1: force a global reset, per plan §M2"),
+    ECVF_Default);
+
+/// ⚠ AN EPOCH MISMATCH RIGHT AFTER OUR OWN RESET IS THE RESET PROPAGATING, NOT A FAULT. The sim
+/// bumps the epoch, republishes, and for a few seconds the sidecar is still reporting the old one
+/// while it tears down a scene and builds a new bed. Halting during that window would fire an
+/// Error and pause the world on every successful reset — and with a lockstep firmware present, a
+/// pause is exactly what must not happen. Measured rebuild: ~10-20 s at these patch sizes.
+TAutoConsoleVariable<float> CVarMpmEpochGraceSeconds(
+    TEXT("airsim.MpmEpochGraceSeconds"), 30.0f,
+    TEXT("How long after a world-stamp change the sidecar may still report the old epoch before "
+         "that counts as a fault rather than a rebuild in progress."),
+    ECVF_Default);
+
+TAutoConsoleVariable<float> CVarMpmStallSeconds(
+    TEXT("airsim.MpmStallSeconds"), 3.0f,
+    TEXT("How long the sidecar may stay beyond its lag budget before the sim pauses to let it "
+         "catch up. Ordinary driving runs 6-16 steps behind a budget of 200, so this is about a "
+         "stopped sidecar, not a slow one."),
+    ECVF_Default);
+
+/// ⚠ The published radius is ALREADY the solver's true particle radius, so drawing at scale 1 is
+/// dimensionally correct and still looks nothing like the offline Newton render — because that
+/// render draws every particle and this one draws a few percent of them. Sand at 6.7% density reads
+/// as scattered grit, not a bed.
+TAutoConsoleVariable<int32> CVarMpmRenderMatchDensity(
+    TEXT("airsim.MpmRenderMatchDensity"), 1,
+    TEXT("Compensate the drawn particle size for decimation, so a sampled view occupies the same "
+         "volume as the solver's full particle set.\n0: draw at true radius\n1: match the bed"),
     ECVF_Default);
 
 TAutoConsoleVariable<float> CVarMpmRenderRoughness(
@@ -906,12 +1012,28 @@ void ASimModeWorldBase::updateMpmParticleRender()
     }
 
     const float world_to_meters = getGlobalNedTransform().fromNed(1.0f);
-    // The engine sphere is 100 uu across, so a unit scale is a 1 m ball; scale to the real radius.
-    const float scale = static_cast<float>(frame.radius) * 2.0f *
-                        CVarMpmRenderScale.GetValueOnGameThread();
 
     const int32 cap = FMath::Max(1, CVarMpmRenderMax.GetValueOnGameThread());
     const int32 draw = FMath::Min(static_cast<int32>(frame.count), cap);
+
+    // MATCH THE PICTURE, NOT THE PARTICLE. Two decimations stand between the solver and this view:
+    // the sidecar strides its particles into shared memory, and the cap above trims again. Drawing
+    // 1/N of the particles at N^(1/3) times the radius puts the same VOLUME on screen, which is
+    // what makes a sampled bed look like the bed rather than like grit scattered over it.
+    //
+    // ⚠ A VIEW CORRECTION, and it is labelled as one: the periodic log reports the solver's true
+    // radius alongside the factor applied, so nobody reads a fattened sphere as a real grain size.
+    float density_scale = 1.0f;
+    if (CVarMpmRenderMatchDensity.GetValueOnGameThread() != 0 && draw > 0 &&
+        frame.total_particles > 0) {
+        const double ratio =
+            static_cast<double>(frame.total_particles) / static_cast<double>(draw);
+        density_scale = static_cast<float>(FMath::Pow(ratio, 1.0 / 3.0));
+    }
+
+    // The engine sphere is 100 uu across, so a unit scale is a 1 m ball; scale to the real radius.
+    const float scale = static_cast<float>(frame.radius) * 2.0f *
+                        CVarMpmRenderScale.GetValueOnGameThread() * density_scale;
 
     TArray<FTransform> transforms;
     transforms.Reserve(draw);
@@ -945,10 +1067,12 @@ void ASimModeWorldBase::updateMpmParticleRender()
         // ⚠ Says what fraction is on screen. A decimated render that looks complete is the same
         // class of lie as a counter reporting success about the wrong place.
         UE_LOG(LogPhysicsCoordinator, Log,
-               TEXT("MPM render: %d instances = %.1f%% of the solver's %llu particles, sidecar "
-                    "step %llu at t=%.2f s"),
+               TEXT("MPM render: %d instances = %.1f%% of the solver's %llu particles, drawn at "
+                    "%.2fx the true %.4f m radius to match the bed's volume, sidecar step %llu at "
+                    "t=%.2f s"),
                draw, frame.total_particles > 0 ? 100.0 * draw / frame.total_particles : 0.0,
                static_cast<unsigned long long>(frame.total_particles),
+               density_scale * CVarMpmRenderScale.GetValueOnGameThread(), frame.radius,
                static_cast<unsigned long long>(frame.sidecar_step), frame.sidecar_time);
     }
 }
@@ -957,6 +1081,8 @@ void ASimModeWorldBase::openMpmSidecarLink()
 {
     using AirSimSettings = msr::airlib::AirSimSettings;
     const auto& settings = getSettings();
+
+    detectLockstepVehicles();
 
     const AirSimSettings::DeformableTerrainSetting* terrain = nullptr;
     for (const auto& item : settings.deformable_terrains) {
@@ -1028,6 +1154,15 @@ std::vector<urdf::PhysicsColliderSet> ASimModeWorldBase::gatherColliders() const
 msr::airlib::mpm::WireWorldStamp ASimModeWorldBase::currentMpmStamp() const
 {
     msr::airlib::mpm::WireWorldStamp stamp;
+    // ⚠ LEGACY HAS NO EPOCH, so nothing ever told the sidecar a reset happened and the sand simply
+    // carried on deformed across a reset that returned the rovers to their spawns. The stamp is the
+    // ONLY reset signal on this wire, so Legacy has to supply one; a local counter bumped in
+    // reset() is exactly as good, because the sidecar compares the stamp rather than interpreting
+    // it.
+    if (physics_scene_coordinator_ == nullptr) {
+        stamp.reset_epoch = mpm_legacy_epoch_;
+        return stamp;
+    }
     if (physics_scene_coordinator_ != nullptr) {
         const auto& coordinator_stamp = physics_scene_coordinator_->stamp();
         stamp.world_id = coordinator_stamp.world.id;
@@ -1036,6 +1171,344 @@ msr::airlib::mpm::WireWorldStamp ASimModeWorldBase::currentMpmStamp() const
         stamp.reset_epoch = coordinator_stamp.reset_epoch;
     }
     return stamp;
+}
+
+void ASimModeWorldBase::startMpmSidecarProcess()
+{
+    using AirSimSettings = msr::airlib::AirSimSettings;
+
+    if (mpm_sidecar_running_)
+        return;
+
+    const AirSimSettings::DeformableTerrainSidecarSetting* sc = nullptr;
+    FString terrain_name;
+    for (const auto& entry : getSettings().deformable_terrains) {
+        if (entry.second.enabled && entry.second.sidecar.has_sidecar &&
+            entry.second.sidecar.auto_start) {
+            sc = &entry.second.sidecar;
+            terrain_name = UTF8_TO_TCHAR(entry.first.c_str());
+            break;
+        }
+    }
+    if (sc == nullptr)
+        return; // nobody opted in — the operator owns the sidecar, as before D14
+
+    // The script lives beside the simulator's own source, two levels above the Unreal project.
+    FString script = UTF8_TO_TCHAR(sc->script.c_str());
+    if (script.IsEmpty()) {
+        script = FPaths::ConvertRelativePathToFull(
+            FPaths::Combine(FPaths::ProjectDir(), TEXT("../../../mpm_sidecar/sidecar.py")));
+    }
+    const FString python = UTF8_TO_TCHAR(sc->python.c_str());
+
+    // ⚠ SAY WHICH FILE IS MISSING. A launch that fails silently leaves a sim publishing colliders
+    // into shared memory with nothing consuming them, which looks exactly like a sidecar that is
+    // merely slow to build.
+    if (!FPaths::FileExists(python)) {
+        UE_LOG(LogPhysicsCoordinator, Error,
+               TEXT("MPM sidecar AutoStart: interpreter not found at '%s' — set "
+                    "DeformableTerrains.%s.Sidecar.Python to a python with the mpm_sidecar "
+                    "requirements installed. Not starting."),
+               *python, *terrain_name);
+        return;
+    }
+    if (!FPaths::FileExists(script)) {
+        UE_LOG(LogPhysicsCoordinator, Error,
+               TEXT("MPM sidecar AutoStart: script not found at '%s'. Not starting."), *script);
+        return;
+    }
+
+    FString log_file = UTF8_TO_TCHAR(sc->log_file.c_str());
+    if (log_file.IsEmpty())
+        log_file = FPaths::Combine(FPaths::ProjectLogDir(), TEXT("mpm_sidecar.log"));
+
+    // ⚠ PASS OUR OWN PID. The child exits when we disappear, so an editor crash cannot strand a
+    // process holding GPU memory — two such orphans were found by hand on 2026-08-26, one after 32
+    // minutes.
+    const uint32 own_pid = FPlatformProcess::GetCurrentProcessId();
+
+    FString args = FString::Printf(
+        TEXT("-u %s --dir /dev/shm --voxel-size %g --fps %g --density %g --particle-every %d "
+             "--max-render-particles %d --parent-pid %u"),
+        *script, sc->voxel_size, sc->fps, sc->density, sc->particle_every,
+        sc->max_render_particles, own_pid);
+    if (!sc->extra_args.empty())
+        args += FString::Printf(TEXT(" %s"), UTF8_TO_TCHAR(sc->extra_args.c_str()));
+
+    // Through a shell so the child's output lands in a file the operator can tail. CreateProc's
+    // pipes would need a reader thread on the game thread's side, which is a lot of machinery for
+    // "write it to a log".
+    const FString command = FString::Printf(TEXT("exec %s %s > %s 2>&1"), *python, *args, *log_file);
+    const FString shell_args = FString::Printf(TEXT("-c \"%s\""), *command);
+
+    mpm_sidecar_proc_ = FPlatformProcess::CreateProc(TEXT("/bin/sh"), *shell_args,
+                                                     /*bLaunchDetached=*/false,
+                                                     /*bLaunchHidden=*/true,
+                                                     /*bLaunchReallyHidden=*/true,
+                                                     &mpm_sidecar_pid_, 0, nullptr, nullptr);
+    if (!mpm_sidecar_proc_.IsValid()) {
+        UE_LOG(LogPhysicsCoordinator, Error,
+               TEXT("MPM sidecar AutoStart: failed to launch '%s'. Not starting."), *python);
+        return;
+    }
+    mpm_sidecar_running_ = true;
+
+    // ⚠ NON-BLOCKING, DELIBERATELY. A 250 k-particle build is ~10 s warm and minutes on a cold Warp
+    // kernel cache; waiting here would freeze PIE, and with a lockstep firmware present it would
+    // breach PX4's 1 s tolerance outright. The sim runs without sand until the child reports in,
+    // which is the same state as any manually started sidecar.
+    UE_LOG(LogPhysicsCoordinator, Log,
+           TEXT("MPM sidecar AutoStart: launched pid %u for terrain '%s' (voxel %g m, %g fps) — "
+                "output at %s. The sim does not wait for it; sand appears when it reports in."),
+           mpm_sidecar_pid_, *terrain_name, sc->voxel_size, sc->fps, *log_file);
+}
+
+void ASimModeWorldBase::stopMpmSidecarProcess()
+{
+    if (!mpm_sidecar_running_)
+        return;
+    mpm_sidecar_running_ = false;
+
+    if (!mpm_sidecar_proc_.IsValid())
+        return;
+
+    // ⚠ SIGINT FIRST, not TerminateProc. The sidecar saves a pose recording and encodes any video
+    // on its interrupt path; killing it outright discards both. TerminateProc is the escalation,
+    // not the opening move.
+    if (mpm_sidecar_pid_ != 0)
+        kill(static_cast<pid_t>(mpm_sidecar_pid_), SIGINT);
+
+    // Bounded wait, and it notices the process is gone rather than sleeping the whole budget.
+    for (int i = 0; i < 50 && FPlatformProcess::IsProcRunning(mpm_sidecar_proc_); ++i)
+        FPlatformProcess::Sleep(0.1f);
+
+    if (FPlatformProcess::IsProcRunning(mpm_sidecar_proc_)) {
+        UE_LOG(LogPhysicsCoordinator, Warning,
+               TEXT("MPM sidecar pid %u did not exit within 5 s of SIGINT — terminating."),
+               mpm_sidecar_pid_);
+        FPlatformProcess::TerminateProc(mpm_sidecar_proc_, /*KillTree=*/true);
+    }
+    else {
+        UE_LOG(LogPhysicsCoordinator, Log, TEXT("MPM sidecar pid %u stopped."), mpm_sidecar_pid_);
+    }
+    FPlatformProcess::CloseProc(mpm_sidecar_proc_);
+    mpm_sidecar_proc_.Reset();
+    mpm_sidecar_pid_ = 0;
+}
+
+double ASimModeWorldBase::currentSimTimeSeconds() const
+{
+    // ⚠ ONE DEFINITION, because there were two and they disagreed. publishMpmState fell back to the
+    // simulation clock in Legacy while applyMpmImpulses fell back to 0.0 — so force-hold's
+    // "measured interval" measured nothing, silently used the nominal MPM dt, and over-delivered
+    // momentum by whatever the sidecar's lag happened to be. Measured 2026-08-26: a rover launched
+    // 58 m and sand driven to z = -7127 m.
+    if (physics_scene_coordinator_ != nullptr)
+        return physics_scene_coordinator_->stamp().simulation_time_nanos * 1e-9;
+    return static_cast<double>(msr::airlib::ClockFactory::get()->nowNanos()) * 1e-9;
+}
+
+void ASimModeWorldBase::applyMpmImpulses()
+{
+    const bool want = CVarMpmTwoWay.GetValueOnGameThread() != 0;
+
+    // ⚠ CLEARING IS NOT OPTIONAL, AND IT IS NOT SYMMETRIC BETWEEN BACKENDS. MuJoCo's xfrc_applied
+    // PERSISTS until overwritten; Box3D's applied force clears every step. So switching two-way off
+    // — or losing the sidecar — would leave a MuJoCo rover being shoved forever by sand that
+    // stopped touching it, while the same code on Box3D would quietly stop. Writing an explicit
+    // zero once is what makes the two behave the same, and it is the same stale-state failure that
+    // cost four bugs on 2026-08-26.
+    if (!want || !mpm_impulse_reader_.isOpen()) {
+        if (mpm_impulse_applied_) {
+            clearMpmImpulses();
+            if (!want && mpm_impulse_reader_.isOpen())
+                UE_LOG(LogPhysicsCoordinator, Log,
+                       TEXT("two-way off — sand reaction cleared to zero on every collider"));
+        }
+        if (!want)
+            return;
+    }
+
+    if (!mpm_impulse_reader_.isOpen()) {
+        if (!mpm_impulse_reader_.open("/dev/shm"))
+            return;
+        UE_LOG(LogPhysicsCoordinator, Warning,
+               TEXT("TWO-WAY MPM ATTACHED. ⚠ This run is LaggedImpulseTwoWay, not TwoWay: the "
+                    "impulses are a frame behind and the articulated effective inertia in plan "
+                    "11.1 is unresolved. Do not report sinkage or traction from it as validated."));
+    }
+
+    msr::airlib::mpm::MpmImpulseReader::Frame frame;
+    if (!mpm_impulse_reader_.read(frame, mpm_last_impulse_step_)) {
+        // Nothing new. ⚠ Under exact-once the force must already be gone; under force-hold it is
+        // held deliberately — but only for a bounded time, or a stopped sidecar becomes a constant
+        // force nobody asked for.
+        const double now = FPlatformTime::Seconds();
+        if (mpm_impulse_applied_ && mpm_last_impulse_seconds_ > 0.0 &&
+            now - mpm_last_impulse_seconds_ > 0.5) {
+            UE_LOG(LogPhysicsCoordinator, Warning,
+                   TEXT("no MPM impulse for %.2f s — clearing the sand's reaction rather than "
+                        "holding a force from a frame that has passed."),
+                   now - mpm_last_impulse_seconds_);
+            clearMpmImpulses();
+        }
+        return;
+    }
+
+    // ⚠ WRONG WORLD, NO FORCE. An impulse computed against a bed from a previous epoch is not a
+    // small error, it is a force from a different simulation.
+    const auto stamp = currentMpmStamp();
+    if (frame.stamp.world_id != stamp.world_id || frame.stamp.reset_epoch != stamp.reset_epoch) {
+        if (mpm_impulse_applied_)
+            clearMpmImpulses();
+        return;
+    }
+
+    const double sim_now = currentSimTimeSeconds();
+
+    // Interval this force must cover. Force-hold uses the MEASURED gap since the last impulse, so a
+    // lagging sidecar delivers the right momentum rather than a fraction of it; exact-once spends
+    // the whole impulse in a single tick.
+    const bool exact_once = CVarMpmImpulseContract.GetValueOnGameThread() != 0;
+    double interval = 0.0;
+    if (exact_once) {
+        interval = static_cast<double>(getPhysicsLoopPeriod()) * 1e-9;
+    }
+    else {
+        interval = (mpm_last_impulse_sim_time_ > 0.0 && sim_now > mpm_last_impulse_sim_time_)
+                       ? sim_now - mpm_last_impulse_sim_time_
+                       : frame.mpm_dt;
+    }
+    if (interval <= 1e-9)
+        interval = frame.mpm_dt > 1e-9 ? frame.mpm_dt : 1.0 / 120.0;
+
+    // ⚠ A RUNAWAY MUST NOT BE SILENT. Lagged explicit coupling can inject energy, and the failure
+    // mode is not subtle degradation — it is a rover leaving the map. This cap turns that into a
+    // logged refusal, which is the difference between "the coupling is unstable here" and "the
+    // simulation is broken and nobody knows why". It is a guard, not a fix: hitting it means the
+    // contract or the cadence is wrong, and the run is not physically meaningful past that point.
+    const float max_force = CVarMpmImpulseMaxForce.GetValueOnGameThread();
+    const float scale = CVarMpmImpulseScale.GetValueOnGameThread();
+    const int32 count = FMath::Min(static_cast<int32>(frame.collider_count),
+                                   static_cast<int32>(mpm_impulse_targets_.size()));
+    int32 pushed = 0;
+    double biggest = 0.0;
+    for (int32 i = 0; i < count; ++i) {
+        const auto& target = mpm_impulse_targets_[i];
+        if (target.api == nullptr)
+            continue;
+        const auto& imp = frame.colliders[i];
+        // A collider the sand never touched gets an explicit zero, not a skip — see the clearing
+        // note above; skipping would leave MuJoCo holding the last non-zero value.
+        urdf::Wrench w;
+        w.force = urdf::Vec3{ imp.linear.x / interval * scale, imp.linear.y / interval * scale,
+                              imp.linear.z / interval * scale };
+        w.torque = urdf::Vec3{ imp.angular.x / interval * scale, imp.angular.y / interval * scale,
+                               imp.angular.z / interval * scale };
+        w.at_center = true;
+
+        // ⚠ RELAXATION, exactly as Newton's coupled proxy does it. Applying a lagged force raw
+        // means every frame's correction lands in full on a state that has already moved, which is
+        // how an explicit coupling pumps energy. Blending with the previous force is what turns a
+        // divergent oscillation into a bounded one.
+        {
+            const float relax = FMath::Clamp(CVarMpmImpulseRelaxation.GetValueOnGameThread(),
+                                             0.0f, 1.0f);
+            if (relax < 1.0f && i < static_cast<int32>(mpm_previous_wrench_.size())) {
+                const urdf::Wrench& prev = mpm_previous_wrench_[i];
+                w.force = urdf::Vec3{ relax * w.force.x + (1.0f - relax) * prev.force.x,
+                                      relax * w.force.y + (1.0f - relax) * prev.force.y,
+                                      relax * w.force.z + (1.0f - relax) * prev.force.z };
+                w.torque = urdf::Vec3{ relax * w.torque.x + (1.0f - relax) * prev.torque.x,
+                                       relax * w.torque.y + (1.0f - relax) * prev.torque.y,
+                                       relax * w.torque.z + (1.0f - relax) * prev.torque.z };
+            }
+            if (i < static_cast<int32>(mpm_previous_wrench_.size()))
+                mpm_previous_wrench_[i] = w;
+        }
+
+        const double fmag = FMath::Sqrt(w.force.x * w.force.x + w.force.y * w.force.y +
+                                        w.force.z * w.force.z);
+        if (max_force > 0.0f && fmag > max_force) {
+            if (!mpm_impulse_capped_) {
+                mpm_impulse_capped_ = true;
+                UE_LOG(LogPhysicsCoordinator, Error,
+                       TEXT("MPM reaction of %.1f N on '%s' exceeds airsim.MpmImpulseMaxForce "
+                            "(%.1f N) — REFUSING it and every one after, and clearing the sand's "
+                            "force. The coupling is unstable; this run is not physically "
+                            "meaningful. Try airsim.MpmImpulseContract 1, or a smaller "
+                            "airsim.MpmImpulseScale to bisect."),
+                       fmag, UTF8_TO_TCHAR(mpm_publisher_->publishedIds()[i].c_str()), max_force);
+            }
+            clearMpmImpulses();
+            return;
+        }
+        target.api->applyLinkWrench(target.link_index, w);
+        if (imp.contact_nodes > 0)
+            ++pushed;
+        biggest = FMath::Max(biggest, FMath::Sqrt(w.force.x * w.force.x + w.force.y * w.force.y +
+                                                  w.force.z * w.force.z));
+    }
+
+    mpm_impulse_applied_ = true;
+    mpm_last_impulse_step_ = frame.sidecar_step;
+    mpm_last_impulse_seconds_ = FPlatformTime::Seconds();
+    mpm_last_impulse_sim_time_ = sim_now;
+    mpm_exact_once_pending_ = exact_once;
+
+    const double now_log = FPlatformTime::Seconds();
+    if (now_log - last_mpm_impulse_log_ > 10.0) {
+        last_mpm_impulse_log_ = now_log;
+        UE_LOG(LogPhysicsCoordinator, Log,
+               TEXT("two-way: %d of %d collider(s) in contact, peak |F| %.2f N over a %.4f s "
+                    "interval (%s), sidecar step %llu"),
+               pushed, count, biggest, interval,
+               exact_once ? TEXT("exact-once") : TEXT("force-hold"),
+               static_cast<unsigned long long>(frame.sidecar_step));
+    }
+}
+
+void ASimModeWorldBase::clearMpmImpulses()
+{
+    urdf::Wrench zero;
+    zero.at_center = true;
+    for (const auto& target : mpm_impulse_targets_) {
+        if (target.api != nullptr)
+            target.api->applyLinkWrench(target.link_index, zero);
+    }
+    mpm_impulse_applied_ = false;
+    mpm_exact_once_pending_ = false;
+    mpm_last_impulse_sim_time_ = 0.0;
+    // ⚠ A cleared force must not be blended back in next frame — that would re-apply the very
+    // thing the clear exists to remove.
+    std::fill(mpm_previous_wrench_.begin(), mpm_previous_wrench_.end(), urdf::Wrench());
+}
+
+void ASimModeWorldBase::detectLockstepVehicles()
+{
+    // ⚠ NO dynamic_cast — Unreal builds with RTTI off, so `MavLinkVehicleSetting` cannot be
+    // recovered from a `VehicleSetting*`. The vehicle TYPE string is the safe discriminator, and
+    // being conservative here is the right bias: treating a MAVLink vehicle as lockstep when it
+    // happens not to be costs some sand lag, while the reverse costs a flight controller.
+    mpm_lockstep_vehicle_present_ = false;
+    mpm_lockstep_vehicle_name_.Empty();
+
+    using Settings = msr::airlib::AirSimSettings;
+    for (const auto& entry : Settings::singleton().vehicles) {
+        if (entry.second == nullptr)
+            continue;
+        const std::string& type = entry.second->vehicle_type;
+        if (type == Settings::kVehicleTypePX4 || type == Settings::kVehicleTypeArduCopter ||
+            type == Settings::kVehicleTypeArduCopterSolo) {
+            mpm_lockstep_vehicle_present_ = true;
+            mpm_lockstep_vehicle_name_ = UTF8_TO_TCHAR(entry.first.c_str());
+            UE_LOG(LogPhysicsCoordinator, Log,
+                   TEXT("vehicle '%s' is a MAVLink firmware (%s) — MPM back-pressure will not "
+                        "pause this world; the sand lags instead."),
+                   *mpm_lockstep_vehicle_name_, UTF8_TO_TCHAR(type.c_str()));
+            break;
+        }
+    }
 }
 
 void ASimModeWorldBase::publishMpmRegistry()
@@ -1144,6 +1617,63 @@ void ASimModeWorldBase::publishMpmRegistry()
     const bool ok = mpm_publisher_->publishRegistry(currentMpmStamp(), coordinatedFixedStepSeconds(),
                                                     region, robots, mpm_selected_ids_);
     mpm_registry_published_ = true;
+    mpm_registry_stamp_ = currentMpmStamp();
+
+    // ⚠ RESOLVE ONCE, HERE. The impulse block is indexed by registry POSITION, and turning that
+    // back into "which vehicle, which link" per tick would be a string lookup on the hot path. It
+    // is rebuilt on every republish because a reset can rebuild the population underneath us, and a
+    // cached link index into a destroyed body table is a use-after-free rather than a wrong number.
+    mpm_impulse_targets_.clear();
+    {
+        std::map<std::string, MpmImpulseTarget> by_id;
+        for (auto& api : getApiProvider()->getVehicleSimApis()) {
+            urdf::PhysicsColliderSet set;
+            if (!api->describeColliders(set))
+                continue;
+            for (const auto& collider : set.colliders)
+                by_id[collider.stable_id] = MpmImpulseTarget{ api, collider.link_index };
+        }
+        for (const std::string& id : mpm_publisher_->publishedIds()) {
+            auto found = by_id.find(id);
+            mpm_impulse_targets_.push_back(found != by_id.end() ? found->second
+                                                                : MpmImpulseTarget{ nullptr, 0 });
+        }
+    }
+    mpm_previous_wrench_.assign(mpm_impulse_targets_.size(), urdf::Wrench());
+    mpm_last_impulse_step_ = 0;
+    mpm_last_impulse_sim_time_ = 0.0;
+
+    // ⚠ MATCHING A LINK IS NOT THE SAME AS HAVING GEOMETRY, and the count below cannot tell them
+    // apart. On 2026-08-26 a Legacy run reported "12 of 12 matched" while six of those colliders
+    // carried shape_count = 0: correct ids, correct mass, live poses, and no collision shapes at
+    // all. Newton built six bodies with no geometry, so the sand could neither touch them nor be
+    // touched — and every gate we had reported success. A collider with no shapes is not a degraded
+    // collider, it is an absent one wearing a name.
+    {
+        int32 empty = 0;
+        FString names;
+        for (const auto& set : robots) {
+            for (const auto& collider : set.colliders) {
+                if (!collider.shapes.empty())
+                    continue;
+                if (std::find(mpm_selected_ids_.begin(), mpm_selected_ids_.end(),
+                              collider.stable_id) == mpm_selected_ids_.end())
+                    continue;
+                ++empty;
+                if (empty <= 8) {
+                    if (!names.IsEmpty()) names += TEXT(", ");
+                    names += UTF8_TO_TCHAR(collider.stable_id.c_str());
+                }
+            }
+        }
+        if (empty > 0) {
+            UE_LOG(LogPhysicsCoordinator, Error,
+                   TEXT("%d selected collider(s) have NO COLLISION GEOMETRY and are invisible to "
+                        "the sand in BOTH directions: %s%s. The backend described them with "
+                        "shape_count = 0."),
+                   empty, *names, empty > 8 ? TEXT(", ...") : TEXT(""));
+        }
+    }
 
     const size_t published = mpm_publisher_->publishedIds().size();
     UE_LOG(LogPhysicsCoordinator, Log,
@@ -1173,16 +1703,60 @@ void ASimModeWorldBase::publishMpmRegistry()
 
 void ASimModeWorldBase::publishMpmState()
 {
-    if (!mpm_publisher_ || !mpm_publisher_->isOpen() || !mpm_registry_published_)
+    if (!mpm_publisher_ || !mpm_publisher_->isOpen())
         return;
 
     const auto stamp = currentMpmStamp();
-    const uint64_t step = physics_scene_coordinator_ != nullptr
-                              ? physics_scene_coordinator_->stamp().step_sequence
-                              : 0;
-    const double time = physics_scene_coordinator_ != nullptr
-                            ? physics_scene_coordinator_->stamp().simulation_time_nanos * 1e-9
-                            : 0.0;
+
+    // ⚠ REPUBLISH WHEN THE WORLD STAMP MOVES. A global reset bumps `reset_epoch` and rebuilds the
+    // population from the frozen manifest, so every collider pose goes back to its t=0 value. The
+    // registry published for the PREVIOUS epoch then describes a run that has ended — the sand was
+    // authored around poses that no longer hold — and the very next state block trips the sidecar's
+    // epoch refusal. Republishing is the whole fix on this side, and it hands the sidecar a bed
+    // built around the post-reset poses rather than the pre-reset ones.
+    const bool stamp_moved =
+        stamp.world_id != mpm_registry_stamp_.world_id ||
+        stamp.world_revision != mpm_registry_stamp_.world_revision ||
+        stamp.manifest_revision != mpm_registry_stamp_.manifest_revision ||
+        stamp.reset_epoch != mpm_registry_stamp_.reset_epoch;
+    if (!mpm_registry_published_ || stamp_moved) {
+        if (mpm_registry_published_) {
+            UE_LOG(LogPhysicsCoordinator, Log,
+                   TEXT("world stamp moved (epoch %llu -> %llu) — republishing the MPM registry so "
+                        "the sand is rebuilt around the post-reset poses"),
+                   static_cast<unsigned long long>(mpm_registry_stamp_.reset_epoch),
+                   static_cast<unsigned long long>(stamp.reset_epoch));
+        }
+        publishMpmRegistry();
+        mpm_stamp_changed_seconds_ = FPlatformTime::Seconds();
+        mpm_rebuild_wait_reported_ = false;
+        // The rebuilt sidecar restarts its counters; that is expected here and must not be read as
+        // a restart of a different process.
+        mpm_last_acknowledged_step_ = 0;
+    }
+    // ⚠ LEGACY HAS NO COORDINATOR, AND THEREFORE NO STEP SEQUENCE. This used to publish a constant
+    // step 0 and time 0 in that mode, which is not a degraded link — it is a DEAD one: the sidecar
+    // consumes step 0 once and then sees `state.step <= acknowledged_step` forever, idling at 0 %
+    // CPU while both ends report healthy. The comment at openMpmSidecarLink promised deformable
+    // terrain worked in Legacy; nothing had ever run it there, because a mixed Box3D + MuJoCo
+    // population is the only thing that forces Legacy, and that combination was tried for the first
+    // time on 2026-08-26.
+    //
+    // The simulation clock is what actually advances in Legacy, so derive both from it. The step is
+    // a count of physics periods rather than a solver-owned sequence — it need only be monotonic
+    // and comparable, which is all the acknowledgement protocol asks of it.
+    uint64_t step = 0;
+    double time = 0.0;
+    if (physics_scene_coordinator_ != nullptr) {
+        step = physics_scene_coordinator_->stamp().step_sequence;
+        time = physics_scene_coordinator_->stamp().simulation_time_nanos * 1e-9;
+    }
+    else {
+        const auto now_nanos = msr::airlib::ClockFactory::get()->nowNanos();
+        const int64_t period = FMath::Max<int64>(getPhysicsLoopPeriod(), 1);
+        step = static_cast<uint64_t>(now_nanos / period);
+        time = static_cast<double>(now_nanos) * 1e-9;
+    }
 
     // ⚠ Read under the physics lock, exactly as the collision overlay does: describeColliders
     // walks live solver tables while the physics thread may be stepping.
@@ -1196,6 +1770,8 @@ void ASimModeWorldBase::publishMpmState()
 
     const auto health = mpm_publisher_->health(stamp);
     const double now = FPlatformTime::Seconds();
+
+    applyMpmLinkPolicy(health, now);
 
     // ⚠ A stale or wrong-epoch sidecar is said ONCE, not every tick. Plan §M2 requires the
     // condition to surface with a diagnostic; it does not require it to drown the log.
@@ -1212,6 +1788,182 @@ void ASimModeWorldBase::publishMpmState()
     if (now - last_mpm_health_log_ > 10.0) {
         last_mpm_health_log_ = now;
         UE_LOG(LogPhysicsCoordinator, Log, TEXT("%s"), UTF8_TO_TCHAR(health.describe().c_str()));
+    }
+}
+
+void ASimModeWorldBase::applyMpmLinkPolicy(const msr::airlib::mpm::MpmSidecarPublisher::Health& health,
+                                          double now)
+{
+    // ⚠ NO SIDECAR IS NOT A FAULT. The link is optional and most runs have none; pausing a sim that
+    // never asked for sand would be a regression dressed as a safety check.
+    if (!health.sidecar_seen || CVarMpmPauseOnStall.GetValueOnGameThread() == 0)
+        return;
+
+    // A RESTARTED SIDECAR. Steps never go backwards inside one run, so an acknowledgement that
+    // moved backwards while the world stamp did NOT change can only be a different process: the old
+    // one died and a new one built a pristine bed. Our own rebuild-on-reset also restarts the
+    // counter, but that comes WITH an epoch change, which is why the stamp check is the
+    // discriminator rather than the counter alone.
+    if (health.epoch_matches && health.fault == 0 && mpm_last_acknowledged_step_ > 0 &&
+        health.acknowledged_step < mpm_last_acknowledged_step_ && !mpm_restart_handled_) {
+        // ⚠ A FORCED RESET MUST NEVER RUN AWAY. Even with the epoch-scoped tracking above, this
+        // path triggers a world reset from a heuristic, and a heuristic that can fire twice a
+        // second is a denial of service against the operator. Rate-limited as defence in depth:
+        // the root cause is fixed, and this makes the next root cause survivable.
+        const double since_last_forced = now - mpm_last_forced_reset_seconds_;
+        if (mpm_last_forced_reset_seconds_ > 0.0 && since_last_forced < 15.0) {
+            UE_LOG(LogPhysicsCoordinator, Warning,
+                   TEXT("MPM sidecar looks restarted again after only %.1f s — NOT forcing another "
+                        "global reset. Something is wrong with the link rather than with the run; "
+                        "check the sidecar log."),
+                   since_last_forced);
+            mpm_restart_handled_ = true;
+            return;
+        }
+        mpm_last_forced_reset_seconds_ = now;
+
+        mpm_restart_handled_ = true;
+        const bool do_reset = CVarMpmResetOnSidecarRestart.GetValueOnGameThread() != 0;
+        UE_LOG(LogPhysicsCoordinator, Warning,
+               TEXT("the MPM sidecar was RESTARTED (acknowledged step went %llu -> %llu inside one "
+                    "epoch). Its sand is pristine while this world has kept driving, so the two no "
+                    "longer share a past. %s"),
+               static_cast<unsigned long long>(mpm_last_acknowledged_step_),
+               static_cast<unsigned long long>(health.acknowledged_step),
+               do_reset ? TEXT("Forcing a global reset, per plan §M2.")
+                        : TEXT("Halting instead (airsim.MpmResetOnSidecarRestart 0)."));
+        mpm_last_acknowledged_step_ = 0;
+        if (do_reset) {
+            // The reset advances reset_epoch, which republishes the registry, which makes the new
+            // sidecar rebuild against the post-reset poses. The chain closes itself.
+            reset();
+        }
+        else {
+            mpm_halted_ = true;
+            mpm_paused_by_link_ = true;
+            pause(true);
+        }
+        return;
+    }
+    // ⚠ ONLY TRACK ACKNOWLEDGEMENTS FROM THIS EPOCH. D9a restarts step_seq at zero in every reset
+    // epoch, so a step number from a different epoch is not comparable to one from this epoch — it
+    // is a different counter that happens to have the same type.
+    //
+    // Getting this wrong produced an infinite reset loop on 2026-08-26: during the rebuild grace
+    // window the sidecar still reports the PREVIOUS epoch, and taking its acknowledgement (145) as
+    // this epoch's baseline meant the rebuilt sidecar's honest first report (0) looked like a
+    // different process starting — which forced another reset, which started another rebuild.
+    // Epochs climbed 104, 105, 106 … about twice a second.
+    if (health.epoch_matches) {
+        if (health.acknowledged_step >= mpm_last_acknowledged_step_)
+            mpm_last_acknowledged_step_ = health.acknowledged_step;
+        if (health.acknowledged_step > 0)
+            mpm_restart_handled_ = false;
+    }
+
+    // HARD HALT — a wrong world or a reported fault. Catching up cannot fix either: the sidecar is
+    // simulating a scene that no longer exists, or its GPU work failed outright. Plan §M2 says a
+    // sidecar restart forces a global reset for exactly this reason, so this pause does NOT lift
+    // itself; the operator resets or restarts deliberately.
+    // ⚠ AN ALL-ZERO STAMP IS "HAS NOT REPORTED YET", NOT "A DIFFERENT WORLD". A sidecar that has
+    // written its magic but not yet its stamp reads as world 0/0 manifest 0 epoch 0, and treating
+    // that as a mismatched epoch halts a run that is merely starting up. It cost a whole test run.
+    const bool stamp_unreported = !health.epoch_matches && health.fault == 0 &&
+                                  health.acknowledged_step == 0 && health.particle_count == 0;
+    if (stamp_unreported)
+        return;
+
+    if (!health.epoch_matches || health.fault != 0) {
+        // Give a rebuild room to happen. Only an epoch mismatch gets the grace — a reported FAULT
+        // is the sidecar itself saying it cannot continue, and waiting on that helps nobody.
+        if (!health.epoch_matches && health.fault == 0 && mpm_stamp_changed_seconds_ > 0.0 &&
+            now - mpm_stamp_changed_seconds_ < CVarMpmEpochGraceSeconds.GetValueOnGameThread()) {
+            if (!mpm_rebuild_wait_reported_) {
+                mpm_rebuild_wait_reported_ = true;
+                UE_LOG(LogPhysicsCoordinator, Log,
+                       TEXT("waiting for the MPM sidecar to rebuild for the new epoch (%s)"),
+                       UTF8_TO_TCHAR(health.describe().c_str()));
+            }
+            return;
+        }
+        if (!mpm_halted_) {
+            mpm_halted_ = true;
+            mpm_paused_by_link_ = true;
+            pause(true);
+            UE_LOG(LogPhysicsCoordinator, Error,
+                   TEXT("PAUSED — the MPM sidecar cannot be trusted: %s. Its sand no longer "
+                        "corresponds to this world, and continuing would deform a bed from a run "
+                        "that has ended. Reset the world (or restart the sidecar and reset) to "
+                        "resume; airsim.MpmPauseOnStall 0 disables this check."),
+                   UTF8_TO_TCHAR(health.describe().c_str()));
+        }
+        return;
+    }
+
+    // ⚠ BACK-PRESSURE IS OFF WHEN A LOCKSTEP FIRMWARE OWNS THE CLOCK. PX4 SITL in lockstep drops
+    // out after ONE SECOND without a HilActuatorControls exchange
+    // (MavLinkMultirotorApi.hpp: `last_update_time_ + 1000000 < now` -> "resetting lock step
+    // mode"), and a back-pressure pause lasts as long as the sidecar needs to drain — seconds. So
+    // holding the clock for the sand would silently break the flight controller, which is a far
+    // worse outcome than sand that lags. Two subsystems cannot both own the clock; the firmware
+    // wins, and the sand degrades to report-only.
+    //
+    // A HARD HALT still fires above, deliberately: that run is already invalid, and quietly flying
+    // a drone while deforming a bed from a world that has ended is not a kinder failure.
+    if (mpm_lockstep_vehicle_present_) {
+        if (!health.responsive && !mpm_lockstep_conflict_reported_) {
+            mpm_lockstep_conflict_reported_ = true;
+            UE_LOG(LogPhysicsCoordinator, Warning,
+                   TEXT("MPM sidecar is beyond its lag budget (%llu steps), but back-pressure is "
+                        "DISABLED because vehicle '%s' runs a lockstep firmware that drops out "
+                        "after 1 s without an exchange. The sand will lag instead of the clock "
+                        "stopping. airsim.MpmPauseOnStall does not override this."),
+                   static_cast<unsigned long long>(health.lag_steps),
+                   *mpm_lockstep_vehicle_name_);
+        }
+        if (health.responsive)
+            mpm_lockstep_conflict_reported_ = false;
+        return;
+    }
+
+    // BACK-PRESSURE — the sidecar is merely behind. Pausing IS the fix here: the sim stops
+    // advancing, the sidecar drains its backlog, and we resume. That makes the pause
+    // self-correcting rather than something an operator has to notice and undo.
+    if (!health.responsive) {
+        if (mpm_unresponsive_since_ <= 0.0) {
+            mpm_unresponsive_since_ = now;
+        }
+        else if (!mpm_paused_by_link_ &&
+                 now - mpm_unresponsive_since_ > CVarMpmStallSeconds.GetValueOnGameThread()) {
+            mpm_paused_by_link_ = true;
+            pause(true);
+            UE_LOG(LogPhysicsCoordinator, Warning,
+                   TEXT("PAUSED for back-pressure — the MPM sidecar has been beyond its lag budget "
+                        "for %.1f s (%llu steps behind). Holding the clock so it can catch up; the "
+                        "sim resumes on its own."),
+                   now - mpm_unresponsive_since_,
+                   static_cast<unsigned long long>(health.lag_steps));
+        }
+        return;
+    }
+
+    mpm_unresponsive_since_ = 0.0;
+    mpm_rebuild_wait_reported_ = false;
+    // ⚠ Only lift a pause WE applied. An operator who paused during a stall should stay paused.
+    //
+    // ⚠ AND A HALT MUST BE LIFTABLE. I first wrote this so a wrong-epoch halt never resumed, which
+    // is wrong: a global reset followed by the sidecar adopting the new epoch is precisely the
+    // documented recovery, and health saying "back in this world" is the evidence that it happened.
+    // Refusing to resume on good health would turn the recovery path into a dead end.
+    if (mpm_paused_by_link_) {
+        const bool was_halt = mpm_halted_;
+        mpm_paused_by_link_ = false;
+        mpm_halted_ = false;
+        pause(false);
+        UE_LOG(LogPhysicsCoordinator, Log,
+               TEXT("resumed — the MPM sidecar %s (%llu steps behind, within budget)"),
+               was_halt ? TEXT("is back in this world") : TEXT("caught up"),
+               static_cast<unsigned long long>(health.lag_steps));
     }
 }
 
@@ -1289,6 +2041,28 @@ void ASimModeWorldBase::drawCollisionDebugOverlay()
 
 void ASimModeWorldBase::reset()
 {
+    // ⚠ SAY EVERY TIME THIS RUNS. A single Backspace produced TWO epoch bumps ~1 s apart on
+    // 2026-08-26, so the sand rebuilt twice for one operator reset. The sand was right: reset()
+    // genuinely ran twice. The only 1-second-delayed reset in the codebase is
+    // `WorldSimApi::spawnPlayer` (`sleep_for(1s); simmode_->reset()`), which is the prime suspect
+    // and unproven. This line turns "it resets twice" into a timestamped count.
+    UE_LOG(LogPhysicsCoordinator, Log, TEXT("ASimModeWorldBase::reset() called (frame %u)"),
+           GFrameNumber);
+
+    // Legacy's only reset signal to the MPM sidecar — see currentMpmStamp.
+    //
+    // ⚠ COLLAPSE MULTIPLE CALLS IN ONE FRAME. reset() arrives more than once per operator reset —
+    // measured 2026-08-26 as pairs 0.8 s apart with two vehicles present — and each bump made the
+    // sidecar tear down and rebuild 634 k particles again. One reset must be one epoch, so the bump
+    // is keyed to the frame number rather than the call.
+    if (physics_scene_coordinator_ == nullptr) {
+        const uint32 frame = GFrameNumber;
+        if (frame != mpm_legacy_epoch_frame_) {
+            mpm_legacy_epoch_frame_ = frame;
+            ++mpm_legacy_epoch_;
+        }
+    }
+
     UAirBlueprintLib::RunCommandOnGameThread([this]() {
         if (physics_world_)
             physics_world_->reset();

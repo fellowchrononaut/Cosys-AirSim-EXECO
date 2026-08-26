@@ -1,0 +1,1111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""Helper functions for computing rigid body inertia properties."""
+
+from __future__ import annotations
+
+import math
+import warnings
+from numbers import Real
+
+import numpy as np
+import warp as wp
+
+from .types import (
+    GeoType,
+    Heightfield,
+    Mesh,
+    Vec3,
+)
+
+_BARREL_INERTIA_NODES, _BARREL_INERTIA_WEIGHTS = np.polynomial.legendre.leggauss(32)
+
+# Relative tolerance for eigenvalue positivity checks.  An eigenvalue is
+# considered "near-zero" only when it is smaller than this fraction of the
+# largest eigenvalue.  This prevents spurious inflation of physically correct
+# but small inertia values (e.g. lightweight gripper pads).
+_INERTIA_REL_TOL = 1.0e-6
+
+# Absolute floor for the eigenvalue check when max_eigenvalue itself is ~0
+# (degenerate tensor).  Must be well below the smallest physically meaningful
+# eigenvalue we want to preserve (order ~1e-7 for lightweight gripper pads).
+_INERTIA_ABS_FLOOR = 1.0e-10
+
+# Absolute value used when an eigenvalue correction *is* triggered.  This
+# keeps the corrected tensor well-conditioned (e.g. singular inertia [0,0,0]
+# becomes [1e-6, 1e-6, 1e-6]).
+_INERTIA_ABS_ADJUSTMENT = 1.0e-6
+
+# Match numpy's default np.allclose() tolerances when deciding whether a
+# nearly-symmetric tensor should be treated as unchanged.
+_INERTIA_SYMMETRY_RTOL = 1.0e-5
+_INERTIA_SYMMETRY_ATOL = 1.0e-8
+
+_MESH_INERTIA_TILE_SIZE = 256
+
+
+def _validate_hollow_thickness(
+    shape_name: str,
+    thickness: float,
+    limits: tuple[tuple[str, float], ...],
+) -> float:
+    if isinstance(thickness, bool) or not isinstance(thickness, Real):
+        raise TypeError(f"thickness must be a real scalar for a hollow {shape_name} geom")
+
+    thickness = float(thickness)
+    if not math.isfinite(thickness):
+        raise ValueError(f"thickness must be finite for a hollow {shape_name} geom; got {thickness}")
+    if thickness < 0.0:
+        raise ValueError(f"thickness must be >= 0 for a hollow {shape_name} geom; got {thickness}")
+    if thickness == 0.0:
+        warnings.warn(
+            f"A hollow {shape_name} geom with zero thickness has zero mass and inertia.",
+            stacklevel=2,
+        )
+        return thickness
+
+    for dim_name, dim_value in limits:
+        dim_limit = float(dim_value)
+        if thickness >= dim_limit:
+            raise ValueError(
+                f"thickness ({thickness}) must be smaller than {dim_name} ({dim_limit}) for a hollow {shape_name} geom"
+            )
+
+    return thickness
+
+
+def compute_inertia_sphere(density: float, radius: float) -> tuple[float, wp.vec3, wp.mat33]:
+    """Helper to compute mass and inertia of a solid sphere
+
+    Args:
+        density: The sphere density [kg/m³]
+        radius: The sphere radius [m]
+
+    Returns:
+
+        A tuple of (mass, center of mass, inertia) with inertia specified around the center of mass
+    """
+
+    v = 4.0 / 3.0 * wp.pi * radius * radius * radius
+
+    m = density * v
+    Ia = 2.0 / 5.0 * m * radius * radius
+
+    I = wp.mat33([[Ia, 0.0, 0.0], [0.0, Ia, 0.0], [0.0, 0.0, Ia]])
+
+    return (m, wp.vec3(), I)
+
+
+def compute_inertia_sphere_from_mass(mass: float, radius: float) -> wp.mat33:
+    """Helper to compute 3x3 inertia matrix of a solid box with given mass and half-extents.
+
+    Args:
+        mass: The box mass [kg]
+        hx: The box half-extent along the x-axis [m]
+        hy: The box half-extent along the y-axis [m]
+        hz: The box half-extent along the z-axis [m]
+
+    Returns:
+
+        A 3x3 inertia matrix with inertia specified around the center of mass
+    """
+    Ia = 0.4 * mass * radius * radius
+    I = wp.mat33([[Ia, 0.0, 0.0], [0.0, Ia, 0.0], [0.0, 0.0, Ia]])
+    return I
+
+
+def compute_inertia_capsule(density: float, radius: float, half_height: float) -> tuple[float, wp.vec3, wp.mat33]:
+    """Helper to compute mass and inertia of a solid capsule extending along the z-axis
+
+    Args:
+        density: The capsule density [kg/m³]
+        radius: The capsule radius [m]
+        half_height: Half-length of the cylindrical section (excluding hemispherical caps) [m]
+
+    Returns:
+
+        A tuple of (mass, center of mass, inertia) with inertia specified around the center of mass
+    """
+
+    h = 2.0 * half_height  # full height of the cylindrical section
+
+    ms = density * (4.0 / 3.0) * wp.pi * radius * radius * radius
+    mc = density * wp.pi * radius * radius * h
+
+    # total mass
+    m = ms + mc
+
+    # adapted from ODE
+    Ia = mc * (0.25 * radius * radius + (1.0 / 12.0) * h * h) + ms * (
+        0.4 * radius * radius + 0.375 * radius * h + 0.25 * h * h
+    )
+    Ib = (mc * 0.5 + ms * 0.4) * radius * radius
+
+    # For Z-axis orientation: I_xx = I_yy = Ia, I_zz = Ib
+    I = wp.mat33([[Ia, 0.0, 0.0], [0.0, Ia, 0.0], [0.0, 0.0, Ib]])
+
+    return (m, wp.vec3(), I)
+
+
+def compute_inertia_cylinder(
+    density: float, radius: float, half_height: float, barrel_radius: float = 0.0
+) -> tuple[float, wp.vec3, wp.mat33]:
+    """Compute mass and inertia of a solid cylinder extending along the z-axis.
+
+    Args:
+        density: The cylinder density [kg/m³].
+        radius: The cylinder radius at its ends [m].
+        half_height: The half-height of the cylinder along the z-axis [m].
+        barrel_radius: The radius of the symmetric circular side-profile arc [m].
+            Use `0.0` for a straight-sided cylinder.
+
+    Returns:
+        The mass, center of mass, and inertia tensor about the center of mass.
+    """
+    if barrel_radius != 0.0:
+        if barrel_radius < half_height:
+            raise ValueError("barrel_radius must be zero or at least half_height")
+
+        z = half_height * _BARREL_INERTIA_NODES
+        weights = half_height * _BARREL_INERTIA_WEIGHTS
+
+        barrel_radius_sq = barrel_radius * barrel_radius
+        half_height_sq = half_height * half_height
+        end_offset = math.sqrt(barrel_radius_sq - half_height_sq)
+        profile_offset = np.sqrt(np.maximum(barrel_radius_sq - z * z, 0.0))
+        radius_profile = radius + (half_height_sq - z * z) / (profile_offset + end_offset)
+
+        radius_sq = radius_profile * radius_profile
+        radius_fourth = radius_sq * radius_sq
+        mass = float(density * np.pi * np.dot(weights, radius_sq))
+        inertia_axial = float(0.5 * density * np.pi * np.dot(weights, radius_fourth))
+        inertia_radial = float(density * np.pi * np.dot(weights, 0.25 * radius_fourth + radius_sq * z * z))
+    else:
+        height = 2.0 * half_height
+        mass = density * wp.pi * radius * radius * height
+        inertia_radial = 1.0 / 12.0 * mass * (3.0 * radius * radius + height * height)
+        inertia_axial = 0.5 * mass * radius * radius
+
+    inertia = wp.mat33([[inertia_radial, 0.0, 0.0], [0.0, inertia_radial, 0.0], [0.0, 0.0, inertia_axial]])
+
+    return mass, wp.vec3(), inertia
+
+
+def compute_inertia_cone(density: float, radius: float, half_height: float) -> tuple[float, wp.vec3, wp.mat33]:
+    """Helper to compute mass and inertia of a solid cone extending along the z-axis
+
+    Args:
+        density: The cone density [kg/m³]
+        radius: The cone base radius [m]
+        half_height: The half-height of the cone (distance from geometric center to base or apex) [m]
+
+    Returns:
+
+        A tuple of (mass, center of mass, inertia) with inertia specified around the center of mass
+    """
+
+    h = 2.0 * half_height  # full height
+
+    m = density * wp.pi * radius * radius * h / 3.0
+
+    # Center of mass is at -h/4 from the geometric center
+    # Since the cone has base at -h/2 and apex at +h/2, the COM is 1/4 of the height from base toward apex
+    com = wp.vec3(0.0, 0.0, -h / 4.0)
+
+    # Inertia about the center of mass
+    Ia = 3 / 20 * m * radius * radius + 3 / 80 * m * h * h
+    Ib = 3 / 10 * m * radius * radius
+
+    # For Z-axis orientation: I_xx = I_yy = Ia, I_zz = Ib
+    I = wp.mat33([[Ia, 0.0, 0.0], [0.0, Ia, 0.0], [0.0, 0.0, Ib]])
+
+    return (m, com, I)
+
+
+def compute_inertia_ellipsoid(density: float, rx: float, ry: float, rz: float) -> tuple[float, wp.vec3, wp.mat33]:
+    """Helper to compute mass and inertia of a solid ellipsoid
+
+    The ellipsoid is centered at the origin with semi-axes rx, ry, rz along the x, y, z axes respectively.
+
+    Args:
+        density: The ellipsoid density [kg/m³]
+        rx: The semi-axis along the x-axis [m]
+        ry: The semi-axis along the y-axis [m]
+        rz: The semi-axis along the z-axis [m]
+
+    Returns:
+
+        A tuple of (mass, center of mass, inertia) with inertia specified around the center of mass
+    """
+    # Volume of ellipsoid: V = (4/3) * pi * rx * ry * rz
+    v = (4.0 / 3.0) * wp.pi * rx * ry * rz
+    m = density * v
+
+    # Inertia tensor for a solid ellipsoid about its center of mass:
+    # Ixx = (1/5) * m * (ry² + rz²)
+    # Iyy = (1/5) * m * (rx² + rz²)
+    # Izz = (1/5) * m * (rx² + ry²)
+    Ixx = (1.0 / 5.0) * m * (ry * ry + rz * rz)
+    Iyy = (1.0 / 5.0) * m * (rx * rx + rz * rz)
+    Izz = (1.0 / 5.0) * m * (rx * rx + ry * ry)
+
+    I = wp.mat33([[Ixx, 0.0, 0.0], [0.0, Iyy, 0.0], [0.0, 0.0, Izz]])
+
+    return (m, wp.vec3(), I)
+
+
+def compute_inertia_box_from_mass(mass: float, hx: float, hy: float, hz: float) -> wp.mat33:
+    """Helper to compute 3x3 inertia matrix of a solid box with given mass and half-extents.
+
+    Args:
+        mass: The box mass [kg]
+        hx: The box half-extent along the x-axis [m]
+        hy: The box half-extent along the y-axis [m]
+        hz: The box half-extent along the z-axis [m]
+
+    Returns:
+
+        A 3x3 inertia matrix with inertia specified around the center of mass
+    """
+    Ia = 1.0 / 3.0 * mass * (hy * hy + hz * hz)
+    Ib = 1.0 / 3.0 * mass * (hx * hx + hz * hz)
+    Ic = 1.0 / 3.0 * mass * (hx * hx + hy * hy)
+
+    I = wp.mat33([[Ia, 0.0, 0.0], [0.0, Ib, 0.0], [0.0, 0.0, Ic]])
+
+    return I
+
+
+def compute_inertia_box(density: float, hx: float, hy: float, hz: float) -> tuple[float, wp.vec3, wp.mat33]:
+    """Helper to compute mass and inertia of a solid box
+
+    Args:
+        density: The box density [kg/m³]
+        hx: The box half-extent along the x-axis [m]
+        hy: The box half-extent along the y-axis [m]
+        hz: The box half-extent along the z-axis [m]
+
+    Returns:
+
+        A tuple of (mass, center of mass, inertia) with inertia specified around the center of mass
+    """
+
+    v = 8.0 * hx * hy * hz
+    m = density * v
+    I = compute_inertia_box_from_mass(m, hx, hy, hz)
+
+    return (m, wp.vec3(), I)
+
+
+@wp.func
+def triangle_inertia(
+    v0: wp.vec3,
+    v1: wp.vec3,
+    v2: wp.vec3,
+):
+    vol = wp.dot(v0, wp.cross(v1, v2)) / 6.0  # tetra volume (0,v0,v1,v2)
+    first = vol * (v0 + v1 + v2) / 4.0  # first-order integral
+
+    # second-order integral (symmetric)
+    o00, o11, o22 = wp.outer(v0, v0), wp.outer(v1, v1), wp.outer(v2, v2)
+    o01, o02, o12 = wp.outer(v0, v1), wp.outer(v0, v2), wp.outer(v1, v2)
+    o01t, o02t, o12t = wp.transpose(o01), wp.transpose(o02), wp.transpose(o12)
+
+    second = (vol / 10.0) * (o00 + o11 + o22)
+    second += (vol / 20.0) * (o01 + o01t + o02 + o02t + o12 + o12t)
+
+    return vol, first, second
+
+
+@wp.func
+def store_mesh_inertia_sum(
+    v_sum: float,
+    f_sum: wp.vec3,
+    s_sum: wp.mat33,
+    lane: int,
+    volume: wp.array[float],
+    first: wp.array[wp.vec3],
+    second: wp.array[wp.mat33],
+):
+    v_total = wp.tile_sum(wp.tile(v_sum))[0]
+    fx_total = wp.tile_sum(wp.tile(f_sum[0]))[0]
+    fy_total = wp.tile_sum(wp.tile(f_sum[1]))[0]
+    fz_total = wp.tile_sum(wp.tile(f_sum[2]))[0]
+    s00_total = wp.tile_sum(wp.tile(s_sum[0, 0]))[0]
+    s01_total = wp.tile_sum(wp.tile(s_sum[0, 1]))[0]
+    s02_total = wp.tile_sum(wp.tile(s_sum[0, 2]))[0]
+    s10_total = wp.tile_sum(wp.tile(s_sum[1, 0]))[0]
+    s11_total = wp.tile_sum(wp.tile(s_sum[1, 1]))[0]
+    s12_total = wp.tile_sum(wp.tile(s_sum[1, 2]))[0]
+    s20_total = wp.tile_sum(wp.tile(s_sum[2, 0]))[0]
+    s21_total = wp.tile_sum(wp.tile(s_sum[2, 1]))[0]
+    s22_total = wp.tile_sum(wp.tile(s_sum[2, 2]))[0]
+
+    if lane == 0:
+        volume[0] = v_total
+        first[0] = wp.vec3(fx_total, fy_total, fz_total)
+        second[0] = wp.mat33(
+            s00_total,
+            s01_total,
+            s02_total,
+            s10_total,
+            s11_total,
+            s12_total,
+            s20_total,
+            s21_total,
+            s22_total,
+        )
+
+
+@wp.kernel(enable_backward=False)
+def compute_solid_mesh_inertia(
+    indices: wp.array[int],
+    vertices: wp.array[wp.vec3],
+    num_tris: int,
+    # outputs
+    volume: wp.array[float],
+    first: wp.array[wp.vec3],
+    second: wp.array[wp.mat33],
+):
+    _block_id, lane = wp.tid()
+
+    v_sum = float(0.0)
+    f_sum = wp.vec3(0.0)
+    s_sum = wp.mat33(0.0)
+
+    for tri in range(lane, num_tris, wp.block_dim()):
+        p = vertices[indices[tri * 3 + 0]]
+        q = vertices[indices[tri * 3 + 1]]
+        r = vertices[indices[tri * 3 + 2]]
+
+        v, f, s = triangle_inertia(p, q, r)
+        v_sum += v
+        f_sum += f
+        s_sum += s
+
+    store_mesh_inertia_sum(v_sum, f_sum, s_sum, lane, volume, first, second)
+
+
+@wp.kernel(enable_backward=False)
+def compute_hollow_mesh_inertia(
+    indices: wp.array[int],
+    vertices: wp.array[wp.vec3],
+    thickness: wp.array[float],
+    num_tris: int,
+    # outputs
+    volume: wp.array[float],
+    first: wp.array[wp.vec3],
+    second: wp.array[wp.mat33],
+):
+    _block_id, lane = wp.tid()
+
+    v_sum = float(0.0)
+    f_sum = wp.vec3(0.0)
+    s_sum = wp.mat33(0.0)
+
+    for tid in range(lane, num_tris, wp.block_dim()):
+        i = indices[tid * 3 + 0]
+        j = indices[tid * 3 + 1]
+        k = indices[tid * 3 + 2]
+
+        vi = vertices[i]
+        vj = vertices[j]
+        vk = vertices[k]
+
+        normal = -wp.normalize(wp.cross(vj - vi, vk - vi))
+        ti = normal * thickness[i]
+        tj = normal * thickness[j]
+        tk = normal * thickness[k]
+
+        # wedge vertices
+        vi0 = vi - ti
+        vi1 = vi + ti
+        vj0 = vj - tj
+        vj1 = vj + tj
+        vk0 = vk - tk
+        vk1 = vk + tk
+
+        v_total = float(0.0)
+        f_total = wp.vec3(0.0)
+        s_total = wp.mat33(0.0)
+
+        v, f, s = triangle_inertia(vi0, vj0, vk0)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vj0, vk1, vk0)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vj0, vj1, vk1)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vj0, vi1, vj1)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vj0, vi0, vi1)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vj1, vi1, vk1)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vi1, vi0, vk0)
+        v_total += v
+        f_total += f
+        s_total += s
+        v, f, s = triangle_inertia(vi1, vk0, vk1)
+        v_total += v
+        f_total += f
+        s_total += s
+
+        v_sum += v_total
+        f_sum += f_total
+        s_sum += s_total
+
+    store_mesh_inertia_sum(v_sum, f_sum, s_sum, lane, volume, first, second)
+
+
+def compute_inertia_mesh(
+    density: float,
+    vertices: list[Vec3] | np.ndarray,
+    indices: list[int] | np.ndarray,
+    is_solid: bool = True,
+    thickness: list[float] | float = 0.001,
+) -> tuple[float, wp.vec3, wp.mat33, float]:
+    """
+    Compute the mass, center of mass, inertia, and volume of a triangular mesh.
+
+    Args:
+        density: The density of the mesh material.
+        vertices: A list of vertex positions (3D coordinates).
+        indices: A list of triangle indices (each triangle is defined by 3 vertex indices).
+        is_solid: If True, compute inertia for a solid mesh; if False, for a hollow mesh using the given thickness.
+        thickness: Thickness of the mesh if it is hollow. Can be a single value or a list of values for each vertex.
+
+    Returns:
+        A tuple containing:
+            - mass: The mass of the mesh.
+            - com: The center of mass (3D coordinates).
+            - I: The inertia tensor (3x3 matrix).
+            - volume: The signed volume of the mesh.
+    """
+
+    indices = np.array(indices).flatten()
+    num_tris = len(indices) // 3
+
+    # Allocating for mass and inertia
+    com_warp = wp.zeros(1, dtype=wp.vec3)
+    I_warp = wp.zeros(1, dtype=wp.mat33)
+    vol_warp = wp.zeros(1, dtype=float)
+
+    wp_vertices = wp.array(vertices, dtype=wp.vec3)
+    wp_indices = wp.array(indices, dtype=int)
+
+    if is_solid:
+        wp.launch_tiled(
+            kernel=compute_solid_mesh_inertia,
+            dim=1,
+            inputs=[
+                wp_indices,
+                wp_vertices,
+                num_tris,
+            ],
+            outputs=[
+                vol_warp,
+                com_warp,
+                I_warp,
+            ],
+            block_dim=_MESH_INERTIA_TILE_SIZE,
+        )
+    else:
+        if isinstance(thickness, float):
+            thickness = [thickness] * len(vertices)
+        wp.launch_tiled(
+            kernel=compute_hollow_mesh_inertia,
+            dim=1,
+            inputs=[
+                wp_indices,
+                wp_vertices,
+                wp.array(thickness, dtype=float),
+                num_tris,
+            ],
+            outputs=[
+                vol_warp,
+                com_warp,
+                I_warp,
+            ],
+            block_dim=_MESH_INERTIA_TILE_SIZE,
+        )
+
+    V_tot = float(vol_warp.numpy()[0])  # signed volume
+    F_tot = com_warp.numpy()[0]  # first moment
+    S_tot = I_warp.numpy()[0]  # second moment
+
+    # If the winding is inward, flip signs
+    if V_tot < 0:
+        V_tot = -V_tot
+        F_tot = -F_tot
+        S_tot = -S_tot
+
+    mass = density * V_tot
+    if V_tot > 0.0:
+        com = F_tot / V_tot
+    else:
+        com = F_tot
+
+    S_tot *= density  # include density
+    I_origin = np.trace(S_tot) * np.eye(3) - S_tot  # inertia about origin
+    r = com
+    I_com = I_origin - mass * ((r @ r) * np.eye(3) - np.outer(r, r))
+
+    return mass, wp.vec3(*com), wp.mat33(*I_com), V_tot
+
+
+@wp.func
+def transform_inertia(mass: float, inertia: wp.mat33, offset: wp.vec3, quat: wp.quat) -> wp.mat33:
+    """
+    Compute a rigid body's inertia tensor expressed in a new coordinate frame.
+
+    The transformation applies (1) a rotation by quaternion ``quat`` and
+    (2) a parallel-axis shift by vector ``offset`` (Steiner's theorem).
+    Let ``R`` be the rotation matrix corresponding to ``quat``. The returned
+    inertia tensor :math:`\\mathbf{I}'` is
+
+    .. math::
+
+        \\mathbf{I}' \\,=\\, \\mathbf{R}\\,\\mathbf{I}\\,\\mathbf{R}^\\top
+        \\, + \\, m\\big(\\lVert\\mathbf{p}\\rVert^2\\,\\mathbf{I}_3
+        \\, - \\, \\mathbf{p}\\,\\mathbf{p}^\\top\\big),
+
+    where :math:`\\mathbf{I}_3` is the :math:`3\\times3` identity matrix.
+
+    Args:
+        mass: Mass of the rigid body.
+        inertia: Inertia tensor expressed in the body's local frame, relative
+            to its center of mass.
+        offset: Position vector from the new frame's origin to the body's
+            center of mass.
+        quat: Orientation of the body relative to the new frame, expressed
+            as a quaternion.
+
+    Returns:
+        wp.mat33: The transformed inertia tensor expressed in the new frame.
+    """
+
+    R = wp.quat_to_matrix(quat)
+
+    # Steiner's theorem
+    return R @ inertia @ wp.transpose(R) + mass * (
+        wp.dot(offset, offset) * wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0) - wp.outer(offset, offset)
+    )
+
+
+def compute_inertia_shape(
+    type: int,
+    scale: Vec3,
+    src: Mesh | Heightfield | None,
+    density: float,
+    is_solid: bool = True,
+    thickness: list[float] | float = 0.001,
+) -> tuple[float, wp.vec3, wp.mat33]:
+    """Computes the mass, center of mass and 3x3 inertia tensor of a shape
+
+    Args:
+        type: The type of shape (GeoType.SPHERE, GeoType.BOX, etc.)
+        scale: The scale of the shape
+        src: The source shape (Mesh or Heightfield)
+        density: The density of the shape
+        is_solid: Whether the shape is solid or hollow
+        thickness: The thickness of the shape (used for collision detection, and inertia computation of hollow shapes)
+
+    Returns:
+        The mass, center of mass and 3x3 inertia tensor of the shape
+    """
+    if density == 0.0 or type == GeoType.PLANE:  # zero density means fixed
+        return 0.0, wp.vec3(), wp.mat33()
+
+    if type == GeoType.SPHERE:
+        solid = compute_inertia_sphere(density, scale[0])
+        if is_solid:
+            return solid
+        else:
+            thickness = _validate_hollow_thickness("sphere", thickness, (("radius", scale[0]),))
+            if thickness == 0.0:
+                return 0.0, solid[1], wp.mat33()
+            hollow = compute_inertia_sphere(density, scale[0] - thickness)
+            return solid[0] - hollow[0], solid[1], solid[2] - hollow[2]
+    elif type == GeoType.BOX:
+        # scale stores half-extents (hx, hy, hz)
+        solid = compute_inertia_box(density, scale[0], scale[1], scale[2])
+        if is_solid:
+            return solid
+        else:
+            thickness = _validate_hollow_thickness(
+                "box", thickness, (("hx", scale[0]), ("hy", scale[1]), ("hz", scale[2]))
+            )
+            if thickness == 0.0:
+                return 0.0, solid[1], wp.mat33()
+            hollow = compute_inertia_box(density, scale[0] - thickness, scale[1] - thickness, scale[2] - thickness)
+            return solid[0] - hollow[0], solid[1], solid[2] - hollow[2]
+    elif type == GeoType.CAPSULE:
+        # scale[0] = radius, scale[1] = half_height
+        solid = compute_inertia_capsule(density, scale[0], scale[1])
+        if is_solid:
+            return solid
+        else:
+            thickness = _validate_hollow_thickness(
+                "capsule", thickness, (("radius", scale[0]), ("half_height", scale[1]))
+            )
+            if thickness == 0.0:
+                return 0.0, solid[1], wp.mat33()
+            hollow = compute_inertia_capsule(density, scale[0] - thickness, scale[1] - thickness)
+            return solid[0] - hollow[0], solid[1], solid[2] - hollow[2]
+    elif type == GeoType.CYLINDER:
+        # scale = (end_radius, half_height, barrel_radius)
+        solid = compute_inertia_cylinder(density, scale[0], scale[1], scale[2])
+        if is_solid:
+            return solid
+        else:
+            thickness = _validate_hollow_thickness(
+                "cylinder", thickness, (("radius", scale[0]), ("half_height", scale[1]))
+            )
+            if thickness == 0.0:
+                return 0.0, solid[1], wp.mat33()
+            inner_barrel_radius = scale[2] - thickness if scale[2] > 0.0 else 0.0
+            hollow = compute_inertia_cylinder(density, scale[0] - thickness, scale[1] - thickness, inner_barrel_radius)
+            return solid[0] - hollow[0], solid[1], solid[2] - hollow[2]
+    elif type == GeoType.CONE:
+        # scale[0] = radius, scale[1] = half_height
+        solid = compute_inertia_cone(density, scale[0], scale[1])
+        if is_solid:
+            return solid
+        else:
+            thickness = _validate_hollow_thickness("cone", thickness, (("radius", scale[0]), ("half_height", scale[1])))
+            if thickness == 0.0:
+                return 0.0, solid[1], wp.mat33()
+            hollow = compute_inertia_cone(density, scale[0] - thickness, scale[1] - thickness)
+            m_shell = solid[0] - hollow[0]
+            # Cones have non-zero COM so outer and inner cones have different COMs;
+            # compute the shell COM as the weighted difference, then shift both
+            # inertia tensors to the shell COM before subtracting (parallel-axis theorem).
+            com_s = np.array(solid[1])
+            com_i = np.array(hollow[1])
+            com_shell = (solid[0] * com_s - hollow[0] * com_i) / m_shell
+
+            def _shift_inertia(mass, I_mat, com_from, com_to):
+                d = com_to - np.array(com_from)
+                return np.array(I_mat).reshape(3, 3) + mass * (np.dot(d, d) * np.eye(3) - np.outer(d, d))
+
+            I_shell = _shift_inertia(solid[0], solid[2], com_s, com_shell) - _shift_inertia(
+                hollow[0], hollow[2], com_i, com_shell
+            )
+            return m_shell, wp.vec3(*com_shell), wp.mat33(*I_shell.flatten())
+    elif type == GeoType.ELLIPSOID:
+        # scale stores semi-axes (rx, ry, rz)
+        solid = compute_inertia_ellipsoid(density, scale[0], scale[1], scale[2])
+        if is_solid:
+            return solid
+        else:
+            thickness = _validate_hollow_thickness(
+                "ellipsoid", thickness, (("rx", scale[0]), ("ry", scale[1]), ("rz", scale[2]))
+            )
+            if thickness == 0.0:
+                return 0.0, solid[1], wp.mat33()
+            hollow = compute_inertia_ellipsoid(
+                density, scale[0] - thickness, scale[1] - thickness, scale[2] - thickness
+            )
+            return solid[0] - hollow[0], solid[1], solid[2] - hollow[2]
+    elif type == GeoType.HFIELD or type == GeoType.GAUSSIAN:
+        # Heightfields are always static terrain; Gaussians are render-only (zero mass, zero inertia)
+        return 0.0, wp.vec3(), wp.mat33()
+    elif type == GeoType.MESH or type == GeoType.CONVEX_MESH:
+        assert src is not None, "src must be provided for mesh or convex hull shapes"
+        if src.has_inertia and src.mass > 0.0 and src.is_solid == is_solid:
+            m, c, I = src.mass, src.com, src.inertia
+            scale = wp.vec3(scale)
+            sx, sy, sz = scale
+
+            # Mass scales with absolute volume — mirrored geometry (det(scale) < 0)
+            # has the same volume as the original, so use |sx*sy*sz| here. The
+            # signed scale is still applied below to mirror the COM and to flip
+            # the appropriate inertia products. Without abs(), negative-scale
+            # mesh/convex-hull shapes would receive negative mass, which
+            # ``verify_and_correct_inertia`` then clamps to zero, making the
+            # body effectively static.
+            mass_ratio = abs(sx * sy * sz) * density
+            m_new = m * mass_ratio
+
+            c_new = wp.cw_mul(c, scale)
+
+            Ixx = I[0, 0] * (sy**2 + sz**2) / 2 * mass_ratio
+            Iyy = I[1, 1] * (sx**2 + sz**2) / 2 * mass_ratio
+            Izz = I[2, 2] * (sx**2 + sy**2) / 2 * mass_ratio
+            # Products of inertia pick up the sign of the corresponding scale
+            # pair, which is the correct mirror behavior under a single-axis
+            # sign flip.
+            Ixy = I[0, 1] * sx * sy * mass_ratio
+            Ixz = I[0, 2] * sx * sz * mass_ratio
+            Iyz = I[1, 2] * sy * sz * mass_ratio
+
+            I_new = wp.mat33([[Ixx, Ixy, Ixz], [Ixy, Iyy, Iyz], [Ixz, Iyz, Izz]])
+
+            return m_new, c_new, I_new
+        elif type == GeoType.MESH or type == GeoType.CONVEX_MESH:
+            assert isinstance(src, Mesh), "src must be a Mesh for mesh or convex hull shapes"
+            # fall back to computing inertia from mesh geometry
+            vertices = np.array(src.vertices) * np.array(scale)
+            m, c, I, _vol = compute_inertia_mesh(density, vertices, src.indices, is_solid, thickness)
+            return m, c, I
+    raise ValueError(f"Unsupported shape type: {type}")
+
+
+def verify_and_correct_inertia(
+    mass: float,
+    inertia: wp.mat33,
+    balance_inertia: bool = True,
+    bound_mass: float | None = None,
+    bound_inertia: float | None = None,
+    body_label: str | None = None,
+) -> tuple[float, wp.mat33, bool]:
+    """Verify and correct inertia values similar to MuJoCo's balanceinertia compiler setting.
+
+    This function checks for invalid inertia values and corrects them if needed. It performs
+    the following checks and corrections:
+    1. Ensures mass is non-negative (and bounded if specified)
+    2. Ensures inertia diagonal elements are non-negative (and bounded if specified)
+    3. Ensures inertia matrix satisfies triangle inequality (principal moments satisfy Ixx + Iyy >= Izz etc.)
+    4. Optionally balances inertia to satisfy the triangle inequality exactly
+
+    Eigenvalue positivity is checked using a relative threshold
+    (``_INERTIA_REL_TOL * max_eigenvalue``) so that lightweight components with
+    small but physically valid inertia are not spuriously inflated.  When
+    correction *is* needed, the adjustment uses a small absolute floor
+    (``_INERTIA_ABS_ADJUSTMENT``) to keep the result well-conditioned.
+
+    Args:
+        mass: The mass of the body [kg].
+        inertia: The 3x3 inertia tensor [kg*m^2].
+        balance_inertia: If True, adjust inertia to exactly satisfy triangle inequality (like MuJoCo's balanceinertia).
+        bound_mass: If specified, clamp mass to be at least this value [kg].
+        bound_inertia: If specified, clamp inertia diagonal elements to be at least this value [kg*m^2].
+        body_label: Optional label/name of the body for more informative warnings.
+
+    Returns:
+        A tuple of (corrected_mass, corrected_inertia, was_corrected) where was_corrected
+        indicates if any corrections were made
+    """
+    was_corrected = False
+    corrected_mass = mass
+    inertia_array = np.array(inertia).reshape(3, 3)
+    corrected_inertia = inertia_array.copy()
+
+    # Format body identifier for warnings
+    body_id = f" for body '{body_label}'" if body_label else ""
+
+    # Check for NaN/Inf in mass or inertia
+    if not np.isfinite(mass) or not np.all(np.isfinite(inertia_array)):
+        warnings.warn(
+            f"NaN/Inf detected in mass or inertia{body_id}, zeroing out mass and inertia",
+            stacklevel=2,
+        )
+        return 0.0, wp.mat33(np.zeros((3, 3))), True
+
+    # Check and correct mass
+    if mass < 0:
+        warnings.warn(f"Negative mass {mass} detected{body_id}, setting to 0", stacklevel=2)
+        corrected_mass = 0.0
+        was_corrected = True
+    elif bound_mass is not None and mass < bound_mass and mass > 0:
+        warnings.warn(f"Mass {mass} is below bound {bound_mass}{body_id}, clamping", stacklevel=2)
+        corrected_mass = bound_mass
+        was_corrected = True
+
+    # For zero mass, inertia should also be zero
+    if corrected_mass == 0.0:
+        if np.any(inertia_array != 0):
+            warnings.warn(f"Zero mass body{body_id} should have zero inertia, correcting", stacklevel=2)
+            corrected_inertia = np.zeros((3, 3))
+            was_corrected = True
+        return corrected_mass, wp.mat33(corrected_inertia), was_corrected
+
+    # Unconditionally symmetrize inertia matrix (idempotent for symmetric tensors)
+    symmetrized = (inertia_array + inertia_array.T) / 2
+    if not np.allclose(
+        inertia_array,
+        symmetrized,
+        rtol=_INERTIA_SYMMETRY_RTOL,
+        atol=_INERTIA_SYMMETRY_ATOL,
+    ):
+        warnings.warn(f"Inertia matrix{body_id} is not symmetric, making it symmetric", stacklevel=2)
+        was_corrected = True
+    corrected_inertia = symmetrized
+
+    # Compute eigenvalues (principal moments) for validation
+    try:
+        eigenvalues = np.linalg.eigvalsh(corrected_inertia)
+
+        # Check for negative or near-zero eigenvalues (ensure positive-definite).
+        # The threshold is relative to the largest eigenvalue so that small but
+        # physically valid inertia (lightweight components) is not inflated.
+        max_eig = np.max(eigenvalues)
+        eig_threshold = max(_INERTIA_REL_TOL * max_eig, _INERTIA_ABS_FLOOR)
+        if np.any(eigenvalues < eig_threshold):
+            warnings.warn(
+                f"Eigenvalues below threshold detected{body_id}: {eigenvalues}, correcting inertia",
+                stacklevel=2,
+            )
+            # Make positive definite by adjusting eigenvalues
+            min_eig = np.min(eigenvalues)
+            adjustment = eig_threshold - min_eig + _INERTIA_ABS_ADJUSTMENT
+            corrected_inertia += np.eye(3, dtype=corrected_inertia.dtype) * adjustment
+            eigenvalues += adjustment
+            was_corrected = True
+
+        # Apply inertia bounds to eigenvalues if specified
+        if bound_inertia is not None:
+            min_eig = np.min(eigenvalues)
+            if min_eig < bound_inertia:
+                warnings.warn(
+                    f"Minimum eigenvalue {min_eig} is below bound {bound_inertia}{body_id}, adjusting", stacklevel=2
+                )
+                adjustment = bound_inertia - min_eig
+                corrected_inertia += np.eye(3, dtype=corrected_inertia.dtype) * adjustment
+                eigenvalues += adjustment
+                was_corrected = True
+
+        # Sort eigenvalues to get principal moments
+        principal_moments = np.sort(eigenvalues)
+        I1, I2, I3 = principal_moments
+
+        # Check triangle inequality on principal moments
+        # For a physically valid inertia tensor: I1 + I2 >= I3 (with tolerance)
+        # Use float32 machine epsilon scaled by I3 as numerical noise floor.
+        tri_tol = max(np.finfo(np.float32).eps * I3, _INERTIA_ABS_FLOOR)
+        has_violations = I1 + I2 < I3 - tri_tol
+
+    except np.linalg.LinAlgError:
+        warnings.warn(f"Failed to compute eigenvalues for inertia tensor{body_id}, making it diagonal", stacklevel=2)
+        was_corrected = True
+        # Fallback: use diagonal elements
+        trace = np.trace(corrected_inertia)
+        if trace <= 0:
+            trace = _INERTIA_ABS_ADJUSTMENT
+        corrected_inertia = np.eye(3) * (trace / 3.0)
+        has_violations = False
+        principal_moments = [trace / 3.0, trace / 3.0, trace / 3.0]
+        eigenvalues = np.array(principal_moments)
+
+    if has_violations:
+        warnings.warn(
+            f"Inertia tensor{body_id} violates triangle inequality with principal moments ({I1:.6f}, {I2:.6f}, {I3:.6f})",
+            stacklevel=2,
+        )
+
+        if balance_inertia:
+            # For non-diagonal matrices, we need to adjust while preserving the rotation
+            deficit = I3 - I1 - I2
+            if deficit > 0:
+                # Simple approach: add scalar to all eigenvalues to ensure validity
+                # This preserves eigenvectors exactly
+                # We need: (I1 + a) + (I2 + a) >= I3 + a
+                # Which simplifies to: I1 + I2 + a >= I3
+                # So: a >= I3 - I1 - I2 = deficit
+                adjustment = deficit + _INERTIA_ABS_ADJUSTMENT
+
+                # Add scalar*I to shift all eigenvalues equally
+                corrected_inertia = corrected_inertia + np.eye(3, dtype=corrected_inertia.dtype) * adjustment
+                was_corrected = True
+
+                # Update principal moments
+                new_I1 = I1 + adjustment
+                new_I2 = I2 + adjustment
+                new_I3 = I3 + adjustment
+
+                warnings.warn(
+                    f"Balanced principal moments{body_id} from ({I1:.6f}, {I2:.6f}, {I3:.6f}) to "
+                    f"({new_I1:.6f}, {new_I2:.6f}, {new_I3:.6f})",
+                    stacklevel=2,
+                )
+
+    # Final check: ensure the corrected inertia matrix is positive definite
+    if has_violations and balance_inertia:
+        # Need to recompute after balancing since we modified the matrix
+        try:
+            eigenvalues = np.linalg.eigvalsh(corrected_inertia)
+        except np.linalg.LinAlgError:
+            warnings.warn(f"Failed to compute eigenvalues of inertia matrix{body_id}", stacklevel=2)
+            eigenvalues = np.array([0.0, 0.0, 0.0])
+
+    # Check final eigenvalues
+    if np.any(eigenvalues <= 0) or np.any(~np.isfinite(eigenvalues)):
+        warnings.warn(
+            f"Corrected inertia matrix{body_id} is not positive definite, this should not happen", stacklevel=2
+        )
+        # As a last resort, make it positive definite by adding a small value to diagonal.
+        min_eigenvalue = (
+            np.min(eigenvalues[np.isfinite(eigenvalues)])
+            if np.any(np.isfinite(eigenvalues))
+            else -_INERTIA_ABS_ADJUSTMENT
+        )
+        epsilon = abs(min_eigenvalue) + _INERTIA_ABS_ADJUSTMENT
+        corrected_inertia[0, 0] += epsilon
+        corrected_inertia[1, 1] += epsilon
+        corrected_inertia[2, 2] += epsilon
+        was_corrected = True
+
+    return corrected_mass, wp.mat33(corrected_inertia), was_corrected
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def validate_and_correct_inertia_kernel(
+    body_mass: wp.array[wp.float32],
+    body_inertia: wp.array[wp.mat33],
+    body_inv_mass: wp.array[wp.float32],
+    body_inv_inertia: wp.array[wp.mat33],
+    balance_inertia: wp.bool,
+    bound_mass: wp.float32,
+    bound_inertia: wp.float32,
+    correction_count: wp.array[wp.int32],  # Output: atomic counter of corrected bodies
+):
+    """Warp kernel for parallel inertia validation and correction.
+
+    This kernel performs basic validation and correction but doesn't support:
+    - Warning messages (handled by caller)
+    - Complex iterative balancing (falls back to simple correction)
+    """
+    tid = wp.tid()
+
+    mass = body_mass[tid]
+    inertia = body_inertia[tid]
+    original_inertia = inertia
+    was_corrected = False
+
+    # Detect NaN/Inf in mass or any inertia coefficient and zero out
+    if (
+        not wp.isfinite(mass)
+        or not wp.isfinite(inertia[0, 0])
+        or not wp.isfinite(inertia[0, 1])
+        or not wp.isfinite(inertia[0, 2])
+        or not wp.isfinite(inertia[1, 0])
+        or not wp.isfinite(inertia[1, 1])
+        or not wp.isfinite(inertia[1, 2])
+        or not wp.isfinite(inertia[2, 0])
+        or not wp.isfinite(inertia[2, 1])
+        or not wp.isfinite(inertia[2, 2])
+    ):
+        mass = 0.0
+        inertia = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        was_corrected = True
+
+    # Check for negative mass
+    if mass < 0.0:
+        mass = 0.0
+        was_corrected = True
+
+    # Apply mass bound (only to positive mass; zero mass means static/fixed body)
+    if bound_mass > 0.0 and mass < bound_mass and mass > 0.0:
+        mass = bound_mass
+        was_corrected = True
+
+    # For zero mass, inertia should be zero
+    if mass == 0.0:
+        was_corrected = was_corrected or (wp.ddot(inertia, inertia) > 0.0)
+        inertia = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    else:
+        # Symmetrize inertia matrix: (I + I^T) / 2
+        sym01 = (inertia[0, 1] + inertia[1, 0]) * 0.5
+        sym02 = (inertia[0, 2] + inertia[2, 0]) * 0.5
+        sym12 = (inertia[1, 2] + inertia[2, 1]) * 0.5
+        sym = wp.mat33(
+            inertia[0, 0],
+            sym01,
+            sym02,
+            sym01,
+            inertia[1, 1],
+            sym12,
+            sym02,
+            sym12,
+            inertia[2, 2],
+        )
+
+        tol01 = _INERTIA_SYMMETRY_ATOL + _INERTIA_SYMMETRY_RTOL * wp.abs(sym01)
+        tol02 = _INERTIA_SYMMETRY_ATOL + _INERTIA_SYMMETRY_RTOL * wp.abs(sym02)
+        tol12 = _INERTIA_SYMMETRY_ATOL + _INERTIA_SYMMETRY_RTOL * wp.abs(sym12)
+        if (
+            wp.abs(inertia[0, 1] - sym01) > tol01
+            or wp.abs(inertia[1, 0] - sym01) > tol01
+            or wp.abs(inertia[0, 2] - sym02) > tol02
+            or wp.abs(inertia[2, 0] - sym02) > tol02
+            or wp.abs(inertia[1, 2] - sym12) > tol12
+            or wp.abs(inertia[2, 1] - sym12) > tol12
+        ):
+            was_corrected = True
+        inertia = sym
+
+        # Use eigendecomposition for proper validation
+        _eigvecs, eigvals = wp.eig3(inertia)
+
+        # Sort eigenvalues to get principal moments (I1 <= I2 <= I3)
+        I1, I2, I3 = eigvals[0], eigvals[1], eigvals[2]
+        if I1 > I2:
+            I1, I2 = I2, I1
+        if I2 > I3:
+            I2, I3 = I3, I2
+            if I1 > I2:
+                I1, I2 = I2, I1
+
+        # Check for negative or near-zero eigenvalues (ensure positive-definite).
+        # Use a relative threshold so lightweight components are not inflated.
+        eig_threshold = wp.max(1.0e-6 * I3, 1.0e-10)
+        if I1 < eig_threshold:
+            adjustment = eig_threshold - I1 + 1.0e-6
+            # Add scalar to all eigenvalues
+            I1 += adjustment
+            I2 += adjustment
+            I3 += adjustment
+            inertia = inertia + wp.mat33(adjustment, 0.0, 0.0, 0.0, adjustment, 0.0, 0.0, 0.0, adjustment)
+            was_corrected = True
+
+        # Apply eigenvalue bounds
+        if bound_inertia > 0.0 and I1 < bound_inertia:
+            adjustment = bound_inertia - I1
+            I1 += adjustment
+            I2 += adjustment
+            I3 += adjustment
+            inertia = inertia + wp.mat33(adjustment, 0.0, 0.0, 0.0, adjustment, 0.0, 0.0, 0.0, adjustment)
+            was_corrected = True
+
+        # Check triangle inequality: I1 + I2 >= I3 (with tolerance)
+        tri_tol = wp.max(1.1920929e-7 * I3, 1.0e-10)  # float32 eps * I3
+        if balance_inertia and (I1 + I2 < I3 - tri_tol):
+            deficit = I3 - I1 - I2
+            adjustment = deficit + 1.0e-6
+            # Add scalar*I to fix triangle inequality
+            inertia = inertia + wp.mat33(adjustment, 0.0, 0.0, 0.0, adjustment, 0.0, 0.0, 0.0, adjustment)
+            was_corrected = True
+
+    output_inertia = inertia if was_corrected else original_inertia
+
+    # Write back corrected values
+    body_mass[tid] = mass
+    body_inertia[tid] = output_inertia
+
+    # Update inverse mass
+    if mass > 0.0:
+        body_inv_mass[tid] = 1.0 / mass
+    else:
+        body_inv_mass[tid] = 0.0
+
+    # Update inverse inertia
+    if mass > 0.0:
+        body_inv_inertia[tid] = wp.inverse(output_inertia)
+    else:
+        body_inv_inertia[tid] = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    if was_corrected:
+        wp.atomic_add(correction_count, 0, 1)

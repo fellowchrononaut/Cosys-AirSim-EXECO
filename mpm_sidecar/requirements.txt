@@ -1,0 +1,18 @@
+# Newton MPM sidecar environment.
+#
+# ⚠ Newton is NOT on PyPI. It is an upstream source checkout, pinned here by commit:
+#     https://github.com/newton-physics/newton.git  @ 6d3fdf6f
+#   ("Honor --num-frames in the headless GL viewer", #3930)
+# Verified 2026-08-26 as a pristine checkout with no local modifications.
+#
+# ⚠ warp 1.16.0 is the version that detects sm_120 (Blackwell / RTX 5090) natively and compiles
+# without a PTX-JIT fallback. Do not float this pin without re-running the sm_120 check in
+# SIMVAL/Newton-MPM-Discussions/m0/warp_sm120_check.py.
+warp-lang==1.16.0
+numpy
+usd-core==26.3
+
+# Only needed to drive a vehicle over RPC from drive_across_patch.py; the solver does not use it.
+# ⚠ Lives in a DIFFERENT environment on the dev machine (execosim, python 3.10) because the solver
+# env is 3.12. Install wherever you run the drive script, not necessarily beside the sidecar.
+# msgpack-rpc-python

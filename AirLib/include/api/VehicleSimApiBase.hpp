@@ -17,6 +17,7 @@ namespace urdf {
 struct CollisionDebugFilter;
 struct CollisionDebugSnapshot;
 struct PhysicsColliderSet;
+struct Wrench;
 } // namespace urdf
 
 namespace msr
@@ -53,6 +54,21 @@ namespace airlib
         /// Declared on the generic vehicle for the same reason as the debug hook: a caller holding
         /// `VehicleSimApiBase*` cannot ask "are you a urdfbot?" in a build with RTTI off.
         virtual bool describeColliders(urdf::PhysicsColliderSet& /*out*/) const { return false; }
+
+        /// Apply an external wrench to one of this vehicle's links, by the `link_index` that
+        /// `describeColliders` reported for it.
+        ///
+        /// ⚠ INDEX, NOT STABLE ID, deliberately. The caller resolves the id ONCE when the registry
+        /// is published; doing a string lookup per link per tick would put a map probe on the hot
+        /// path for no gain, and the index is exactly what the descriptor promises is stable "for
+        /// cheap per-step updates afterwards".
+        ///
+        /// ⚠ The default is false — a vehicle that cannot be pushed says so rather than silently
+        /// swallowing forces that the caller believes were applied.
+        virtual bool applyLinkWrench(size_t /*link_index*/, const urdf::Wrench& /*wrench*/)
+        {
+            return false;
+        }
 
         /// Collision geometry as THIS vehicle's solver holds it, for the debug overlay.
         /// Returns false when the vehicle cannot say, which is the honest default.

@@ -184,6 +184,19 @@ bool MpmSidecarPublisher::open(const Options& options)
     impl_->registry->version = kProtocolVersion;
     impl_->state->magic = kStateMagic;
     impl_->state->version = kProtocolVersion;
+
+    // ⚠ INVALIDATE ANY STATUS BLOCK LEFT BY A DEAD SIDECAR. The status segment is mapped without
+    // zeroing because the sidecar owns its contents — but a sidecar that has EXITED leaves a
+    // perfectly valid-looking block behind in tmpfs, complete with magic, acknowledgements and the
+    // world stamp of the run that has ended. A fresh Play then reads it, finds a stamp that does
+    // not match (world_revision advances on every PIE session), and concludes the sidecar is in the
+    // wrong world — halting a run that simply has no sidecar yet. Measured 2026-08-26: Stop/Play
+    // paused the sim on revisions 2 and 3, with no sidecar process alive at all.
+    //
+    // Clearing the magic says the only true thing: nothing has reported yet. A LIVE sidecar rewrites
+    // it within one loop iteration, so this costs a healthy link nothing; a live sidecar on a stale
+    // revision re-announces and is correctly halted, which is the case this policy is for.
+    impl_->status->magic = 0;
     return true;
 #else
     return false;

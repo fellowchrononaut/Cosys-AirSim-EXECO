@@ -55,11 +55,12 @@ namespace mpm
 /// declared a region in settings and the sidecar spawned sand wherever its own CLI defaults said,
 /// with nothing carrying one to the other — the rover would drive through empty space while every
 /// diagnostic reported healthy. The region is not optional metadata; it is where the sand IS.
-constexpr uint32_t kProtocolVersion = 3;
+constexpr uint32_t kProtocolVersion = 4;
 
 constexpr uint32_t kRegistryMagic = 0x4D504D52u;  // 'MPMR'
 constexpr uint32_t kStateMagic = 0x4D504D53u;     // 'MPMS'
 constexpr uint32_t kStatusMagic = 0x4D504D48u;    // 'MPMH'
+constexpr uint32_t kImpulseMagic = 0x4D504D49; // 'MPMI'
 constexpr uint32_t kParticleMagic = 0x4D504D50u;  // 'MPMP'
 
 /// Hard ceilings, so both segments are fixed-size and can be mapped once.
@@ -192,6 +193,43 @@ struct WireTerrainRegion {
     uint32_t valid = 0;
 };
 
+/// What the sand did back to one collider over a single MPM frame.
+///
+/// ⚠ IMPULSE, NOT FORCE. Newton reports per-grid-node impulses (N.s) accumulated across its own
+/// step; the sidecar reduces them per collider and sends them as impulses because that is what they
+/// are. The simulator converts to whatever its rigid seam accepts — both backends take newtons —
+/// and the conversion is a decision recorded in the plan (M3), not an implementation detail:
+/// dividing by the wrong dt silently scales every force the sand applies.
+///
+/// ⚠ `angular` is about the collider's CURRENT centre of mass, matching Newton's own
+/// `compute_body_forces` kernel (`r = impulse_pos - transform_point(X_wb, X_com)`). A consumer that
+/// applies `linear` at a different point and adds `angular` would double-count the moment arm.
+struct WireColliderImpulse {
+    WireVec3 linear;   ///< N.s, world axes
+    WireVec3 angular;  ///< N.m.s about the collider's centre of mass, world axes
+    /// Grid nodes that contributed. 0 means the sand never touched this collider this frame, which
+    /// is different from an impulse that happened to sum to zero.
+    uint32_t contact_nodes = 0;
+    uint32_t reserved = 0;
+};
+
+struct MpmImpulseBlock {
+    uint32_t magic = kImpulseMagic;
+    uint32_t version = kProtocolVersion;
+    uint32_t sequence = 0;
+    uint32_t collider_count = 0;
+
+    WireWorldStamp stamp;
+
+    uint64_t sidecar_step = 0;
+    double sidecar_time = 0;
+    /// Simulated seconds these impulses were accumulated over. The consumer needs it to convert to
+    /// a force, and must NOT assume it equals its own tick.
+    double mpm_dt = 0;
+
+    WireColliderImpulse colliders[kMaxColliders];
+};
+
 struct MpmRegistryBlock {
     uint32_t magic = kRegistryMagic;
     uint32_t version = kProtocolVersion;
@@ -299,6 +337,7 @@ struct MpmParticleBlock {
 constexpr const char* kRegistrySegment = "execosim_mpm_registry";
 constexpr const char* kStateSegment = "execosim_mpm_state";
 constexpr const char* kStatusSegment = "execosim_mpm_status";
+constexpr const char* kImpulseSegment = "execosim_mpm_impulse";
 constexpr const char* kParticleSegment = "execosim_mpm_particles";
 
 static_assert(sizeof(WireVec3) == 24, "WireVec3 must be 3 packed doubles");

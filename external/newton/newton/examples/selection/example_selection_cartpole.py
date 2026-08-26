@@ -1,0 +1,242 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+###########################################################################
+# Example Selection Cartpole
+#
+# Demonstrates batch control of multiple cartpole worlds using
+# ArticulationView. This example spawns multiple cartpole robots and applies
+# simple random control policy.
+#
+# To limit the number of worlds to render use the max-worlds argument.
+# Command: python -m newton.examples selection_cartpole --world-count 16 --max-worlds 8
+#
+###########################################################################
+
+from __future__ import annotations
+
+import warp as wp
+
+import newton
+import newton.examples
+from newton.selection import ArticulationView
+
+USE_TORCH = False
+COLLAPSE_FIXED_JOINTS = False
+
+
+@wp.kernel
+def randomize_states_kernel(joint_q: wp.array3d[float], seed: int):
+    tid = wp.tid()
+    rng = wp.rand_init(seed, tid)
+    joint_q[tid, 0, 0] = 2.0 - 4.0 * wp.randf(rng)
+    joint_q[tid, 0, 1] = wp.pi / 8.0 - wp.pi / 4.0 * wp.randf(rng)
+    joint_q[tid, 0, 2] = wp.pi / 8.0 - wp.pi / 4.0 * wp.randf(rng)
+
+
+@wp.kernel
+def apply_forces_kernel(joint_q: wp.array3d[float], joint_f: wp.array3d[float]):
+    tid = wp.tid()
+    if joint_q[tid, 0, 0] > 0.0:
+        joint_f[tid, 0, 0] = -20.0
+    else:
+        joint_f[tid, 0, 0] = 20.0
+
+
+class Example:
+    def __init__(self, viewer, args):
+        self.fps = 60
+        self.frame_dt = 1.0 / self.fps
+
+        self.sim_time = 0.0
+        self.sim_substeps = 10
+        self.sim_dt = self.frame_dt / self.sim_substeps
+
+        self.world_count = args.world_count
+        max_worlds = args.max_worlds
+        verbose = True
+
+        world = newton.ModelBuilder()
+        world.default_joint_cfg.armature = 0.1
+        world.add_usd(
+            newton.examples.get_asset("cartpole.usda"),
+            collapse_fixed_joints=COLLAPSE_FIXED_JOINTS,
+            enable_self_collisions=False,
+        )
+
+        scene = newton.ModelBuilder()
+        scene.replicate(world, world_count=self.world_count)
+
+        # finalize model
+        self.model = scene.finalize()
+
+        self.solver = newton.solvers.SolverMuJoCo(self.model, disable_contacts=True)
+
+        self.viewer = viewer
+
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        self.control = self.model.control()
+
+        # =======================
+        # get cartpole view
+        # =======================
+        self.cartpoles = ArticulationView(self.model, "/cartPole", verbose=verbose)
+
+        # =========================
+        # randomize initial state
+        # =========================
+        if USE_TORCH:
+            import torch  # noqa: PLC0415
+
+            cart_positions = 2.0 - 4.0 * torch.rand(self.world_count)
+            pole1_angles = torch.pi / 8.0 - torch.pi / 4.0 * torch.rand(self.world_count)
+            pole2_angles = torch.pi / 8.0 - torch.pi / 4.0 * torch.rand(self.world_count)
+            joint_q = torch.stack([cart_positions, pole1_angles, pole2_angles], dim=1)
+        else:
+            joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+            wp.launch(randomize_states_kernel, dim=self.world_count, inputs=[joint_q, 42])
+
+        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q)
+
+        if not isinstance(self.solver, newton.solvers.SolverMuJoCo):
+            self.cartpoles.eval_fk(self.state_0)
+
+        self.viewer.set_model(self.model)
+        if max_worlds is not None:
+            self.viewer.set_visible_worlds(range(max_worlds))
+        self.viewer.set_world_offsets((1.0, 0.0, 0.0))
+
+        # Set camera to view the scene
+        self.viewer.set_camera(
+            pos=wp.vec3(-15.0, 1.0, 3.0),
+            pitch=-15.0,
+            yaw=0.0,
+        )
+
+        # Ensure FK evaluation (for non-MuJoCo solvers):
+        newton.eval_fk(
+            self.model,
+            self.model.joint_q,
+            self.model.joint_qd,
+            self.state_0,
+        )
+
+        self.capture()
+
+    def capture(self):
+        self.graph = None
+        with wp.ScopedCapture() as capture:
+            self.simulate()
+        self.graph = capture.graph
+
+    def simulate(self):
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+
+            # apply forces to the model for picking, wind, etc
+            self.viewer.apply_forces(self.state_0)
+
+            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def step(self):
+        # ====================================
+        # get observations and apply controls
+        # ====================================
+        if USE_TORCH:
+            import torch  # noqa: PLC0415
+
+            joint_q = wp.to_torch(self.cartpoles.get_attribute("joint_q", self.state_0))
+            joint_f = wp.to_torch(self.cartpoles.get_attribute("joint_f", self.control))
+            joint_f[..., 0] = torch.where(joint_q[..., 0] > 0, -20, 20)
+        else:
+            joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+            joint_f = self.cartpoles.get_attribute("joint_f", self.control)
+            wp.launch(
+                apply_forces_kernel,
+                dim=joint_f.shape[0],
+                inputs=[joint_q, joint_f],
+            )
+
+        self.cartpoles.set_attribute("joint_f", self.control, joint_f)
+
+        # simulate
+        if self.graph:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+
+        self.sim_time += self.frame_dt
+
+    def render(self):
+        self.viewer.begin_frame(self.sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.end_frame()
+
+    def test_final(self):
+        num_bodies_per_world = self.model.body_count // self.world_count
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "cart is at ground level and has correct orientation",
+            lambda q, qd: q[2] == 0.0 and newton.math.vec_allclose(q.q, wp.quat_identity()),
+            indices=[i * num_bodies_per_world for i in range(self.world_count)],
+        )
+        # fmt: off
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "cart only moves along y direction",
+            lambda q, qd: qd[0] == 0.0
+            and abs(qd[1]) > 0.05
+            and qd[2] == 0.0
+            and wp.length_sq(wp.spatial_bottom(qd)) == 0.0,
+            indices=[i * num_bodies_per_world for i in range(self.world_count)],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "pole1 only has y-axis linear velocity and x-axis angular velocity",
+            lambda q, qd: qd[0] == 0.0
+            and abs(qd[1]) > 0.05
+            and qd[2] == 0.0
+            and abs(qd[3]) > 0.3
+            and qd[4] == 0.0
+            and qd[5] == 0.0,
+            indices=[i * num_bodies_per_world + 1 for i in range(self.world_count)],
+        )
+        newton.examples.test_body_state(
+            self.model,
+            self.state_0,
+            "pole2 only has yz-plane linear velocity and x-axis angular velocity",
+            lambda q, qd: qd[0] == 0.0
+            and abs(qd[1]) > 0.05
+            and abs(qd[2]) > 0.05
+            and abs(qd[3]) > 0.2
+            and qd[4] == 0.0
+            and qd[5] == 0.0,
+            indices=[i * num_bodies_per_world + 2 for i in range(self.world_count)],
+        )
+        # fmt: on
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        newton.examples.add_world_count_arg(parser)
+        newton.examples.add_max_worlds_arg(parser)
+        parser.set_defaults(world_count=16)
+        return parser
+
+
+if __name__ == "__main__":
+    parser = Example.create_parser()
+
+    viewer, args = newton.examples.init(parser)
+
+    if USE_TORCH:
+        import torch
+
+        torch.set_default_device(args.device)
+
+    newton.examples.run(Example(viewer, args), args)

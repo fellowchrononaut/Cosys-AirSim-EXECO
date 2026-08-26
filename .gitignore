@@ -326,6 +326,13 @@ external/*
 # See external/coacd/VENDORED.md.
 !external/coacd/
 !external/coacd/**
+# Newton, vendored 2026-08-26 as the MPM deformable-terrain solver used by mpm_sidecar/. Same
+# exact-bytes reasoning as the others, plus one specific to this dependency: before it was vendored,
+# `newton` resolved through a `site-packages/newton.pth` pointing OUTSIDE any repository, so which
+# solver ran depended on machine state. `.git` is excluded (124 MB of history against 41 MB of
+# source). See external/newton/VENDORED.md.
+!external/newton/
+!external/newton/**
 deps/
 cmake_build/
 
