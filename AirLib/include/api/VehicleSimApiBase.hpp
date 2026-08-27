@@ -14,6 +14,7 @@
 /// Forward-declared on purpose: references need no definition, so the generic vehicle
 /// interface does not acquire a dependency on the URDF model for the sake of one debug hook.
 namespace urdf {
+struct Vec3;
 struct CollisionDebugFilter;
 struct CollisionDebugSnapshot;
 struct PhysicsColliderSet;
@@ -54,6 +55,17 @@ namespace airlib
         /// Declared on the generic vehicle for the same reason as the debug hook: a caller holding
         /// `VehicleSimApiBase*` cannot ask "are you a urdfbot?" in a build with RTTI off.
         virtual bool describeColliders(urdf::PhysicsColliderSet& /*out*/) const { return false; }
+
+        /// ⚠ WHERE THIS VEHICLE'S SIDECAR-OWNED SAND SHOULD BE DRAWN, as a translation to add to
+        /// every published particle position before it reaches the level.
+        ///
+        /// A sidecar that owns the vehicle also owns the sand, and it builds both in ITS OWN
+        /// coordinates — the ones its --own-vehicle-x and --patch-x name. The backend anchors the
+        /// VEHICLE by shifting every pose so the root lands where the settings asked. The sand has
+        /// to move by the same vector or the robot and the bed it is driving on are drawn 100+ m
+        /// apart, each of them internally consistent. Returns false for every vehicle that does not
+        /// have a sidecar-owned solver behind it, which is all of them but one.
+        virtual bool sandRenderOffset(urdf::Vec3& /*out*/) const { return false; }
 
         /// Apply an external wrench to one of this vehicle's links, by the `link_index` that
         /// `describeColliders` reported for it.

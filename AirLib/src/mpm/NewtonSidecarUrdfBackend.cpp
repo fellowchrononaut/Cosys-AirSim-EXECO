@@ -1,0 +1,955 @@
+#include "mpm/NewtonSidecarUrdfBackend.hpp"
+
+#include "mpm/MpmSidecarProtocol.hpp"
+#include "common/common_utils/Utils.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+
+#if defined(__linux__) || defined(__unix__) || defined(__APPLE__)
+#define MPM_SHM_SUPPORTED 1
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#define MPM_SHM_SUPPORTED 0
+#endif
+
+namespace msr
+{
+namespace airlib
+{
+namespace mpm
+{
+
+namespace
+{
+
+/// One published sample, kept host-side so interpolation never touches shared memory.
+struct PoseSample {
+    double time = 0;                       ///< the sidecar's SIMULATED time
+    uint64_t step = 0;
+    std::vector<urdf::LinkPose> poses;
+    std::vector<urdf::Twist> twists;
+    std::vector<urdf::JointState> joints;
+    bool effort_reported = false;
+};
+
+urdf::Vec3 lerp(const urdf::Vec3& a, const urdf::Vec3& b, double t)
+{
+    return urdf::Vec3{a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), a.z + t * (b.z - a.z)};
+}
+
+/// Cubic Hermite with the published twist as the tangent.
+///
+/// ⚠ THE TANGENTS MUST BE SCALED BY dt. The Hermite basis is defined on the unit interval, so a
+/// velocity in m/s becomes the derivative with respect to the parameter only after multiplying by
+/// the interval length. Omitting it overshoots in proportion to the sample rate — an error that
+/// looks like a tuning problem and is a units problem.
+urdf::Vec3 hermite(const urdf::Vec3& p0, const urdf::Vec3& v0,
+                   const urdf::Vec3& p1, const urdf::Vec3& v1, double t, double dt)
+{
+    const double t2 = t * t, t3 = t2 * t;
+    const double h00 = 2 * t3 - 3 * t2 + 1;
+    const double h10 = t3 - 2 * t2 + t;
+    const double h01 = -2 * t3 + 3 * t2;
+    const double h11 = t3 - t2;
+    return urdf::Vec3{
+        h00 * p0.x + h10 * dt * v0.x + h01 * p1.x + h11 * dt * v1.x,
+        h00 * p0.y + h10 * dt * v0.y + h01 * p1.y + h11 * dt * v1.y,
+        h00 * p0.z + h10 * dt * v0.z + h01 * p1.z + h11 * dt * v1.z};
+}
+
+/// ⚠ SHORTEST ARC. Without the dot-sign flip, two quaternions describing nearly the same rotation
+/// can interpolate the long way round and a wheel spins backwards for one frame — which reads as a
+/// physics glitch and is a sign convention.
+urdf::Quat slerp(const urdf::Quat& a, urdf::Quat b, double t)
+{
+    double d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0.0) {
+        b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w;
+        d = -d;
+    }
+    urdf::Quat out;
+    if (d > 0.9995) {
+        out.x = a.x + t * (b.x - a.x);
+        out.y = a.y + t * (b.y - a.y);
+        out.z = a.z + t * (b.z - a.z);
+        out.w = a.w + t * (b.w - a.w);
+    }
+    else {
+        const double theta = std::acos(std::max(-1.0, std::min(1.0, d)));
+        const double s = std::sin(theta);
+        const double wa = std::sin((1.0 - t) * theta) / s;
+        const double wb = std::sin(t * theta) / s;
+        out.x = wa * a.x + wb * b.x;
+        out.y = wa * a.y + wb * b.y;
+        out.z = wa * a.z + wb * b.z;
+        out.w = wa * a.w + wb * b.w;
+    }
+    const double n = std::sqrt(out.x * out.x + out.y * out.y + out.z * out.z + out.w * out.w);
+    if (n > 0) { out.x /= n; out.y /= n; out.z /= n; out.w /= n; }
+    return out;
+}
+
+} // namespace
+
+struct NewtonSidecarUrdfBackend::Impl
+{
+    Options options;
+
+#if MPM_SHM_SUPPORTED
+    MpmVehicleCommandBlock* command = nullptr;
+    int command_fd = -1;
+    const MpmVehiclePoseBlock* pose = nullptr;
+    int pose_fd = -1;
+#endif
+
+    /// The two samples the current render time falls between. `previous` may be empty at startup.
+    PoseSample previous;
+    PoseSample latest;
+    bool have_previous = false;
+    bool have_latest = false;
+
+    double playback_time = 0.0;      ///< where we are rendering, in the sidecar's time base
+    double seconds_since_new = 0.0;
+    /// ⚠ HOW FAST THE SIDECAR'S SIMULATED TIME ADVANCES PER SECOND OF OURS. Not 1.0, and assuming
+    /// it was is the bug this exists to fix: at 1.37 M sand particles the sidecar runs at roughly
+    /// 0.18x real time, so a playback clock advanced by our own dt outruns it more than five times
+    /// over, pins itself against the extrapolation clamp and snaps back on every publication.
+    /// Measured live rather than configured, because it depends on the bed, the GPU and what else
+    /// is running.
+    double observed_rate = 1.0;
+    double wall_since_sample = 0.0;
+    bool rate_seeded = false;
+    bool stale_warned = false;
+    bool connected_logged = false;
+    uint64_t extrapolated = 0;
+    uint64_t command_step = 0;
+
+    /// Targets accumulated by setJointTarget between steps, indexed like joint_names_.
+    std::vector<urdf::ControlMode> modes;
+    std::vector<double> targets;
+
+    /// Where each of our joints sits in the published joint array, resolved by name once.
+    std::vector<int> wire_joint_index;
+    /// Where each of our links sits in the published link array.
+    std::vector<int> wire_link_index;
+    bool mapping_resolved = false;
+    bool mapping_warned = false;
+    bool wrench_warned = false;
+
+    /// ⚠ THE SIDECAR'S FRAME IS ITS OWN, AND ANCHORING IT IS NOT OPTIONAL.
+    ///
+    /// `BackendOptions::root_position` is where the plugin says the root link belongs, in the
+    /// SOLVER frame. Every other backend builds the robot there. The sidecar cannot: it is a
+    /// separate process that was started before the editor and placed its vehicle wherever its
+    /// own --own-vehicle-x said. Publishing those coordinates as if they were solver-frame put a
+    /// Scout at Unreal world (-1.2, 0) while this level's play area sits ~(121.5, -24.6) m away,
+    /// so the robot rendered perfectly and was 125 m off screen. `simGetObjectPose` said
+    /// (-122.707, +24.642) against a PlayerStart at the origin.
+    ///
+    /// The offset is measured ONCE, from the first sample: whatever the sidecar calls the root's
+    /// position then is defined to be `root_position`. Everything after is shifted by the same
+    /// vector, so the robot appears exactly where the settings asked and the sidecar stays free to
+    /// use whatever coordinates it likes.
+    urdf::Vec3 requested_root;
+    urdf::Vec3 frame_offset;
+    bool offset_resolved = false;
+    /// Incremented by reset(); published on every command so the sidecar cannot miss the edge.
+    uint64_t reset_epoch = 0;
+
+    std::shared_ptr<const urdf::StaticWorld> static_world;
+#if MPM_SHM_SUPPORTED
+    MpmStaticWorldBlock* static_block = nullptr;
+    int static_fd = -1;
+#endif
+    bool static_published = false;
+    uint32_t static_revision = 0;
+};
+
+NewtonSidecarUrdfBackend::NewtonSidecarUrdfBackend(Options options)
+    : impl_(new Impl())
+{
+    impl_->options = std::move(options);
+}
+
+NewtonSidecarUrdfBackend::~NewtonSidecarUrdfBackend()
+{
+#if MPM_SHM_SUPPORTED
+    if (impl_->command) ::munmap(impl_->command, sizeof(MpmVehicleCommandBlock));
+    if (impl_->command_fd >= 0) ::close(impl_->command_fd);
+    if (impl_->pose)
+        ::munmap(const_cast<MpmVehiclePoseBlock*>(impl_->pose), sizeof(MpmVehiclePoseBlock));
+    if (impl_->pose_fd >= 0) ::close(impl_->pose_fd);
+    if (impl_->static_block) ::munmap(impl_->static_block, sizeof(MpmStaticWorldBlock));
+    if (impl_->static_fd >= 0) ::close(impl_->static_fd);
+#endif
+}
+
+void NewtonSidecarUrdfBackend::setStaticWorld(std::shared_ptr<const urdf::StaticWorld> world)
+{
+    // ⚠ STORED, NOT PUBLISHED YET. Publishing needs `frame_offset`, and that is only known once the
+    // sidecar has told us where it thinks its robot is — see step(). Writing 24 MB here with a zero
+    // offset would put the level a hundred metres from the robot standing on it.
+    impl_->static_world = std::move(world);
+    impl_->static_published = false;
+}
+
+void NewtonSidecarUrdfBackend::publishStaticWorld()
+{
+#if MPM_SHM_SUPPORTED
+    if (impl_->static_published || impl_->static_world == nullptr || !impl_->offset_resolved)
+        return;
+
+    if (impl_->static_block == nullptr) {
+        const std::string path = impl_->options.directory + "/" + kStaticWorldSegment;
+        // We are the writer, so this one is created here — same reasoning as the command segment.
+        impl_->static_fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0666);
+        if (impl_->static_fd < 0) {
+            common_utils::Utils::log("NewtonSidecar: cannot open " + path +
+                                     " — the sidecar will fall back to its flat ground plane.",
+                                     common_utils::Utils::kLogLevelError);
+            impl_->static_published = true;   // do not retry every tick
+            return;
+        }
+        if (::ftruncate(impl_->static_fd, sizeof(MpmStaticWorldBlock)) != 0) {
+            // Not fatal on its own; the size check below is the authority.
+        }
+        struct stat info;
+        if (::fstat(impl_->static_fd, &info) != 0 ||
+            static_cast<size_t>(info.st_size) != sizeof(MpmStaticWorldBlock)) {
+            common_utils::Utils::log(
+                "NewtonSidecar: " + path + " is the wrong size — PROTOCOL MISMATCH between the "
+                "plugin and the sidecar. Delete the segment and restart both.",
+                common_utils::Utils::kLogLevelError);
+            ::close(impl_->static_fd);
+            impl_->static_fd = -1;
+            impl_->static_published = true;
+            return;
+        }
+        void* address = ::mmap(nullptr, sizeof(MpmStaticWorldBlock), PROT_READ | PROT_WRITE,
+                               MAP_SHARED, impl_->static_fd, 0);
+        if (address == MAP_FAILED) {
+            ::close(impl_->static_fd);
+            impl_->static_fd = -1;
+            impl_->static_published = true;
+            return;
+        }
+        impl_->static_block = static_cast<MpmStaticWorldBlock*>(address);
+    }
+
+    MpmStaticWorldBlock* b = impl_->static_block;
+    auto* seq = reinterpret_cast<volatile std::atomic<uint32_t>*>(&b->sequence);
+    seq->fetch_add(1, std::memory_order_release);      // odd: writing
+
+    b->magic = kStaticWorldMagic;
+    b->version = kProtocolVersion;
+    b->frame_offset.x = impl_->frame_offset.x;
+    b->frame_offset.y = impl_->frame_offset.y;
+    b->frame_offset.z = impl_->frame_offset.z;
+
+    uint32_t bodies = 0, shapes = 0, verts = 0, indices = 0;
+    bool truncated = false;
+
+    const urdf::StaticWorld& world = *impl_->static_world;
+    for (const urdf::StaticBody& sb : world.bodies) {
+        if (bodies >= kMaxStaticBodies) { truncated = true; break; }
+
+        // ⚠ MEASURE BEFORE COMMITTING. A body written half-way — some shapes in, the pools full
+        // before the rest — is a solid that is missing a face, and a robot drives through a missing
+        // face exactly as it would through geometry that was never sent. Bodies are all-or-nothing.
+        uint32_t need_shapes = 0, need_verts = 0, need_indices = 0;
+        for (const urdf::StaticShape& ss : sb.shapes) {
+            ++need_shapes;
+            need_verts += static_cast<uint32_t>(ss.points.size());
+            need_indices += static_cast<uint32_t>(ss.indices.size());
+        }
+        if (shapes + need_shapes > kMaxStaticShapes ||
+            verts + need_verts > kMaxStaticVertices ||
+            indices + need_indices > kMaxStaticIndices) {
+            truncated = true;
+            break;
+        }
+
+        WireStaticBody& wb = b->bodies[bodies];
+        std::snprintf(wb.name, kMaxStaticNameChars, "%s", sb.name.c_str());
+        wb.position.x = sb.position.x;
+        wb.position.y = sb.position.y;
+        wb.position.z = sb.position.z;
+        wb.orientation.x = sb.orientation.x;
+        wb.orientation.y = sb.orientation.y;
+        wb.orientation.z = sb.orientation.z;
+        wb.orientation.w = sb.orientation.w;
+        wb.friction = sb.friction;
+        wb.restitution = sb.restitution;
+        wb.shape_start = shapes;
+        wb.shape_count = need_shapes;
+
+        for (const urdf::StaticShape& ss : sb.shapes) {
+            WireStaticShape& ws = b->shapes[shapes++];
+            ws.kind = static_cast<uint32_t>(ss.kind);
+            ws.radius = ss.radius;
+            ws.center_a.x = ss.center_a.x;
+            ws.center_a.y = ss.center_a.y;
+            ws.center_a.z = ss.center_a.z;
+            ws.center_b.x = ss.center_b.x;
+            ws.center_b.y = ss.center_b.y;
+            ws.center_b.z = ss.center_b.z;
+            ws.vertex_start = verts;
+            ws.vertex_count = static_cast<uint32_t>(ss.points.size());
+            for (const urdf::Vec3& p : ss.points) {
+                b->vertices[verts * 3 + 0] = static_cast<float>(p.x);
+                b->vertices[verts * 3 + 1] = static_cast<float>(p.y);
+                b->vertices[verts * 3 + 2] = static_cast<float>(p.z);
+                ++verts;
+            }
+            ws.index_start = indices;
+            ws.index_count = static_cast<uint32_t>(ss.indices.size());
+            for (int idx : ss.indices)
+                b->indices[indices++] = idx;
+        }
+        ++bodies;
+    }
+
+    b->body_count = bodies;
+    b->shape_count = shapes;
+    b->vertex_count = verts;
+    b->index_count = indices;
+    b->truncated = truncated ? 1u : 0u;
+    b->revision = ++impl_->static_revision;
+    seq->fetch_add(1, std::memory_order_release);      // even: readable
+
+    impl_->static_published = true;
+
+    common_utils::Utils::log(
+        common_utils::Utils::stringf(
+            "NewtonSidecar '%s': mirrored the level to the sidecar — %u bodies, %u shapes, "
+            "%u vertices, %u triangles, offset (%+.3f %+.3f %+.3f), revision %u.",
+            impl_->options.vehicle_name.c_str(), bodies, shapes, verts, indices / 3,
+            impl_->frame_offset.x, impl_->frame_offset.y, impl_->frame_offset.z,
+            b->revision),
+        common_utils::Utils::kLogLevelInfo);
+
+    // ⚠ TRUNCATION IS AN ERROR, NOT A FOOTNOTE. What the sidecar builds is then a level with holes
+    // in it, and a robot falls through a floor that was dropped exactly as it would through one
+    // that never existed. Say which limit bound so it can be raised deliberately.
+    if (truncated) {
+        common_utils::Utils::log(
+            common_utils::Utils::stringf(
+                "NewtonSidecar '%s': the level did NOT fit and the mirror is PARTIAL — stopped at "
+                "%u/%u bodies, %u/%u shapes, %u/%u vertices, %u/%u indices. The sidecar's robot "
+                "will pass through whatever was dropped. Raise the kMaxStatic* caps in "
+                "MpmSidecarProtocol.hpp and protocol.py together.",
+                impl_->options.vehicle_name.c_str(),
+                bodies, kMaxStaticBodies, shapes, kMaxStaticShapes,
+                verts, kMaxStaticVertices, indices, kMaxStaticIndices),
+            common_utils::Utils::kLogLevelError);
+    }
+#endif
+}
+
+bool NewtonSidecarUrdfBackend::staticWorldPublished() const
+{
+    return impl_->static_published;
+}
+
+int NewtonSidecarUrdfBackend::addKinematicBody(const urdf::KinematicBody&)
+{
+    // ⚠ REFUSED BY RETURNING -1 RATHER THAN PRETENDING. `mirrorsKinematicBodies()` already says
+    // false, so a correct caller never gets here; returning a plausible handle would let one that
+    // ignores the query believe it had placed a body the sidecar will never know about.
+    return -1;
+}
+
+void NewtonSidecarUrdfBackend::setKinematicPose(int, const urdf::Vec3&, const urdf::Quat&)
+{
+}
+
+void NewtonSidecarUrdfBackend::buildFromUrdf(const urdf::Robot& model,
+                                             const urdf::BackendOptions& opts)
+{
+    impl_->requested_root = opts.root_position;
+    impl_->offset_resolved = false;
+    link_names_.clear();
+    joint_names_.clear();
+    total_mass_ = 0.0;
+
+    // ⚠ THE URDF IS PARSED HERE FOR ITS NAMES AND MASSES ONLY. The sidecar builds the robot from
+    // its own copy of the same file; this side never integrates anything. Keeping the name list in
+    // URDF order matters because every consumer above (sensors, ROS, the render component)
+    // addresses links by the index this vector defines.
+    for (const auto& link : model.links) {
+        link_names_.push_back(link.name);
+        total_mass_ += link.inertial.mass;
+    }
+    for (const auto& joint : model.joints)
+        joint_names_.push_back(joint.name);
+
+    impl_->modes.assign(joint_names_.size(), urdf::ControlMode::None);
+    impl_->targets.assign(joint_names_.size(), 0.0);
+    impl_->wire_joint_index.assign(joint_names_.size(), -1);
+    impl_->wire_link_index.assign(link_names_.size(), -1);
+
+    if (impl_->options.vehicle_name.empty())
+        throw std::invalid_argument(
+            "NewtonSidecar backend: no vehicle name was set. It must match the sidecar's "
+            "--own-vehicle spec name, which is how one wire block carries several vehicles.");
+
+#if !MPM_SHM_SUPPORTED
+    throw std::runtime_error("NewtonSidecar backend needs POSIX shared memory; this platform has "
+                             "none compiled in.");
+#else
+    const std::string command_path = impl_->options.directory + "/" + kVehicleCommandSegment;
+    const std::string pose_path = impl_->options.directory + "/" + kVehiclePoseSegment;
+
+    // ⚠ THE COMMAND SEGMENT IS CREATED IF ABSENT; THE POSE SEGMENT IS NOT.
+    //
+    // We are the WRITER of commands, so a sidecar started later must find our block waiting. We
+    // are only a READER of poses, and creating that one would let a simulator started first
+    // present an all-zero block that the sidecar then overwrites — the window between is a robot
+    // rendered at the origin while every counter reports connected. Missing is the honest state,
+    // and step() reports it.
+    impl_->command_fd = ::open(command_path.c_str(), O_RDWR | O_CREAT, 0666);
+    if (impl_->command_fd < 0)
+        throw std::runtime_error("NewtonSidecar backend: cannot open " + command_path);
+    if (::ftruncate(impl_->command_fd, sizeof(MpmVehicleCommandBlock)) != 0) {
+        // ⚠ Not fatal on its own: another process may have created it at the right size already,
+        // and ftruncate on some filesystems refuses to shrink-or-grow a mapped file. The size
+        // check below is the authority.
+    }
+    struct stat info;
+    if (::fstat(impl_->command_fd, &info) != 0 ||
+        static_cast<size_t>(info.st_size) != sizeof(MpmVehicleCommandBlock)) {
+        ::close(impl_->command_fd);
+        impl_->command_fd = -1;
+        throw std::runtime_error(
+            "NewtonSidecar backend: " + command_path + " is the wrong size. This is a PROTOCOL "
+            "MISMATCH — the plugin and the sidecar were built from different versions of "
+            "MpmSidecarProtocol.hpp / protocol.py. Delete the segment and restart both.");
+    }
+    void* address = ::mmap(nullptr, sizeof(MpmVehicleCommandBlock), PROT_READ | PROT_WRITE,
+                           MAP_SHARED, impl_->command_fd, 0);
+    if (address == MAP_FAILED) {
+        ::close(impl_->command_fd);
+        impl_->command_fd = -1;
+        throw std::runtime_error("NewtonSidecar backend: cannot map " + command_path);
+    }
+    impl_->command = static_cast<MpmVehicleCommandBlock*>(address);
+    impl_->command->magic = kVehicleCommandMagic;
+    impl_->command->version = kProtocolVersion;
+
+    // The pose segment may legitimately not exist yet — the sidecar creates it. step() retries.
+    (void)pose_path;
+#endif
+}
+
+void NewtonSidecarUrdfBackend::reset()
+{
+    impl_->have_previous = false;
+    impl_->have_latest = false;
+    impl_->playback_time = 0.0;
+    impl_->seconds_since_new = 0.0;
+    impl_->extrapolated = 0;
+    impl_->stale_warned = false;
+    std::fill(impl_->modes.begin(), impl_->modes.end(), urdf::ControlMode::None);
+    std::fill(impl_->targets.begin(), impl_->targets.end(), 0.0);
+    // ⚠ The MAPPING is deliberately NOT cleared. Link and joint names do not change across a
+    // reset, and re-resolving would re-emit the "names the sidecar does not have" warning on every
+    // global reset.
+    //
+    // ⚠ THE ANCHOR IS DELIBERATELY *NOT* RE-RESOLVED, and an earlier version clearing it here was
+    // actively misleading. Re-anchoring shifts the whole picture so the robot's CURRENT position
+    // maps onto the spawn — which drags the sand along with it, because the bed is drawn through
+    // the same offset. The operator sees the robot and its ruts teleport to the player start with
+    // every rut intact. That is a camera move dressed as a reset.
+    //
+    // The anchor stays valid across a reset precisely because the sidecar puts its vehicle back at
+    // its own spawn, which is what the offset was computed against in the first place.
+    //
+    // ⚠ THIS IS WHAT ACTUALLY RESETS ANYTHING. The vehicle is solved in another process, so the
+    // simulator resetting its own world reaches none of it. Bumping the epoch is the request; the
+    // sidecar rebuilds its model — fresh bed, vehicle at spawn — and the next poses reflect it.
+    ++impl_->reset_epoch;
+    common_utils::Utils::log(
+        common_utils::Utils::stringf(
+            "NewtonSidecar '%s': reset requested (epoch %llu) — the sidecar will rebuild its sand "
+            "and return the vehicle to its spawn. Expect a pause while it does.",
+            impl_->options.vehicle_name.c_str(),
+            static_cast<unsigned long long>(impl_->reset_epoch)),
+        common_utils::Utils::kLogLevelInfo);
+}
+
+#if MPM_SHM_SUPPORTED
+namespace
+{
+
+/// Copy the pose block through its seqlock. Returns false if the writer was mid-update.
+///
+/// ⚠ A TORN READ ON AN ARTICULATED BODY IS INDISTINGUISHABLE FROM A JOINT SNAPPING — some links
+/// from step N and some from N+1 is a pose no configuration of the robot can produce. The sequence
+/// is ODD while the writer is inside an update; both loads are acquire so the compiler cannot hoist
+/// the body copy outside them.
+bool readPoseBlock(const MpmVehiclePoseBlock* src, MpmVehiclePoseBlock& out)
+{
+    const auto* seq = reinterpret_cast<const volatile std::atomic<uint32_t>*>(&src->sequence);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const uint32_t before = seq->load(std::memory_order_acquire);
+        if (before % 2 != 0)
+            continue;
+        std::memcpy(&out, src, sizeof(MpmVehiclePoseBlock));
+        const uint32_t after = seq->load(std::memory_order_acquire);
+        if (before == after)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+#endif
+
+int NewtonSidecarUrdfBackend::step(double dt)
+{
+#if !MPM_SHM_SUPPORTED
+    (void)dt;
+    return 0;
+#else
+    // ---- publish the joint targets -------------------------------------------------------
+    if (impl_->command) {
+        MpmVehicleCommandBlock* b = impl_->command;
+        // Seqlock: odd while we are inside the update.
+        auto* seq = reinterpret_cast<volatile std::atomic<uint32_t>*>(&b->sequence);
+        seq->fetch_add(1, std::memory_order_release);
+
+        b->magic = kVehicleCommandMagic;
+        b->version = kProtocolVersion;
+        b->vehicle_count = 1;
+        b->step = ++impl_->command_step;
+        b->simulation_time = impl_->playback_time;
+        // ⚠ Published EVERY tick, not only on the tick it changes. The sidecar samples this block
+        // latest-wins and may miss any individual write; carrying the current value means it
+        // notices the edge whenever it next looks, rather than depending on catching one frame.
+        b->reset_epoch = impl_->reset_epoch;
+
+        WireVehicleCommand& v = b->vehicles[0];
+        std::snprintf(v.vehicle_name, kMaxVehicleNameChars, "%s",
+                      impl_->options.vehicle_name.c_str());
+        uint32_t n = 0;
+        for (size_t j = 0; j < joint_names_.size() && n < kMaxJointsPerVehicle; ++j) {
+            // ⚠ MODE None IS OMITTED, NOT SENT AS ZERO. A passive rocker-bogie joint must stay
+            // free to swing; commanding it to velocity 0 is a brake, and a braked rocker lifts
+            // wheels off the ground on uneven terrain.
+            if (impl_->modes[j] == urdf::ControlMode::None)
+                continue;
+            WireJointCommand& jc = v.joints[n++];
+            std::snprintf(jc.joint_name, kMaxLinkNameChars, "%s", joint_names_[j].c_str());
+            // Only velocity crosses the wire today; the sidecar says so if it is sent anything
+            // else, rather than applying a velocity while the caller believed it sent a position.
+            jc.target_mode = static_cast<uint32_t>(
+                impl_->modes[j] == urdf::ControlMode::Velocity ? WireJointTargetMode::Velocity
+                : impl_->modes[j] == urdf::ControlMode::Position ? WireJointTargetMode::Position
+                                                                 : WireJointTargetMode::Torque);
+            jc.target = impl_->targets[j];
+        }
+        v.joint_count = n;
+        seq->fetch_add(1, std::memory_order_release);
+    }
+
+    // ---- attach to the pose segment if the sidecar has since created it -------------------
+    if (!impl_->pose) {
+        const std::string pose_path = impl_->options.directory + "/" + kVehiclePoseSegment;
+        impl_->pose_fd = ::open(pose_path.c_str(), O_RDONLY);
+        if (impl_->pose_fd >= 0) {
+            struct stat info;
+            if (::fstat(impl_->pose_fd, &info) == 0 &&
+                static_cast<size_t>(info.st_size) == sizeof(MpmVehiclePoseBlock)) {
+                void* address = ::mmap(nullptr, sizeof(MpmVehiclePoseBlock), PROT_READ,
+                                       MAP_SHARED, impl_->pose_fd, 0);
+                if (address != MAP_FAILED)
+                    impl_->pose = static_cast<const MpmVehiclePoseBlock*>(address);
+            }
+            if (!impl_->pose) {
+                ::close(impl_->pose_fd);
+                impl_->pose_fd = -1;
+            }
+        }
+    }
+
+    // ---- take the newest published sample -------------------------------------------------
+    bool got_new = false;
+    if (impl_->pose) {
+        MpmVehiclePoseBlock snapshot;
+        if (readPoseBlock(impl_->pose, snapshot) && snapshot.magic == kVehiclePoseMagic &&
+            snapshot.version == kProtocolVersion) {
+            for (uint32_t i = 0; i < snapshot.vehicle_count && i < kMaxVehicles; ++i) {
+                const WireVehiclePose& v = snapshot.vehicles[i];
+                if (impl_->options.vehicle_name != v.vehicle_name)
+                    continue;
+                if (impl_->have_latest && snapshot.sidecar_step == impl_->latest.step)
+                    break;                       // nothing new since last tick
+
+                PoseSample sample;
+                sample.time = snapshot.sidecar_time;
+                sample.step = snapshot.sidecar_step;
+                sample.effort_reported = v.effort_reported != 0;
+
+                if (!impl_->mapping_resolved) {
+                    for (size_t l = 0; l < link_names_.size(); ++l) {
+                        impl_->wire_link_index[l] = -1;
+                        for (uint32_t k = 0; k < v.link_count && k < kMaxLinksPerVehicle; ++k) {
+                            // ⚠ SUFFIX MATCH. Newton labels links "robot/link_name" while our URDF
+                            // model knows them as "link_name". Comparing whole strings resolved
+                            // nothing and left every link at the origin.
+                            const std::string wire = v.links[k].link_name;
+                            const size_t slash = wire.rfind('/');
+                            const std::string bare =
+                                slash == std::string::npos ? wire : wire.substr(slash + 1);
+                            if (bare == link_names_[l]) {
+                                impl_->wire_link_index[l] = static_cast<int>(k);
+                                break;
+                            }
+                        }
+                    }
+                    for (size_t j = 0; j < joint_names_.size(); ++j) {
+                        impl_->wire_joint_index[j] = -1;
+                        for (uint32_t k = 0; k < v.joint_count && k < kMaxJointsPerVehicle; ++k) {
+                            const std::string wire = v.joints[k].joint_name;
+                            const size_t slash = wire.rfind('/');
+                            const std::string bare =
+                                slash == std::string::npos ? wire : wire.substr(slash + 1);
+                            if (bare == joint_names_[j]) {
+                                impl_->wire_joint_index[j] = static_cast<int>(k);
+                                break;
+                            }
+                        }
+                    }
+                    impl_->mapping_resolved = true;
+                }
+
+                // ⚠ ANCHOR ON THE FIRST SAMPLE. The root link is link 0 by construction (the URDF
+                // order this backend publishes), so whatever the sidecar says it is at now becomes
+                // the solver-frame root_position the plugin asked for.
+                if (!impl_->offset_resolved && impl_->wire_link_index[0] >= 0) {
+                    const WireLinkPose& r = v.links[impl_->wire_link_index[0]];
+                    // ⚠ X AND Y ONLY. Z IS NOT ARBITRARY AND MUST NOT BE ANCHORED.
+                    //
+                    // Where in the level a robot stands is a free choice, so x/y are shifted to
+                    // wherever the settings asked. HEIGHT is not: both worlds have a ground, the
+                    // sidecar's at its own `ground_z` and the level's at its floor, and they are
+                    // meant to be the same surface. Shifting z by
+                    // (settings spawn - sidecar rest height) lifted the whole sidecar world by
+                    // 0.565 m, so the Scout and its sand floated visibly clear of the level's
+                    // floor — each internally consistent, both wrong against the level.
+                    //
+                    // The consequence, said plainly because it surprises: for a sidecar-owned
+                    // vehicle the settings' Z does NOT place the robot. The sidecar's own spawn
+                    // height and ground plane do. Set them with --own-vehicle-z and --ground-z.
+                    impl_->frame_offset = urdf::Vec3{
+                        impl_->requested_root.x - r.position.x,
+                        impl_->requested_root.y - r.position.y,
+                        0.0};
+                    impl_->offset_resolved = true;
+                    common_utils::Utils::log(
+                        common_utils::Utils::stringf(
+                            "NewtonSidecar '%s': anchoring the sidecar frame in X/Y only. It "
+                            "reports the root at (%.3f %.3f %.3f); settings ask for "
+                            "(%.3f %.3f %.3f); applying offset (%+.3f %+.3f %+.3f). Z is NOT "
+                            "anchored - the sidecar's own ground plane and spawn height decide "
+                            "height, so this robot rests where --own-vehicle-z and --ground-z put "
+                            "it, not where the settings' Z says.",
+                            impl_->options.vehicle_name.c_str(),
+                            r.position.x, r.position.y, r.position.z,
+                            impl_->requested_root.x, impl_->requested_root.y,
+                            impl_->requested_root.z,
+                            impl_->frame_offset.x, impl_->frame_offset.y, impl_->frame_offset.z),
+                        common_utils::Utils::kLogLevelInfo);
+                }
+                const urdf::Vec3 off = impl_->frame_offset;
+
+                sample.poses.resize(link_names_.size());
+                sample.twists.resize(link_names_.size());
+                for (size_t l = 0; l < link_names_.size(); ++l) {
+                    const int k = impl_->wire_link_index[l];
+                    if (k < 0)
+                        continue;               // stays identity; reported once below
+                    const WireLinkPose& w = v.links[k];
+                    // ⚠ POSITION ONLY. The offset is a translation, so twists and orientations are
+                    // unchanged by it; rotating the sidecar's frame is not supported and would need
+                    // the orientation half of root_orientation applied to every vector here.
+                    sample.poses[l].position = urdf::Vec3{w.position.x + off.x,
+                                                          w.position.y + off.y,
+                                                          w.position.z + off.z};
+                    sample.poses[l].orientation = urdf::Quat{w.orientation.x, w.orientation.y,
+                                                             w.orientation.z, w.orientation.w};
+                    sample.twists[l].linear = urdf::Vec3{w.linear_velocity.x, w.linear_velocity.y,
+                                                         w.linear_velocity.z};
+                    sample.twists[l].angular = urdf::Vec3{w.angular_velocity.x,
+                                                          w.angular_velocity.y,
+                                                          w.angular_velocity.z};
+                }
+                sample.joints.resize(joint_names_.size());
+                for (size_t j = 0; j < joint_names_.size(); ++j) {
+                    const int k = impl_->wire_joint_index[j];
+                    if (k < 0)
+                        continue;
+                    sample.joints[j].position = v.joints[k].position;
+                    sample.joints[j].velocity = v.joints[k].velocity;
+                    sample.joints[j].effort = sample.effort_reported ? v.joints[k].effort : 0.0;
+                }
+
+                if (impl_->have_latest) {
+                    impl_->previous = impl_->latest;
+                    impl_->have_previous = true;
+                }
+                impl_->latest = std::move(sample);
+                impl_->have_latest = true;
+                got_new = true;
+                break;
+            }
+        }
+    }
+
+    // ⚠ AFTER the anchor, not before: the geometry is shifted into the sidecar's frame by the same
+    // offset the poses use, and that is only known once the sidecar has told us where its robot is.
+    // Returns immediately once published, so this costs a branch per step.
+    publishStaticWorld();
+
+    // ---- advance the playback clock --------------------------------------------------------
+    //
+    // ⚠ THE PLAYBACK CLOCK IS OURS AND RUNS ON OUR dt. It is deliberately not the sidecar's step
+    // counter and deliberately not wall time. Following the sidecar's counter would make our frame
+    // rate its frame rate — which is the coupling this whole design exists to avoid — and wall time
+    // would drift the instant the solve ran slower than real time, which at 1.37 M particles it
+    // routinely does.
+    impl_->wall_since_sample += dt;
+
+    if (got_new) {
+        const double interval = impl_->have_previous
+                                    ? impl_->latest.time - impl_->previous.time
+                                    : 0.0;
+        // ⚠ MEASURE THE RATE FROM SIM TIME AGAINST OUR OWN ELAPSED TIME. `interval` is how much
+        // SIMULATED time passed between the last two publications; `wall_since_sample` is how much
+        // of ours passed while we waited for this one. Their ratio is how fast the sidecar is
+        // actually running relative to us, and it is what the playback clock must advance at.
+        if (interval > 0.0 && impl_->wall_since_sample > 1e-6) {
+            const double instant = interval / impl_->wall_since_sample;
+            // Heavily smoothed: the ratio of two small intervals is noisy, and a playback rate
+            // that jitters is visible as speed wobble even when its average is right.
+            impl_->observed_rate = impl_->rate_seeded
+                                       ? 0.9 * impl_->observed_rate + 0.1 * instant
+                                       : instant;
+            impl_->rate_seeded = true;
+        }
+        impl_->wall_since_sample = 0.0;
+        impl_->seconds_since_new = 0.0;
+        impl_->stale_warned = false;
+
+        const double fallback = interval > 0 ? interval : 1.0 / 30.0;
+        const double delay = impl_->options.delay_intervals * fallback;
+        const double target = impl_->latest.time - delay;
+        // ⚠ RESYNC ONLY WHEN WE HAVE FALLEN OUTSIDE THE BRACKET. Snapping every time a sample
+        // arrives would make the playback clock jump by the jitter between publications, and a
+        // pose that jumps backwards by a few milliseconds every frame is visible as a stutter even
+        // when the average rate is perfect.
+        if (impl_->playback_time > impl_->latest.time ||
+            impl_->playback_time < target - 4.0 * fallback)
+            impl_->playback_time = target;
+    }
+    else {
+        impl_->seconds_since_new += dt;
+    }
+
+    // ⚠ ADVANCED AT THE SIDECAR'S RATE, NOT OURS, and clamped so it cannot run past the newest
+    // sample it has actually been given. A vehicle rendered in slow motion is TRUE — the physics
+    // really is progressing at that rate — whereas one advanced at our clock is a smooth lie that
+    // snaps back four times a second.
+    impl_->playback_time += dt * (impl_->rate_seeded ? impl_->observed_rate : 1.0);
+    if (impl_->have_latest && impl_->playback_time > impl_->latest.time)
+        impl_->playback_time = impl_->latest.time;
+    return 0;
+#endif
+}
+
+urdf::LinkPose NewtonSidecarUrdfBackend::getLinkPose(size_t link) const
+{
+    urdf::LinkPose out;
+    if (link >= link_names_.size() || !impl_->have_latest)
+        return out;
+    if (!impl_->have_previous)
+        return impl_->latest.poses[link];
+
+    const PoseSample& a = impl_->previous;
+    const PoseSample& b = impl_->latest;
+    const double span = b.time - a.time;
+    if (span <= 1e-9)
+        return b.poses[link];
+
+    double t = (impl_->playback_time - a.time) / span;
+    if (t > 1.0) {
+        // ⚠ EXTRAPOLATION IS ALLOWED AND COUNTED. When the sidecar is slower than the renderer,
+        // holding the last pose would stutter at exactly the sidecar's period; continuing along
+        // the published twist is smooth and wrong by a bounded amount. It is capped so a sidecar
+        // that has DIED does not send the vehicle off to infinity.
+        ++impl_->extrapolated;
+        t = std::min(t, 2.0);
+    }
+    t = std::max(t, 0.0);
+
+    out.position = hermite(a.poses[link].position, a.twists[link].linear,
+                           b.poses[link].position, b.twists[link].linear, t, span);
+    out.orientation = slerp(a.poses[link].orientation, b.poses[link].orientation,
+                            std::min(t, 1.0));
+    return out;
+}
+
+urdf::Twist NewtonSidecarUrdfBackend::getLinkTwist(size_t link) const
+{
+    urdf::Twist out;
+    if (link >= link_names_.size() || !impl_->have_latest)
+        return out;
+    if (!impl_->have_previous)
+        return impl_->latest.twists[link];
+
+    const PoseSample& a = impl_->previous;
+    const PoseSample& b = impl_->latest;
+    const double span = b.time - a.time;
+    const double t = span > 1e-9
+                         ? std::max(0.0, std::min(1.0, (impl_->playback_time - a.time) / span))
+                         : 1.0;
+    // ⚠ TWIST IS LERPED, NOT HERMITED. A Hermite on velocity would need acceleration as its
+    // tangent, which the wire does not carry; using the velocities themselves as tangents would be
+    // a units error dressed as smoothing.
+    out.linear = lerp(a.twists[link].linear, b.twists[link].linear, t);
+    out.angular = lerp(a.twists[link].angular, b.twists[link].angular, t);
+    return out;
+}
+
+urdf::JointState NewtonSidecarUrdfBackend::getJointState(size_t joint) const
+{
+    urdf::JointState out;
+    if (joint >= joint_names_.size() || !impl_->have_latest)
+        return out;
+    if (!impl_->have_previous)
+        return impl_->latest.joints[joint];
+
+    const PoseSample& a = impl_->previous;
+    const PoseSample& b = impl_->latest;
+    const double span = b.time - a.time;
+    const double t = span > 1e-9
+                         ? std::max(0.0, std::min(1.0, (impl_->playback_time - a.time) / span))
+                         : 1.0;
+    // ⚠ NO ANGLE WRAPPING HERE ON PURPOSE. Newton reports a continuous joint's position as an
+    // accumulating angle, not wrapped to [-pi, pi], so a plain lerp is correct. Wrapping it would
+    // make a spinning wheel's reported angle jump every revolution, and anything differentiating
+    // it would see an impulse.
+    out.position = a.joints[joint].position +
+                   t * (b.joints[joint].position - a.joints[joint].position);
+    out.velocity = a.joints[joint].velocity +
+                   t * (b.joints[joint].velocity - a.joints[joint].velocity);
+    out.effort = b.joints[joint].effort;
+    return out;
+}
+
+const std::string& NewtonSidecarUrdfBackend::linkName(size_t link) const
+{
+    static const std::string empty;
+    return link < link_names_.size() ? link_names_[link] : empty;
+}
+
+const std::string& NewtonSidecarUrdfBackend::jointName(size_t joint) const
+{
+    static const std::string empty;
+    return joint < joint_names_.size() ? joint_names_[joint] : empty;
+}
+
+int NewtonSidecarUrdfBackend::findLink(const std::string& name) const
+{
+    for (size_t i = 0; i < link_names_.size(); ++i)
+        if (link_names_[i] == name) return static_cast<int>(i);
+    return -1;
+}
+
+int NewtonSidecarUrdfBackend::findJoint(const std::string& name) const
+{
+    for (size_t i = 0; i < joint_names_.size(); ++i)
+        if (joint_names_[i] == name) return static_cast<int>(i);
+    return -1;
+}
+
+void NewtonSidecarUrdfBackend::setJointTarget(size_t joint, urdf::ControlMode mode, double value)
+{
+    if (joint >= joint_names_.size())
+        return;
+    impl_->modes[joint] = mode;
+    impl_->targets[joint] = value;
+}
+
+void NewtonSidecarUrdfBackend::setPositionGains(size_t, double, double)
+{
+    // Deliberately nothing. See the note on the declaration: the actuator model lives in the
+    // sidecar's vehicle spec, and accepting a gain here that no solver will read would be a knob
+    // that does nothing on the one parameter that decides whether the vehicle climbs.
+}
+
+void NewtonSidecarUrdfBackend::applyExternalWrench(size_t, const urdf::Wrench&)
+{
+    // ⚠ LOUD ONCE, THEN NO-OP — AND IT USED TO THROW, WHICH WAS WRONG.
+    //
+    // The body is in another process and protocol v5 carries no force channel into it, so this
+    // genuinely cannot be honoured. The first version threw, on the principle that a silent no-op
+    // lets a rotor, a winch or a tow force be applied every tick with no effect and no error.
+    // That principle is right and the mechanism was not: `UrdfBotSimApi::applyLinkWrench` calls
+    // this on the GAME THREAD, where an escaping exception takes the editor down rather than
+    // reporting a problem. Crashing the simulator is a worse answer to "this is unsupported" than
+    // any log.
+    //
+    // Logged once rather than per tick: a message every frame is scrolled past and ignored, which
+    // is the same outcome as not warning at all.
+    if (!impl_->wrench_warned) {
+        impl_->wrench_warned = true;
+        common_utils::Utils::log(
+            "NewtonSidecar backend: applyExternalWrench is NOT supported and is being ignored. "
+            "The vehicle is solved in the sidecar process and protocol v5 carries no force channel "
+            "into it. Drive it through a URDF joint the sidecar can actuate, or run this vehicle "
+            "on Box3D/MuJoCo. This is reported once per run.",
+            common_utils::Utils::kLogLevelError);
+    }
+}
+
+bool NewtonSidecarUrdfBackend::isConnected() const
+{
+    return impl_->have_latest;
+}
+
+double NewtonSidecarUrdfBackend::observedPublishInterval() const
+{
+    if (!impl_->have_previous || !impl_->have_latest)
+        return 0.0;
+    return impl_->latest.time - impl_->previous.time;
+}
+
+uint64_t NewtonSidecarUrdfBackend::extrapolatedSteps() const
+{
+    return impl_->extrapolated;
+}
+
+bool NewtonSidecarUrdfBackend::frameOffset(urdf::Vec3& out) const
+{
+    if (!impl_->offset_resolved)
+        return false;
+    out = impl_->frame_offset;
+    return true;
+}
+
+double NewtonSidecarUrdfBackend::observedRate() const
+{
+    return impl_->rate_seeded ? impl_->observed_rate : 1.0;
+}
+
+} // namespace mpm
+} // namespace airlib
+} // namespace msr

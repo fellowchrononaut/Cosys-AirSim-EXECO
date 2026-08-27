@@ -67,6 +67,30 @@ FAULT_SOLVER = 2
 FAULT_TOPOLOGY = 3
 
 
+def _quat_from_z_to(axis):
+    """xyzw quaternion rotating +Z onto `axis`. Identity for a degenerate segment."""
+    import numpy as np
+
+    a = np.asarray(axis, dtype=float)
+    n = float(np.linalg.norm(a))
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    a = a / n
+    z = np.array([0.0, 0.0, 1.0])
+    d = float(np.dot(z, a))
+    if d > 1.0 - 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    # ⚠ ANTIPARALLEL NEEDS A PICKED AXIS, not the cross product, which is zero there — leaving it
+    # would silently give the identity and lay the capsule the wrong way round.
+    if d < -1.0 + 1e-12:
+        return (1.0, 0.0, 0.0, 0.0)
+    c = np.cross(z, a)
+    w = 1.0 + d
+    q = np.array([c[0], c[1], c[2], w])
+    q = q / float(np.linalg.norm(q))
+    return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+
+
 class Sidecar:
     def __init__(self, args):
         self.args = args
@@ -116,6 +140,24 @@ class Sidecar:
         # ⚠ D15 step 1: set only in --own-vehicle mode. `vehicle` being None is what every other
         # code path means by "the simulator owns the robot and we only see kinematic colliders".
         self.vehicle = None
+        self.command_seg = None
+        self.pose_seg = None
+        self.last_command_step = 0
+        self._last_pose_time = -1.0e9
+        self._publish_every = 1
+        self._poses_published = 0
+        self._command_version_warned = False
+        self._command_name_warned = False
+        self._unknown_joint_warned = False
+        self._unsupported_mode_warned = False
+        self._pose_overflow_warned = False
+        self._static_revision = 0
+        self._static_seg = None
+        self._built_static_revision = 0
+        # ⚠ False until we know whether a level mirror is coming. Gates the SAND only.
+        self._static_settled = False
+        self.requested_reset_epoch = 0
+        self._applied_reset_epoch = 0
         self.control = None
         self.contacts = None
         self.pipeline = None
@@ -831,7 +873,12 @@ class Sidecar:
 
         block = self.particle_seg.block
         block.sequence |= 1
-        block.stamp = self.status_seg.block.stamp
+        # ⚠ THERE IS NO STATUS BLOCK IN OWN-VEHICLE MODE. That mode never attaches the collider
+        # segments — there is no simulator publishing colliders to it — so the stamp it would echo
+        # does not exist. Leaving the field at its zero default is correct there: the epoch belongs
+        # to the collider protocol, and a run with no colliders has no epoch to be stale against.
+        if self.status_seg is not None:
+            block.stamp = self.status_seg.block.stamp
         block.sidecar_step = self.sidecar_step
         block.sidecar_time = self.sidecar_time
         block.total_particles = total
@@ -1221,6 +1268,202 @@ class Sidecar:
                 print(f"reached --max-steps {self.args.max_steps}")
                 return 0
 
+    # ---- D15 step 2: the vehicle wire ------------------------------------------------------
+
+    def attach_vehicle_wire(self) -> None:
+        """Open the command (in) and pose (out) segments.
+
+        ⚠ THESE TWO ARE CREATED HERE, UNLIKE EVERY OTHER SEGMENT, and the difference is deliberate.
+        For the sand path the simulator is the writer of registry and state, so a sidecar that
+        created them could present an EMPTY registry to a simulator that had not written one yet —
+        the sidecar would build zero colliders and report itself healthy. For the vehicle path the
+        sidecar is the writer of the POSE block, so it must create that one; and the command block
+        is created too so this process can run standalone against a test harness with no simulator
+        present at all. `Segment(create=True)` adopts an existing correctly-sized file rather than
+        truncating it, so whichever end starts first, both get the same inode.
+        """
+        self.command_seg = P.Segment(self.directory, P.VEHICLE_COMMAND_SEGMENT,
+                                     P.MpmVehicleCommandBlock, create=True)
+        self.pose_seg = P.Segment(self.directory, P.VEHICLE_POSE_SEGMENT,
+                                  P.MpmVehiclePoseBlock, create=True)
+        # ⚠ THE SAND IS PUBLISHED HERE TOO, or the operator drives an invisible mound. In
+        # collider mode the simulator creates this segment; in own-vehicle mode there is no
+        # simulator-side terrain at all, so this process owns the bed and must offer the picture
+        # of it. Unreal shifts these positions by the same anchor it applies to the vehicle.
+        self.particle_seg = P.Segment(self.directory, P.PARTICLE_SEGMENT,
+                                      P.MpmParticleBlock, create=True)
+        pblock = self.particle_seg.block
+        pblock.magic = P.PARTICLE_MAGIC
+        pblock.version = P.PROTOCOL_VERSION
+        print(f"              sand     -> {self.particle_seg.path} "
+              f"(every {self.args.particle_every} solve(s), "
+              f"max {self.args.max_render_particles} particles)")
+        # ⚠ SNAP THE CADENCE TO A WHOLE NUMBER OF SOLVES, AND PUBLISH WHAT WE WILL ACTUALLY DO.
+        #
+        # A pose can only be published at the end of a solve, so the achievable intervals are
+        # multiples of frame_dt and nothing else. The first version of this asked "has `interval`
+        # of simulated time elapsed since the last publish?", which at 100 Hz solves and a 33.33 ms
+        # request fires at 40 ms — 25 Hz — while the block still advertised 33.33 ms.
+        # Measured by vehicle_wire_check.py: "median 40.00 ms, nominal 33.33 ms, cadence error
+        # 20 %". A consumer sizing its interpolation window against the advertised figure would
+        # extrapolate 6.7 ms past every sample and never know why its poses lagged.
+        #
+        # The wire field is the CONTRACT, so it has to carry the truth: round to the nearest whole
+        # number of solves, publish that interval, and say so out loud when it is not what was
+        # asked for.
+        frame_dt = 1.0 / float(self.args.fps)
+        requested = 1.0 / float(self.args.own_vehicle_publish_hz)
+        self._publish_every = max(1, int(round(requested / frame_dt)))
+        actual = self._publish_every * frame_dt
+        block = self.pose_seg.block
+        block.magic = P.VEHICLE_POSE_MAGIC
+        block.version = P.PROTOCOL_VERSION
+        block.publish_interval_seconds = actual
+        print(f"vehicle wire: commands <- {self.command_seg.path}")
+        print(f"              poses    -> {self.pose_seg.path}")
+        print(f"              cadence: every {self._publish_every} solve(s) = "
+              f"{actual * 1000:.2f} ms of SIMULATED time = {1.0 / actual:.2f} Hz")
+        if abs(actual - requested) > 0.02 * requested:
+            print(f"              ⚠ asked for {self.args.own_vehicle_publish_hz:.2f} Hz "
+                  f"({requested * 1000:.2f} ms); a pose can only be published at the end of a "
+                  f"solve and solves are {frame_dt * 1000:.2f} ms apart, so the nearest achievable "
+                  f"rate is {1.0 / actual:.2f} Hz. The wire carries the achievable one.")
+
+    def consume_vehicle_command(self) -> bool:
+        """Apply the current wire command. Returns True if one was applied this call.
+
+        ⚠ LATEST-WINS AND NEVER BLOCKING, which is the whole of the rate-decoupling answer on this
+        side. We read whatever is in the block when a solve begins; if the simulator has not
+        written since the last solve we simply re-apply what we have, and if it has written three
+        times we see only the newest. Waiting for a fresh command would make the sand solver the
+        thing the simulator's tick rate depends on, which is exactly what plan D15 flags as "who
+        owns time" and what PX4 lockstep forbids.
+        """
+        if self.command_seg is None:
+            return False
+        try:
+            block = P.read_consistent(self.command_seg)
+        except P.SegmentError:
+            # A torn read is not an error here: the writer is simply faster than we are, and the
+            # next solve will read the newer value. Silence is correct; a warning per solve is not.
+            return False
+        if block.magic != P.VEHICLE_COMMAND_MAGIC:
+            return False                      # never written yet
+        if block.version != P.PROTOCOL_VERSION:
+            if not self._command_version_warned:
+                self._command_version_warned = True
+                print(f"⚠ vehicle command block is protocol v{block.version}, this sidecar speaks "
+                      f"v{P.PROTOCOL_VERSION} — ignoring commands. Rebuild both from one commit.",
+                      file=sys.stderr)
+            return False
+
+        wanted = self.vehicle.spec.name
+        entry = None
+        for i in range(min(block.vehicle_count, P.MAX_VEHICLES)):
+            if block.vehicles[i].name() == wanted:
+                entry = block.vehicles[i]
+                break
+        if entry is None:
+            # ⚠ SAID ONCE. A simulator commanding "husky" while this sidecar owns "scout" would
+            # otherwise present as a vehicle that simply never moves, with both ends healthy.
+            if not self._command_name_warned:
+                self._command_name_warned = True
+                names = [block.vehicles[i].name() for i in range(min(block.vehicle_count,
+                                                                     P.MAX_VEHICLES))]
+                print(f"⚠ no wire command for vehicle '{wanted}'; the block carries {names}",
+                      flush=True)
+            return False
+
+        commands = [(entry.joints[j].name(), int(entry.joints[j].target_mode),
+                     float(entry.joints[j].target))
+                    for j in range(min(entry.joint_count, P.MAX_JOINTS_PER_VEHICLE))]
+        self.vehicle.apply_wire_commands(self.control, commands)
+        self.last_command_step = int(block.step)
+        # ⚠ RECORDED, NOT ACTED ON HERE. Rebuilding from inside the command read would destroy the
+        # model whose control array we are part-way through writing.
+        self.requested_reset_epoch = int(block.reset_epoch)
+
+        if self.vehicle.unknown_joints and not self._unknown_joint_warned:
+            self._unknown_joint_warned = True
+            print(f"⚠ wire commanded joint(s) this vehicle does not have: "
+                  f"{self.vehicle.unknown_joints[:6]}", flush=True)
+        unsupported = getattr(self.vehicle, "unsupported_modes", None)
+        if unsupported and not self._unsupported_mode_warned:
+            self._unsupported_mode_warned = True
+            print(f"⚠ wire asked for target mode(s) this sidecar does not apply: "
+                  f"{sorted(unsupported)[:4]} — only VELOCITY is supported, because position and "
+                  f"torque modes are a BUILD-time property of the joint, not a per-tick one.",
+                  flush=True)
+        return True
+
+    def publish_vehicle_poses(self) -> None:
+        """Write link poses for Unreal. Seqlock, latest-wins.
+
+        ⚠ PUBLISHED ON A SIMULATED-TIME CADENCE, not every solve and not on a wall clock. Every
+        solve would write 100 Hz of pose into a block a 60 fps renderer samples, which is work
+        nobody reads; a wall clock would make the cadence depend on how slow the solve happened to
+        be, so a heavy bed would silently change the interpolation window the consumer is sizing
+        against. `sidecar_time` advances by exactly one frame_dt per solve, so this is stable
+        whatever the hardware does.
+        """
+        if self.pose_seg is None:
+            return
+        # ⚠ COUNT SOLVES, DO NOT COMPARE ACCUMULATED TIMES. Comparing simulated times against an
+        # interval that is not a multiple of the solve step quantises upward — see the note in
+        # attach_vehicle_wire for the 25-Hz-advertised-as-30 measurement. Counting is exact and
+        # needs no epsilon.
+        if self.sidecar_step % self._publish_every != 0:
+            return
+        interval = self._publish_every / float(self.args.fps)
+        self._last_pose_time = self.sidecar_time
+
+        poses = self.vehicle.link_poses(self.state_0)
+        if len(poses) > P.MAX_LINKS_PER_VEHICLE:
+            if not self._pose_overflow_warned:
+                self._pose_overflow_warned = True
+                print(f"⚠ vehicle has {len(poses)} links but the wire carries "
+                      f"{P.MAX_LINKS_PER_VEHICLE}; the rest are NOT published", file=sys.stderr)
+            poses = poses[:P.MAX_LINKS_PER_VEHICLE]
+
+        block = self.pose_seg.block
+        # ⚠ ODD WHILE WRITING. A reader that copied mid-update would get some links from this step
+        # and some from the last, which on an articulated body is indistinguishable from a joint
+        # that snapped. Same discipline as every other block here.
+        block.sequence += 1
+        block.magic = P.VEHICLE_POSE_MAGIC
+        block.version = P.PROTOCOL_VERSION
+        block.vehicle_count = 1
+        block.sidecar_step = self.sidecar_step
+        block.sidecar_time = self.sidecar_time
+        block.publish_interval_seconds = interval
+        block.acknowledged_command_step = self.last_command_step
+        entry = block.vehicles[0]
+        entry.vehicle_name = self.vehicle.spec.name.encode("utf-8")[:P.MAX_VEHICLE_NAME_CHARS - 1]
+        entry.link_count = len(poses)
+        joints = self.vehicle.joint_states(self.state_0)[:P.MAX_JOINTS_PER_VEHICLE]
+        entry.joint_count = len(joints)
+        # ⚠ 0 = "the efforts below are placeholders", and it stays 0 until the solver can actually
+        # report per-joint applied torque. See WireJointState for why a silent zero is worse here.
+        entry.effort_reported = 0
+        for i, (jlabel, jpos, jvel) in enumerate(joints):
+            js = entry.joints[i]
+            js.joint_name = jlabel.encode("utf-8")[:P.MAX_LINK_NAME_CHARS - 1]
+            js.position = jpos
+            js.velocity = jvel
+            js.effort = 0.0
+        for i, (label, pos, quat, lin, ang) in enumerate(poses):
+            link = entry.links[i]
+            link.link_name = label.encode("utf-8")[:P.MAX_LINK_NAME_CHARS - 1]
+            link.position.x, link.position.y, link.position.z = pos
+            (link.orientation.x, link.orientation.y,
+             link.orientation.z, link.orientation.w) = quat
+            (link.linear_velocity.x, link.linear_velocity.y,
+             link.linear_velocity.z) = lin
+            (link.angular_velocity.x, link.angular_velocity.y,
+             link.angular_velocity.z) = ang
+        block.sequence += 1
+        self._poses_published += 1
+
     # ---- D15 step 1: the sidecar owns the vehicle -----------------------------------------
 
     def build_own_vehicle(self) -> None:
@@ -1283,18 +1526,50 @@ class Sidecar:
         self.vehicle.add_to(builder, self.args.own_vehicle_x, self.args.own_vehicle_y, z,
                             self.args.own_vehicle_yaw)
 
-        # ⚠ THE GROUND IS PRESENT, ON PURPOSE. The question D15 exists to answer is whether sand
-        # support and rigid ground support can coexist without one cancelling the other, so
-        # removing the ground would assume the answer. Its height is the bottom of the bed, which
-        # is where the sand needs support — same rule build() uses.
+        # ⚠ THE REAL LEVEL IF WE HAVE IT, A FLAT PLANE ONLY AS A FALLBACK.
+        #
+        # A typed-in ground height was wrong twice in one afternoon: the two ends differ in z by the
+        # AirSim NED origin's offset from the Unreal world origin (0.640 m on Blocks), so a
+        # plausible number can be wrong by exactly that and read as a physics bug. And a level whose
+        # ground is not flat cannot be expressed as a number at all, while one with obstacles never
+        # could — a robot in this process could previously drive through every wall in the map.
+        #
+        # The ground is still PRESENT either way, on purpose: the question D15 exists to answer is
+        # whether sand support and rigid ground support can coexist without one cancelling the
+        # other, so removing the floor would assume the answer.
         ground_z = self.args.ground_z
         if ground_z is None:
             ground_z = self.args.patch_z - self.args.patch_depth * 0.5
-        builder.add_ground_plane(
-            height=float(ground_z),
-            cfg=newton.ModelBuilder.ShapeConfig(mu=float(self.args.ground_friction)))
         self.ground_z = float(ground_z)
-        print(f"ground plane at z = {self.ground_z:.3f} m, mu = {self.args.ground_friction}")
+
+        # ⚠ A BAD MIRROR MUST NOT KILL THE SIMULATION. The level arrives from another process and
+        # is 24 MB of geometry; one malformed shape used to raise out of the rebuild and exit the
+        # sidecar, which from the operator's seat looked like sand appearing and then vanishing.
+        # Falling back to the flat plane is degraded but running, and it says which it is.
+        mirrored = 0
+        if self.args.own_vehicle_mirror_world:
+            try:
+                mirrored = self._add_static_world(builder)
+            except Exception as error:
+                import traceback
+                print(f"⚠ the level mirror could not be built ({error}) — falling back to a flat "
+                      f"ground plane. The robot will not collide with anything in the level.",
+                      file=sys.stderr)
+                traceback.print_exc()
+                mirrored = 0
+        self._built_static_revision = self._static_revision
+        if mirrored:
+            print(f"level mirror: {mirrored} static shape(s) from the simulator — "
+                  f"no synthetic ground plane")
+        else:
+            builder.add_ground_plane(
+                height=float(ground_z),
+                cfg=newton.ModelBuilder.ShapeConfig(mu=float(self.args.ground_friction)))
+            print(f"ground plane at z = {self.ground_z:.3f} m, mu = {self.args.ground_friction}"
+                  + ("" if not self.args.own_vehicle_mirror_world else
+                     "  ⚠ FALLBACK: the simulator published no level geometry, so this is a flat "
+                     "floor at a height taken from the command line. Anything in the level that is "
+                     "not flat, and everything the robot could bump into, is absent."))
 
         # The cull needs world-space shapes; `_spawn_sand` consumes exactly this list.
         self._collider_volumes = self.vehicle.collider_volumes(builder)
@@ -1360,6 +1635,235 @@ class Sidecar:
 
         if self.args.render_to:
             self._setup_offline_viewer()
+
+    def _add_static_world(self, builder) -> int:
+        """Build the level's collision geometry into `builder`. Returns how many shapes were added.
+
+        ⚠ THIS IS THE ANSWER TO "WHAT IS THE GROUND HEIGHT", AND IT IS "STOP ASKING". The height was
+        got wrong twice in one afternoon because the two ends differ in z by the AirSim NED origin's
+        offset from the Unreal world origin — 0.640 m on Blocks — so any plausible number can be
+        wrong by exactly that. A level whose ground is not flat has no such number at all, and a
+        level with obstacles never did: before this, a robot solved in this process could drive
+        through every wall in the map.
+
+        ⚠ SHIFTED INTO OUR FRAME BY THE OFFSET THE BLOCK CARRIES. The vertices arrive in the SOLVER
+        frame (origin: the Unreal world origin); this process works in its own, and the simulator
+        adds `frame_offset` to everything we publish. Subtracting it here is the inverse, and it
+        travels with the data precisely so the two ends cannot disagree about the convention.
+        """
+        import numpy as np
+        import warp as wp
+
+        import newton
+
+        try:
+            seg = P.Segment(self.directory, P.STATIC_WORLD_SEGMENT, P.MpmStaticWorldBlock)
+        except P.SegmentError:
+            # ⚠ ORDINARY, NOT AN ERROR. The simulator writes this only once it has anchored its
+            # robot, which happens after this process starts; a standalone probe run has no
+            # simulator at all. The caller falls back to a flat plane and says so.
+            return 0
+
+        try:
+            block = P.read_consistent(seg)
+        except P.SegmentError:
+            return 0
+        if block.magic != P.STATIC_WORLD_MAGIC:
+            return 0
+        if block.version != P.PROTOCOL_VERSION:
+            print(f"⚠ level mirror is protocol v{block.version}, this sidecar speaks "
+                  f"v{P.PROTOCOL_VERSION} — ignoring it and falling back to a flat plane. "
+                  f"Rebuild both ends from one commit.", file=sys.stderr)
+            return 0
+
+        self._static_revision = int(block.revision)
+        off = np.array(block.frame_offset.as_tuple(), dtype=float)
+        verts = np.ctypeslib.as_array(block.vertices)[: block.vertex_count * 3] \
+            .reshape(-1, 3).astype(float)
+        idx = np.ctypeslib.as_array(block.indices)[: block.index_count].astype(np.int32)
+
+        added = 0
+        skipped_kinds = {}
+        for b in range(min(block.body_count, P.MAX_STATIC_BODIES)):
+            wb = block.bodies[b]
+            pos = np.array(wb.position.as_tuple(), dtype=float) - off
+            quat = wb.orientation.as_xyzw()
+            xform = wp.transform(wp.vec3(*pos), wp.quat(*quat))
+            # ⚠ STATIC MEANS body=-1, not "a body that happens not to move". A dynamic body with
+            # infinite mass still costs the solver an integration step and can be pushed by a
+            # numerical accident; -1 is geometry the solver treats as immovable by construction.
+            cfg = newton.ModelBuilder.ShapeConfig(mu=float(wb.friction),
+                                                  restitution=float(wb.restitution))
+            for s in range(wb.shape_start, min(wb.shape_start + wb.shape_count,
+                                               P.MAX_STATIC_SHAPES)):
+                ws = block.shapes[s]
+                kind = int(ws.kind)
+                if kind == P.STATIC_SHAPE_SPHERE:
+                    c = np.array(ws.center_a.as_tuple(), dtype=float)
+                    builder.add_shape_sphere(-1, xform=wp.transform_multiply(
+                        xform, wp.transform(wp.vec3(*c), wp.quat_identity())),
+                        radius=float(ws.radius), cfg=cfg)
+                    added += 1
+                elif kind == P.STATIC_SHAPE_CAPSULE:
+                    a = np.array(ws.center_a.as_tuple(), dtype=float)
+                    bb = np.array(ws.center_b.as_tuple(), dtype=float)
+                    mid = 0.5 * (a + bb)
+                    axis = bb - a
+                    half = float(np.linalg.norm(axis)) * 0.5
+                    # Newton's capsule runs along local Z; rotate Z onto the segment.
+                    rot = _quat_from_z_to(axis)
+                    builder.add_shape_capsule(-1, xform=wp.transform_multiply(
+                        xform, wp.transform(wp.vec3(*mid), wp.quat(*rot))),
+                        radius=float(ws.radius), half_height=half, cfg=cfg)
+                    added += 1
+                elif kind in (P.STATIC_SHAPE_MESH, P.STATIC_SHAPE_HULL):
+                    v = verts[ws.vertex_start: ws.vertex_start + ws.vertex_count]
+                    if len(v) < 4:
+                        continue
+                    if ws.index_count >= 3:
+                        # ⚠ ALREADY LOCAL TO THIS SHAPE'S OWN POINTS. An earlier version subtracted
+                        # `vertex_start` here on the assumption that indices were global offsets
+                        # into the shared vertex pool; they are not — urdf::StaticShape::indices
+                        # index `ss.points`, and the serialiser copies them unchanged. Subtracting
+                        # drove them negative and Newton refused the mesh
+                        # ("indices contains negative index -110"), taking the whole rebuild — and
+                        # the sidecar — down with it.
+                        tri = idx[ws.index_start: ws.index_start + ws.index_count]
+                        if tri.size and (tri.min() < 0 or tri.max() >= ws.vertex_count):
+                            # ⚠ COUNTED, NOT TRUSTED. A shape whose indices do not address its own
+                            # points is corrupt on the wire; building it would either throw or
+                            # produce a surface made of the wrong triangles.
+                            skipped_kinds["mesh (indices out of range)"] = \
+                                skipped_kinds.get("mesh (indices out of range)", 0) + 1
+                            continue
+                    else:
+                        # ⚠ A HULL ARRIVES AS A POINT CLOUD with no triangles. Triangulating it is
+                        # the only way it becomes a surface; skipping it silently would leave a
+                        # hole the robot drives through.
+                        tri = self._hull_indices(v)
+                        if tri is None:
+                            skipped_kinds["hull (no scipy)"] = \
+                                skipped_kinds.get("hull (no scipy)", 0) + 1
+                            continue
+                    mesh = newton.Mesh(np.ascontiguousarray(v, dtype=np.float32),
+                                       np.ascontiguousarray(tri, dtype=np.int32).flatten())
+                    builder.add_shape_mesh(-1, xform=xform, mesh=mesh, cfg=cfg)
+                    added += 1
+                else:
+                    skipped_kinds[str(kind)] = skipped_kinds.get(str(kind), 0) + 1
+
+        if block.truncated:
+            # ⚠ LOUD. The simulator could not fit the level, so what was just built has holes in it
+            # and the robot will pass through whatever was dropped — indistinguishable, from in
+            # here, from geometry that never existed.
+            print("⚠ the level mirror is PARTIAL: the simulator ran out of wire capacity. The "
+                  "robot WILL fall through whatever was dropped. Raise the kMaxStatic* caps in "
+                  "MpmSidecarProtocol.hpp and protocol.py together.", file=sys.stderr)
+        if skipped_kinds:
+            print(f"⚠ level mirror skipped shapes: {skipped_kinds}", file=sys.stderr)
+        seg.close()
+        return added
+
+    @staticmethod
+    def _hull_indices(points):
+        """Triangulate a point cloud into a closed surface, or None if scipy is unavailable."""
+        try:
+            from scipy.spatial import ConvexHull
+        except ImportError:
+            return None
+        import numpy as np
+
+        try:
+            return np.asarray(ConvexHull(np.asarray(points, dtype=float)).simplices,
+                              dtype=np.int32)
+        except Exception:
+            # Degenerate clouds (coplanar, duplicated points) are common in cooked collision and
+            # are not worth failing the whole level over; the caller counts them.
+            return None
+
+    def _static_world_revision(self) -> int:
+        """Cheapest possible peek at the level mirror's revision. 0 = nothing published.
+
+        ⚠ A PEEK, NOT A READ. The block is 24 MB and `read_consistent` copies all of it; doing that
+        once a second to compare one integer would move 24 MB/s for nothing. The header fields are
+        read directly under the seqlock instead.
+        """
+        try:
+            if self._static_seg is None:
+                self._static_seg = P.Segment(self.directory, P.STATIC_WORLD_SEGMENT,
+                                             P.MpmStaticWorldBlock)
+        except P.SegmentError:
+            return 0
+        b = self._static_seg.block
+        if b.magic != P.STATIC_WORLD_MAGIC or b.sequence % 2 != 0:
+            return 0
+        return int(b.revision)
+
+    def rebuild_model(self, reason: str) -> None:
+        """Tear the Newton model down and build it again. The one path both triggers share.
+
+        ⚠ EXPENSIVE AND UNAVOIDABLE FOR BOTH OF THEM. Newton has no "put the sand back" — the bed's
+        deformation IS its state, spread across a few hundred thousand particles — so returning to
+        the initial condition means building it again. The first rebuild of a session also compiles
+        the mesh-contact CUDA kernels (~11 s); later ones hit Warp's cache and are much faster.
+        """
+        print(f"\n{reason} — rebuilding the model. The sand is respawned; anything driven so far "
+              f"is discarded.", flush=True)
+        # Drop the old model so its GPU memory is released before the new one is built.
+        self.solver = None
+        self.mpm = None
+        self.model = None
+        self.state_0 = self.state_1 = None
+        self.control = None
+        self.pipeline = None
+        self.contacts = None
+        if self.vehicle is not None:
+            self.vehicle.close()
+        self.vehicle = None
+        import gc
+        gc.collect()
+        self.build_own_vehicle()
+        self._last_pose_time = -1.0e9
+
+    def rebuild_for_reset(self) -> bool:
+        """Honour a reset requested by the simulator (BackSpace).
+
+        ⚠ WITHOUT THIS, BackSpace DOES NOTHING TO THIS VEHICLE, because the vehicle is not in the
+        simulator's world at all. The simulator resets its own actors and the robot's poses keep
+        arriving from a Newton model that never heard about it.
+        """
+        if self.requested_reset_epoch == self._applied_reset_epoch:
+            return False
+        epoch = self.requested_reset_epoch
+        self.rebuild_model(f"reset requested by the simulator (epoch {epoch})")
+        self._applied_reset_epoch = epoch
+        # ⚠ The sand is legitimately absent for a moment while it rebuilds; withholding it stops
+        # the renderer seeing the stream die and clearing a bed that is about to come back.
+        self._static_settled = False
+        self.sidecar_time = 0.0
+        self.sidecar_step = 0
+        return True
+
+    def rebuild_for_static_world(self) -> bool:
+        """Rebuild the whole model once the simulator publishes the level.
+
+        ⚠ THE ORDERING MAKES THIS UNAVOIDABLE. The simulator can only place the level relative to
+        this robot once it knows where this robot is, which it learns from our first published
+        pose — so the mirror necessarily arrives AFTER we have already built. The alternative is to
+        refuse to start until a simulator appears, which would break every standalone probe run.
+        Rebuilding once, loudly, is the honest resolution.
+
+        ⚠ THE SAND IS RESPAWNED, and that is correct rather than regrettable: a bed settled against
+        a flat plane at the wrong height is not valid initial state for a bed resting on the real
+        floor. Any ruts driven in the meantime are discarded with it.
+        """
+        revision = self._static_world_revision()
+        if revision == 0 or revision == self._built_static_revision:
+            return False
+        self.rebuild_model(f"level mirror revision {revision} arrived — building on the real "
+                           f"level geometry")
+        self._built_static_revision = revision
+        return True
 
     def _own_vehicle_wheel_speed(self, t: float) -> float:
         """⚠ RAMPED, NOT STEPPED. A step from 0 to 6 rad/s is an impulse through the contact law;
@@ -1453,6 +1957,8 @@ class Sidecar:
             return 1
 
         self.build_own_vehicle()
+        if self.args.own_vehicle_wire:
+            self.attach_vehicle_wire()
 
         frame_dt = 1.0 / float(self.args.fps)
         steps = int(self.args.own_vehicle_seconds * self.args.fps)
@@ -1463,13 +1969,75 @@ class Sidecar:
         try:
             for i in range(steps):
                 t = i * frame_dt
-                self.vehicle.drive(self.control, self._own_vehicle_wheel_speed(t))
+                # ⚠ THE WIRE WINS WHEN IT IS PRESENT. The built-in ramp is a standalone convenience
+                # for step 1; once a simulator is commanding joints, a local ramp writing the same
+                # targets would fight it and the vehicle would obey whichever ran last.
+                if self.command_seg is not None:
+                    self.consume_vehicle_command()
+                else:
+                    self.vehicle.drive(self.control, self._own_vehicle_wheel_speed(t))
                 self.state_0.clear_forces()
                 self.pipeline.collide(self.state_0, self.contacts)
                 self.solver.step(self.state_0, self.state_0, self.control, self.contacts, frame_dt)
                 self.sidecar_step += 1
                 self.sidecar_time += frame_dt
 
+                self.publish_vehicle_poses()
+                # ⚠ NO SAND UNTIL THE LEVEL QUESTION IS SETTLED, and this ordering is the whole
+                # point. The rebuild onto the real level blocks this process for ~11 s while Warp
+                # compiles the mesh-contact kernels a flat plane never needed. Publishing particles
+                # before that means the renderer sees the stream START, then stop for longer than
+                # its 5 s liveness timeout — so it concludes the sidecar has died and clears the
+                # bed, exactly as it should. Measured: sand drawn at 01:37:34, cleared at 01:37:41,
+                # redrawn at 01:37:56. Nothing was wrong except that we let it begin too early.
+                #
+                # POSES still go out from the first solve, because the simulator cannot anchor the
+                # level to this robot until it knows where the robot is — that is what triggers the
+                # mirror we are waiting for.
+                if self._static_settled:
+                    self.publish_particles()
+                # ⚠ CHECKED EVERY SOLVE, unlike the level mirror. A reset is an operator pressing a
+                # key and expecting something to happen; making them wait up to a second for a poll
+                # would read as "BackSpace sometimes does nothing", which is exactly the complaint
+                # this is fixing. It is one integer compare.
+                if self.requested_reset_epoch != self._applied_reset_epoch:
+                    try:
+                        if self.rebuild_for_reset():
+                            continue
+                    except Exception as error:
+                        self._applied_reset_epoch = self.requested_reset_epoch
+                        self._static_settled = True
+                        print(f"⚠ reset FAILED ({error}); continuing on the model already built. "
+                              f"The sand and the vehicle are NOT back at their initial state.",
+                              file=sys.stderr)
+                # ⚠ CHECKED ABOUT FOUR TIMES A SECOND while unsettled, once a second after: it is a
+                # shared-memory peek, but the sooner the rebuild starts the shorter the wait.
+                probe_every = max(1, int(self.args.fps) // (4 if not self._static_settled else 1))
+                if (self.args.own_vehicle_mirror_world and self.command_seg is not None
+                        and self.sidecar_step % probe_every == 0):
+                    # ⚠ GUARDED AT THE CALL SITE TOO. build_own_vehicle can fail for reasons that
+                    # have nothing to do with the mirror (GPU memory, a solver refusing a model),
+                    # and a rebuild that throws must leave the run degraded rather than dead.
+                    try:
+                        if self.rebuild_for_static_world():
+                            self._static_settled = True
+                            continue
+                        # ⚠ BOUNDED. If no simulator ever publishes a level — a standalone run, a
+                        # sim without the NewtonSidecar backend — waiting forever would mean sand
+                        # that never appears. Give up after the grace period and say which it is.
+                        if (not self._static_settled and
+                                self.sidecar_time > float(self.args.own_vehicle_mirror_wait)):
+                            self._static_settled = True
+                            print(f"no level mirror after "
+                                  f"{self.args.own_vehicle_mirror_wait:.0f} s of simulated time — "
+                                  f"publishing sand against the flat fallback ground at "
+                                  f"z={self.ground_z:.3f}. The robot will not collide with the "
+                                  f"level.", flush=True)
+                    except Exception as error:
+                        self._built_static_revision = self._static_world_revision()
+                        print(f"⚠ rebuilding on the level mirror FAILED ({error}); continuing on "
+                              f"the model already built. The robot's collision is whatever it was "
+                              f"before this attempt.", file=sys.stderr)
                 if i % every == 0:
                     rows.append(self._own_vehicle_sample(t, frame_dt))
                 if self.viewer is not None and i % max(1, self.args.render_every) == 0:
@@ -1579,6 +2147,9 @@ class Sidecar:
 
     def close(self) -> None:
         for segment in (self.registry_seg, self.state_seg, self.status_seg, self.particle_seg):
+            if segment is not None:
+                segment.close()
+        for segment in (self.command_seg, self.pose_seg, self._static_seg):
             if segment is not None:
                 segment.close()
         if self.vehicle is not None:
@@ -1762,6 +2333,31 @@ def main() -> int:
     own.add_argument("--own-vehicle-metric-particles", type=int, default=60000,
                      help="particles sampled for the metrics; ratios and percentiles are "
                           "stride-invariant, so this costs no fidelity")
+    # ---- D15 step 2: the vehicle wire ----
+    own.add_argument("--own-vehicle-mirror-world", dest="own_vehicle_mirror_world",
+                     action="store_true", default=True,
+                     help="build the LEVEL's own collision geometry, published by the simulator, "
+                          "instead of a flat ground plane at --ground-z. On by default: a typed-in "
+                          "ground height cannot describe a level whose ground is not flat, and "
+                          "cannot describe obstacles at all. Falls back to the flat plane, loudly, "
+                          "when the simulator has published nothing.")
+    own.add_argument("--no-own-vehicle-mirror-world", dest="own_vehicle_mirror_world",
+                     action="store_false",
+                     help="ignore the level and use the flat --ground-z plane. For standalone "
+                          "probe runs, where there is no simulator and the bed is the experiment.")
+    own.add_argument("--own-vehicle-mirror-wait", type=float, default=8.0, metavar="SECONDS",
+                     help="how long (in SIMULATED seconds) to withhold the sand while waiting for "
+                          "the simulator to publish the level. Past this the sand is published "
+                          "against the flat --ground-z fallback and the run says so.")
+    own.add_argument("--own-vehicle-wire", action="store_true",
+                     help="attach the D15 vehicle segments: read joint targets from Unreal and "
+                          "publish link poses back. Without this the vehicle is driven by the "
+                          "built-in ramp and nothing is published (step 1 behaviour).")
+    own.add_argument("--own-vehicle-publish-hz", type=float, default=30.0, metavar="HZ",
+                     help="pose publication rate in SIMULATED time, decoupled from both the solve "
+                          "rate and the renderer's. 30 Hz against a 60 fps consumer means one "
+                          "interpolated frame between every published pair; the consumer needs the "
+                          "twist carried in WireLinkPose to do that without corner-cutting.")
     own.add_argument("--own-vehicle-csv", default=None, metavar="PATH",
                      help="where the per-sample metrics go. Defaults to "
                           "<repo>/PhysicsEngineDiscussion/newton_probes/results/"

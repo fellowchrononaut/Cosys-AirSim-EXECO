@@ -21,6 +21,10 @@ import mmap
 import os
 import time
 
+# ⚠ 5 since 2026-08-26: added MpmVehicleCommandBlock and MpmVehiclePoseBlock — plan D15, the
+# VEHICLE moving into the sidecar. Unreal sends joint targets, the sidecar sends back link poses.
+# Existing block LAYOUTS are untouched by this bump, so v3/v4 recordings still parse.
+#
 # ⚠ 4 since 2026-08-26: added MpmImpulseBlock — the sand's reaction back onto the colliders. The
 # registry and state LAYOUTS are unchanged by this bump, which is what makes recordings written at
 # version 3 still readable; see `validate(..., accept_older=True)`.
@@ -28,13 +32,16 @@ import time
 # ⚠ 2 since 2026-08-25: the registry gained the terrain REGION. Before that the simulator declared
 # a region in settings and this sidecar spawned sand wherever its CLI defaults said, with nothing
 # carrying one to the other.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 REGISTRY_MAGIC = 0x4D504D52  # 'MPMR'
 STATE_MAGIC = 0x4D504D53     # 'MPMS'
 STATUS_MAGIC = 0x4D504D48    # 'MPMH'
 IMPULSE_MAGIC = 0x4D504D49   # 'MPMI'
 PARTICLE_MAGIC = 0x4D504D50  # 'MPMP'
+VEHICLE_COMMAND_MAGIC = 0x4D504D43  # 'MPMC' — Unreal -> sidecar joint targets
+VEHICLE_POSE_MAGIC = 0x4D504D56     # 'MPMV' — sidecar -> Unreal link poses
+STATIC_WORLD_MAGIC = 0x4D504D57     # 'MPMW' — Unreal -> sidecar level collision geometry
 
 MAX_COLLIDERS = 256
 MAX_SHAPES_PER_COLLIDER = 16
@@ -43,11 +50,41 @@ MAX_TERRAIN_ID_CHARS = 64
 MAX_RENDER_PARTICLES = 100000
 MAX_SHAPE_VERTICES = 64
 
+# ⚠ D15 LIMITS. Deliberately small: a sidecar-owned vehicle is one Newton model per process and the
+# solve cost, not the wire, is what bounds how many can exist. Four vehicles at 64 links is ~30 KB
+# of pose and ~20 KB of command, which is noise next to the 1.2 MB particle block.
+MAX_VEHICLES = 4
+MAX_LINKS_PER_VEHICLE = 64
+MAX_JOINTS_PER_VEHICLE = 64
+MAX_VEHICLE_NAME_CHARS = 64
+MAX_LINK_NAME_CHARS = 64
+
+# ⚠ THE LEVEL'S OWN COLLISION GEOMETRY, sized for a real map rather than for Blocks. Blocks is 172
+# bodies / 39 696 triangles; the caps below are ~25x that and cost ~24 MB of tmpfs, which is RAM but
+# cheap RAM next to the 1.2 MB particle block being written every solve. Vertices are float32 here,
+# unlike everything else on this wire: a level triangle is a picture of a surface, not a pose, and
+# doubling its precision would double a 24 MB transfer to buy nothing a millimetre-scale sand grid
+# can use.
+MAX_STATIC_BODIES = 512
+MAX_STATIC_SHAPES = 2048
+MAX_STATIC_VERTICES = 1000000
+MAX_STATIC_INDICES = 3000000
+MAX_STATIC_NAME_CHARS = 64
+
+# WireStaticShapeKind — mirrors urdf::StaticShapeKind, values frozen by PROTOCOL_VERSION.
+STATIC_SHAPE_HULL = 0
+STATIC_SHAPE_MESH = 1
+STATIC_SHAPE_SPHERE = 2
+STATIC_SHAPE_CAPSULE = 3
+
 REGISTRY_SEGMENT = "execosim_mpm_registry"
 STATE_SEGMENT = "execosim_mpm_state"
 STATUS_SEGMENT = "execosim_mpm_status"
 IMPULSE_SEGMENT = "execosim_mpm_impulse"
 PARTICLE_SEGMENT = "execosim_mpm_particles"
+VEHICLE_COMMAND_SEGMENT = "execosim_mpm_vehicle_command"
+VEHICLE_POSE_SEGMENT = "execosim_mpm_vehicle_pose"
+STATIC_WORLD_SEGMENT = "execosim_mpm_static_world"
 
 # WireShapeKind — numeric values frozen by PROTOCOL_VERSION.
 SHAPE_SPHERE = 0
@@ -56,6 +93,15 @@ SHAPE_CYLINDER = 2
 SHAPE_BOX = 3
 SHAPE_CONVEX_HULL = 4
 SHAPE_PLANE = 5
+
+# WireJointTargetMode — numeric values frozen by PROTOCOL_VERSION.
+# ⚠ NONE IS NOT "ZERO". A joint with mode NONE is left alone by the sidecar, which is what a
+# passive rocker-bogie needs; a joint commanded to velocity 0 is actively held at zero, which is a
+# brake. Conflating the two locks the suspension of any vehicle whose settings omit a joint.
+JOINT_TARGET_NONE = 0
+JOINT_TARGET_POSITION = 1
+JOINT_TARGET_VELOCITY = 2
+JOINT_TARGET_TORQUE = 3
 
 # WireCouplingRole
 ROLE_STATIC = 0
@@ -266,6 +312,230 @@ class MpmParticleBlock(ctypes.Structure):
     ]
 
 
+# ---------------------------------------------------------------------------------------------
+# D15: the VEHICLE lives in the sidecar. Unreal sends joint targets; the sidecar sends link poses.
+# ---------------------------------------------------------------------------------------------
+
+
+class WireJointCommand(ctypes.Structure):
+    """One actuated joint's target for one tick."""
+
+    _fields_ = [
+        ("joint_name", ctypes.c_char * MAX_LINK_NAME_CHARS),
+        ("target_mode", ctypes.c_uint32),   # WireJointTargetMode
+        ("_pad", ctypes.c_uint32),
+        ("target", ctypes.c_double),
+    ]
+
+    def name(self) -> str:
+        return self.joint_name.decode("utf-8", "replace")
+
+
+class WireVehicleCommand(ctypes.Structure):
+    _fields_ = [
+        ("vehicle_name", ctypes.c_char * MAX_VEHICLE_NAME_CHARS),
+        ("joint_count", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("joints", WireJointCommand * MAX_JOINTS_PER_VEHICLE),
+    ]
+
+    def name(self) -> str:
+        return self.vehicle_name.decode("utf-8", "replace")
+
+
+class MpmVehicleCommandBlock(ctypes.Structure):
+    """Unreal -> sidecar. Latest-wins.
+
+    ⚠ LATEST-WINS, AND THAT IS THE RATE-DECOUPLING DECISION MADE CONCRETE. The sidecar consumes
+    whatever command is current when it starts a solve and never waits for a newer one. A dropped
+    command is a target that was superseded before it could be applied, which is exactly what
+    should happen to it — the alternative is the simulator blocking on the sand solver, which is
+    what plan D15 calls "who owns time" and what PX4 lockstep forbids outright.
+    """
+
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("sequence", ctypes.c_uint32),
+        ("vehicle_count", ctypes.c_uint32),
+        ("stamp", WireWorldStamp),
+        ("step", ctypes.c_uint64),
+        ("simulation_time", ctypes.c_double),
+        # ⚠ THE ONLY THING THAT CAN ACTUALLY RESET A SIDECAR-OWNED VEHICLE. The simulator resetting
+        # its own world does nothing to a robot solved in another process: its Newton model keeps
+        # the vehicle where it drove to and the sand keeps every rut. Bumping this is what tells
+        # the sidecar to rebuild — fresh bed, vehicle back at its spawn.
+        ("reset_epoch", ctypes.c_uint64),
+        ("vehicles", WireVehicleCommand * MAX_VEHICLES),
+    ]
+
+
+class WireLinkPose(ctypes.Structure):
+    """⚠ VELOCITIES ARE CARRIED ON PURPOSE, and they are what make rate decoupling work.
+
+    The sidecar publishes at 20-30 Hz and Unreal renders at 60. Interpolating position alone
+    between two 33 ms-apart samples gives visible corner-cutting on a turning wheel; position plus
+    twist gives a Hermite the consumer can evaluate at any instant, and extrapolation for the
+    frames past the newest sample. This is also why the pose path can afford to lag at all: a
+    one-step-old POSE is a small position error, whereas a one-step-old FORCE applied to a light
+    wheel is the instability this workstream spent 2026-08-26 chasing.
+    """
+
+    _fields_ = [
+        ("link_name", ctypes.c_char * MAX_LINK_NAME_CHARS),
+        ("position", WireVec3),
+        ("orientation", WireQuat),
+        ("linear_velocity", WireVec3),
+        ("angular_velocity", WireVec3),
+    ]
+
+    def name(self) -> str:
+        return self.link_name.decode("utf-8", "replace")
+
+
+class WireJointState(ctypes.Structure):
+    """⚠ `effort` IS NOT REPORTED YET, and `effort_reported` on the enclosing WireVehiclePose says
+    so rather than leaving a consumer to trust a zero. Position and velocity come straight out of
+    Newton's `joint_q` / `joint_qd` and are exact; applied joint torque needs the solver's own
+    force array, which the coupled proxy does not expose per-joint today. A silent 0.0 here would
+    be indistinguishable from a motor doing nothing, which is exactly the shape of bug that cost
+    this workstream a day (a published velocity that was the wrong half of a twist and read as a
+    stationary vehicle)."""
+
+    _fields_ = [
+        ("joint_name", ctypes.c_char * MAX_LINK_NAME_CHARS),
+        ("position", ctypes.c_double),
+        ("velocity", ctypes.c_double),
+        ("effort", ctypes.c_double),
+    ]
+
+    def name(self) -> str:
+        return self.joint_name.decode("utf-8", "replace")
+
+
+class WireVehiclePose(ctypes.Structure):
+    _fields_ = [
+        ("vehicle_name", ctypes.c_char * MAX_VEHICLE_NAME_CHARS),
+        ("link_count", ctypes.c_uint32),
+        ("joint_count", ctypes.c_uint32),
+        ("effort_reported", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("links", WireLinkPose * MAX_LINKS_PER_VEHICLE),
+        ("joints", WireJointState * MAX_JOINTS_PER_VEHICLE),
+    ]
+
+    def name(self) -> str:
+        return self.vehicle_name.decode("utf-8", "replace")
+
+
+class MpmVehiclePoseBlock(ctypes.Structure):
+    """Sidecar -> Unreal. Latest-wins, never blocking.
+
+    ⚠ `sidecar_time` IS THE TIMESTAMP THE INTERPOLATION IS ANCHORED TO, and it is the sidecar's
+    SIMULATED time, not wall time. A consumer that interpolated against its own clock would drift
+    whenever the solve ran slower than real time — which it does, routinely, at 1.37 M particles.
+
+    ⚠ `publish_interval_seconds` is the sidecar's NOMINAL cadence, published so the consumer can
+    size its interpolation window without measuring it. It is advisory: the honest instantaneous
+    interval is the difference of two consecutive `sidecar_time` values, and a consumer that needs
+    to notice a stall must use that rather than trust this.
+    """
+
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("sequence", ctypes.c_uint32),
+        ("vehicle_count", ctypes.c_uint32),
+        ("stamp", WireWorldStamp),
+        ("sidecar_step", ctypes.c_uint64),
+        ("sidecar_time", ctypes.c_double),
+        ("publish_interval_seconds", ctypes.c_double),
+        ("acknowledged_command_step", ctypes.c_uint64),
+        ("vehicles", WireVehiclePose * MAX_VEHICLES),
+    ]
+
+
+class WireStaticShape(ctypes.Structure):
+    """One collision primitive, in the frame of the body that owns it.
+
+    ⚠ VERTICES AND INDICES LIVE IN SHARED POOLS, not in this struct. A per-shape array would have
+    to be sized for the worst shape and multiplied by MAX_STATIC_SHAPES, which for a level mesh is
+    absurd; the start/count pairs index the flat `vertices` and `indices` arrays on the block.
+    """
+
+    _fields_ = [
+        ("kind", ctypes.c_uint32),
+        ("vertex_start", ctypes.c_uint32),
+        ("vertex_count", ctypes.c_uint32),
+        ("index_start", ctypes.c_uint32),
+        ("index_count", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("center_a", WireVec3),
+        ("center_b", WireVec3),
+        ("radius", ctypes.c_double),
+    ]
+
+
+class WireStaticBody(ctypes.Structure):
+    """⚠ BODY-LOCAL SHAPES PLUS A WORLD TRANSFORM, matching urdf::StaticBody rather than flattening
+    to world space. That is what lets one cooked mesh be reused by every instance of the same asset
+    placed in a level — the difference between cooking a map once and once per placed rock."""
+
+    _fields_ = [
+        ("name", ctypes.c_char * MAX_STATIC_NAME_CHARS),
+        ("position", WireVec3),
+        ("orientation", WireQuat),
+        ("shape_start", ctypes.c_uint32),
+        ("shape_count", ctypes.c_uint32),
+        ("friction", ctypes.c_double),
+        ("restitution", ctypes.c_double),
+    ]
+
+    def label(self) -> str:
+        return self.name.decode("utf-8", "replace")
+
+
+class MpmStaticWorldBlock(ctypes.Structure):
+    """Unreal -> sidecar. The level's collision geometry, published ONCE per revision.
+
+    ⚠ WHY THIS EXISTS. Without it the sidecar's robot stands on a flat plane at a height somebody
+    typed in, and collides with nothing else in the level at all. Getting that height right by hand
+    failed twice on one afternoon — the two ends disagree about z by the AirSim NED origin's offset
+    from the Unreal world origin (0.640 m on Blocks), so a plausible number can be wrong by exactly
+    that and look like a physics bug. A level whose ground is not flat cannot be expressed as a
+    number at all, and a level with obstacles never could.
+
+    ⚠ PUBLISHED ON A REVISION, NOT PER TICK. It is 24 MB and it is static by construction; the
+    sidecar rebuilds its collision only when `revision` changes.
+
+    ⚠ `frame_offset` TRAVELS WITH THE GEOMETRY. The vertices are in the SOLVER frame (origin: the
+    Unreal world origin), and the sidecar works in its own frame, offset from it. Sending the vector
+    alongside the data means the sidecar subtracts it itself rather than the two ends separately
+    agreeing on a convention that has already been got wrong once today.
+    """
+
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("sequence", ctypes.c_uint32),
+        ("revision", ctypes.c_uint32),
+        ("body_count", ctypes.c_uint32),
+        ("shape_count", ctypes.c_uint32),
+        ("vertex_count", ctypes.c_uint32),
+        ("index_count", ctypes.c_uint32),
+        # ⚠ Non-zero means the level did NOT fit and what follows is a PARTIAL world. A robot that
+        # falls through a floor which was silently dropped is the worst outcome here, so both ends
+        # report this rather than letting it look like geometry that was never there.
+        ("truncated", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),
+        ("frame_offset", WireVec3),
+        ("bodies", WireStaticBody * MAX_STATIC_BODIES),
+        ("shapes", WireStaticShape * MAX_STATIC_SHAPES),
+        ("vertices", ctypes.c_float * (MAX_STATIC_VERTICES * 3)),
+        ("indices", ctypes.c_int32 * MAX_STATIC_INDICES),
+    ]
+
+
 class SegmentError(RuntimeError):
     pass
 
@@ -389,7 +659,17 @@ def validate(block, expected_magic: int, what: str, accept_older: bool = False) 
 
 
 if __name__ == "__main__":
-    for name, kind in (("MpmParticleBlock", MpmParticleBlock),
+    for name, kind in (("WireStaticShape", WireStaticShape),
+                       ("WireStaticBody", WireStaticBody),
+                       ("MpmStaticWorldBlock", MpmStaticWorldBlock),
+                       ("WireJointCommand", WireJointCommand),
+                       ("WireVehicleCommand", WireVehicleCommand),
+                       ("MpmVehicleCommandBlock", MpmVehicleCommandBlock),
+                       ("WireLinkPose", WireLinkPose),
+                       ("WireJointState", WireJointState),
+                       ("WireVehiclePose", WireVehiclePose),
+                       ("MpmVehiclePoseBlock", MpmVehiclePoseBlock),
+                       ("MpmParticleBlock", MpmParticleBlock),
                        ("WireColliderImpulse", WireColliderImpulse),
                        ("MpmImpulseBlock", MpmImpulseBlock),
                        ("WireTerrainRegion", WireTerrainRegion),

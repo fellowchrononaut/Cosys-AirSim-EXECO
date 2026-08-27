@@ -80,6 +80,10 @@ public:
 
     /// This robot's links as MPM colliders, qualified by vehicle name.
     bool describeColliders(urdf::PhysicsColliderSet& out) const override;
+    /// See VehicleSimApiBase::sandRenderOffset. Only a NewtonSidecar-backed vehicle has one, and
+    /// without it the sidecar's sand is drawn in the sidecar's own coordinates while the robot is
+    /// drawn where the settings asked - two internally consistent pictures 100+ m apart.
+    bool sandRenderOffset(urdf::Vec3& out) const override;
     bool applyLinkWrench(size_t link_index, const urdf::Wrench& wrench) override;
     bool setLinkWorldCollision(size_t link_index, bool enabled) override;
 

@@ -142,6 +142,15 @@ class VehicleSpec:
         return spec
 
 
+def _rotate(quat_xyzw, v):
+    """Rotate `v` by an xyzw quaternion. Numpy-only so this stays usable without warp on the host."""
+    import numpy as np
+
+    x, y, z, w = quat_xyzw
+    u = np.array([x, y, z], dtype=float)
+    return (v * (w * w - u.dot(u)) + 2.0 * u * u.dot(v) + 2.0 * w * np.cross(u, v))
+
+
 def _resolve(p: str) -> str:
     """Spec paths are relative to the SIMVAL repo root unless they are already absolute."""
     return p if os.path.isabs(p) else os.path.normpath(os.path.join(REPO, p))
@@ -176,6 +185,11 @@ class OwnVehicle:
         self.bodies: list = []
         self.mass = 0.0
         self._urdf_tmp = None
+        self.dof_by_joint_label: dict = {}
+        self.unknown_joints: list = []
+        self._labels: dict = {}
+        self._body_com: dict = {}
+        self._wire_joint_dofs: list = []
 
     # ---- build --------------------------------------------------------------------------
 
@@ -247,6 +261,34 @@ class OwnVehicle:
         if relaxed:
             print(f"  relaxed zero effort/velocity limits on {len(relaxed)} passive dof(s)")
 
+        # ⚠ EVERY joint by label, not just the driven ones. D15 step 2 lets Unreal command any
+        # joint by name over the wire, and a map built only from the spec's `drive` list would
+        # silently ignore a steering or arm joint the settings asked for. `joint_qd_start` is the
+        # joint-index -> DOF-index map; see _find_drive_dofs for why that distinction matters.
+        self.dof_by_joint_label = {}
+        for i, label in enumerate(builder.joint_label):
+            self.dof_by_joint_label[label] = int(builder.joint_qd_start[i])
+            # Also index by the bare joint name, so a wire command may use either the URDF name or
+            # Newton's fully-qualified "robot/joint" label.
+            bare = label.rsplit("/", 1)[-1]
+            self.dof_by_joint_label.setdefault(bare, int(builder.joint_qd_start[i]))
+
+        # ⚠ THE JOINTS WORTH PUBLISHING, in a stable order. Newton's floating base is a joint too,
+        # and publishing its six DOFs as "joint states" would put a base translation into a
+        # consumer's joint-state stream where a controller expects a wheel angle.
+        # ⚠ TWO DIFFERENT INDICES, AND USING ONE FOR BOTH SHIFTS EVERY POSITION BY A JOINT.
+        # `joint_q` is addressed by `joint_q_start` and `joint_qd` by `joint_qd_start`, and they
+        # are NOT the same map: a floating base contributes SEVEN coordinates (3 translation +
+        # 4 quaternion) but only SIX degrees of freedom. Indexing joint_q with the DOF start made
+        # the first wheel report q=+1.000 — the base quaternion's w — and handed every subsequent
+        # wheel its neighbour's angle. The velocities were correct throughout, which is exactly why
+        # it nearly passed: three of the four numbers looked right.
+        self._wire_joint_dofs = [
+            (label.rsplit("/", 1)[-1], int(builder.joint_q_start[i]),
+             int(builder.joint_qd_start[i]))
+            for i, label in enumerate(builder.joint_label)
+            if int(builder.joint_qd_start[i]) >= 6 or builder.joint_dof_count <= 6]
+
         self.drive_dofs = self._find_drive_dofs(builder)
         for dof in self.drive_dofs:
             builder.joint_target_mode[dof] = newton.JointTargetMode.VELOCITY
@@ -291,6 +333,9 @@ class OwnVehicle:
                              if self.spec.wheel_marker in model.body_label[b]]
         if not self.wheel_bodies:
             raise SystemExit(f"no finalised body label contains '{self.spec.wheel_marker}'")
+        self._labels = {b: model.body_label[b] for b in self.bodies}
+        com = model.body_com.numpy()
+        self._body_com = {b: np.array(com[b], dtype=float) for b in self.bodies}
         self.mass = float(np.sum(model.body_mass.numpy()[self.body_start:self.body_end]))
         print(f"  total vehicle mass {self.mass:.3f} kg (weight {self.mass * 9.81:.1f} N), "
               f"{len(self.wheel_bodies)} wheel bodies")
@@ -303,6 +348,115 @@ class OwnVehicle:
         for dof, sign in zip(self.drive_dofs, self.spec.drive_sign):
             tv[dof] = rad_s * sign
         control.joint_target_qd.assign(tv)
+
+    def apply_wire_commands(self, control, commands) -> int:
+        """Apply (joint_name, mode, target) triples from the wire. Returns how many were applied.
+
+        ⚠ MODE `NONE` MEANS LEAVE IT ALONE, not "hold at zero". A passive rocker-bogie joint must
+        stay free to swing; writing a zero velocity target to it is a brake, and a braked rocker
+        takes wheels off the ground on uneven terrain. Unreal omits such joints from its command
+        list entirely, and this must not invent targets for them.
+
+        ⚠ UNKNOWN NAMES ARE COUNTED AND REPORTED BY THE CALLER, never silently dropped. A typo in a
+        settings file would otherwise produce a vehicle that simply does not drive, with both ends
+        reporting healthy.
+        """
+        import protocol as P
+
+        tv = control.joint_target_qd.numpy()
+        applied = 0
+        self.unknown_joints = []
+        for name, mode, target in commands:
+            if mode == P.JOINT_TARGET_NONE:
+                continue
+            dof = self.dof_by_joint_label.get(name)
+            if dof is None:
+                self.unknown_joints.append(name)
+                continue
+            if mode == P.JOINT_TARGET_VELOCITY:
+                tv[dof] = float(target)
+                applied += 1
+            else:
+                # ⚠ NAMED, NOT IGNORED. Position and torque targets need joint_target_mode set at
+                # BUILD time (the mode is a model property, not a per-tick one), so accepting them
+                # here would apply a velocity target while the caller believed it sent a position.
+                self.unsupported_modes = getattr(self, "unsupported_modes", set())
+                self.unsupported_modes.add((name, int(mode)))
+        control.joint_target_qd.assign(tv)
+        return applied
+
+    def link_poses(self, state):
+        """(label, position, orientation_xyzw, linear_velocity, angular_velocity) per body.
+
+        ⚠ NEWTON'S body_qd IS (LINEAR, ANGULAR) — I ASSERTED THE OPPOSITE HERE AND WAS WRONG.
+        An earlier version of this function read `qd[0:3]` as angular and `qd[3:6]` as linear, with
+        a confident comment saying so, which made the bug look deliberate and survived review by
+        being self-consistent. `newton/_src/sim/state.py` is explicit: "First three entries: linear
+        velocity [m/s] relative to the body's center of mass in world frame; last three: angular
+        velocity [rad/s] in world frame."
+
+        Caught by vehicle_wire_check.py: with the halves swapped, the wire reported vx = -0.0004
+        m/s for a base link that finite differences of its OWN published positions put at 1.48 m/s,
+        and Hermite interpolation using those tangents was WORSE than plain linear (p95 34.4 mm
+        against 0.6 mm). A velocity nobody checks is a velocity nobody notices is zero.
+
+        ⚠ AND THE LINEAR ENTRY IS THE COM'S, NOT THE ORIGIN'S, while `body_q` is the origin's
+        transform. For a wheel whose COM sits on its axis the two coincide, which is exactly why
+        this would have passed a wheels-only test and then produced a chassis that translates when
+        it rotates. `v_origin = v_com + omega x (origin - com_world)` is the correction, and it
+        needs the model's body_com, so it is applied here rather than left to the consumer.
+        """
+        import numpy as np
+
+        q = state.body_q.numpy()
+        qd = state.body_qd.numpy()
+        out = []
+        for b in self.bodies:
+            xf = q[b]
+            pos = np.array(xf[0:3], dtype=float)
+            quat = np.array(xf[3:7], dtype=float)      # xyzw
+            v_com = np.array(qd[b][0:3], dtype=float)
+            w = np.array(qd[b][3:6], dtype=float)
+
+            com_local = self._body_com.get(b)
+            if com_local is not None:
+                com_world = pos + _rotate(quat, com_local)
+                v_origin = v_com + np.cross(w, pos - com_world)
+            else:
+                v_origin = v_com
+
+            out.append((self.label_of(b),
+                        (float(pos[0]), float(pos[1]), float(pos[2])),
+                        (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])),
+                        (float(v_origin[0]), float(v_origin[1]), float(v_origin[2])),
+                        (float(w[0]), float(w[1]), float(w[2]))))
+        return out
+
+    def joint_states(self, state):
+        """(label, position, velocity) per actuated DOF.
+
+        ⚠ EFFORT IS NOT INCLUDED, and the wire says so through `effort_reported` rather than
+        shipping a zero. Position and velocity are exact — they are `joint_q` and `joint_qd`. The
+        applied joint torque would have to come from the solver's own per-joint force array, which
+        `SolverCoupledProxy` does not expose; publishing 0.0 for it would be indistinguishable from
+        a motor doing nothing.
+
+        ⚠ POSITION AND VELOCITY USE DIFFERENT INDEX MAPS. `joint_q_start` addresses `joint_q`;
+        `joint_qd_start` addresses `joint_qd`. A floating base contributes seven COORDINATES but
+        six DEGREES OF FREEDOM, so the two diverge by one from the first real joint onward. See the
+        note where _wire_joint_dofs is built for what using one for both actually looked like.
+        """
+        q = state.joint_q.numpy()
+        qd = state.joint_qd.numpy()
+        out = []
+        for label, q_index, qd_index in self._wire_joint_dofs:
+            pos = float(q[q_index]) if q_index < len(q) else 0.0
+            vel = float(qd[qd_index]) if qd_index < len(qd) else 0.0
+            out.append((label, pos, vel))
+        return out
+
+    def label_of(self, body: int) -> str:
+        return self._labels[body] if self._labels else str(body)
 
     # ---- sand culling -------------------------------------------------------------------
 

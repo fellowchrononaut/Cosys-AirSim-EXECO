@@ -1035,6 +1035,20 @@ void ASimModeWorldBase::updateMpmParticleRender()
     }
 
     const float world_to_meters = getGlobalNedTransform().fromNed(1.0f);
+    // ⚠ THE SAND MUST MOVE WITH THE ROBOT THAT OWNS IT. A sidecar running --own-vehicle builds the
+    // vehicle AND the bed in its own coordinates; the NewtonSidecar backend anchors the VEHICLE by
+    // shifting every pose so the root lands where the settings asked. Drawing the particles
+    // unshifted puts the bed at the sidecar's raw coordinates instead - measured on this level, the
+    // robot rendered at NED (-122.7, +24.6) against a PlayerStart at the origin, so the two
+    // pictures would sit 125 m apart and each look perfectly correct on its own.
+    //
+    // Returns false for every vehicle without a sidecar-owned solver, which is the normal case: the
+    // ordinary MPM link's sand is already published in the simulator's own frame.
+    urdf::Vec3 sand_offset;
+    for (auto& api : getApiProvider()->getVehicleSimApis()) {
+        if (api->sandRenderOffset(sand_offset))
+            break;
+    }
 
     const int32 cap = FMath::Max(1, CVarMpmRenderMax.GetValueOnGameThread());
     const int32 draw = FMath::Min(static_cast<int32>(frame.count), cap);
@@ -1061,8 +1075,9 @@ void ASimModeWorldBase::updateMpmParticleRender()
     TArray<FTransform> transforms;
     transforms.Reserve(draw);
     for (int32 i = 0; i < draw; ++i) {
-        const urdf::Vec3 solver{ frame.positions[i * 3], frame.positions[i * 3 + 1],
-                                 frame.positions[i * 3 + 2] };
+        const urdf::Vec3 solver{ frame.positions[i * 3] + sand_offset.x,
+                                 frame.positions[i * 3 + 1] + sand_offset.y,
+                                 frame.positions[i * 3 + 2] + sand_offset.z };
         transforms.Emplace(FQuat::Identity,
                            UrdfTransform::toFVector(solver, world_to_meters),
                            FVector(scale));

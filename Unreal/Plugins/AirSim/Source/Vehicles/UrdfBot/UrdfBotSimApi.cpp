@@ -23,6 +23,11 @@
 #if WITH_MUJOCO_BINDING
 #include "urdf/backends/mujoco/MuJoCoUrdfBackend.hpp"
 #endif
+// ⚠ NOT GUARDED BY A WITH_*_BINDING. The Newton sidecar backend links against nothing: it is POSIX
+// mmap and the URDF descriptor headers, and Newton itself is a separate PROCESS. It is built by the
+// always-on src/mpm/*.cpp glob, exactly like the rest of the MPM link, so it is available in every
+// build and needs no "is it in this build" story.
+#include "mpm/NewtonSidecarUrdfBackend.hpp"
 
 #include "HAL/PlatformFileManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -483,11 +488,32 @@ void UrdfBotSimApi::loadModelAndBackend()
             "build.sh: run ./build_thirdparty.sh once, then ./build.sh.");
 #endif
     }
+    else if (engine == "newtonsidecar") {
+        // ⚠ THE VEHICLE IS SOLVED IN ANOTHER PROCESS. Nothing here integrates it; this backend
+        // writes joint targets into shared memory and interpolates the link poses that come back.
+        // See NewtonSidecarUrdfBackend.hpp for why that is worth a backend rather than a flag:
+        // harvested impulses carry only the reaction to MOTION, so a wheel resting on settled sand
+        // reports ~0 N, and support and sinkage are unreachable across the old wire.
+        msr::airlib::mpm::NewtonSidecarUrdfBackend::Options newton_opts;
+        newton_opts.vehicle_name = vehicle_setting_->newton_sidecar_vehicle.empty()
+                                       ? Utils::toLower(getVehicleName())
+                                       : vehicle_setting_->newton_sidecar_vehicle;
+        // ⚠ SAID OUT LOUD, ALWAYS. The name must equal the sidecar's --own-vehicle spec name, and
+        // a mismatch presents as a robot that never moves while both ends report healthy — the
+        // exact failure this workstream already shipped once with an empty collider registry.
+        UE_LOG(LogUrdfBot, Log,
+               TEXT("'%s' runs on the Newton SIDECAR; it will look for vehicle '%s' in %s. "
+                    "That name must match the sidecar's --own-vehicle spec."),
+               UTF8_TO_TCHAR(getVehicleName().c_str()),
+               UTF8_TO_TCHAR(newton_opts.vehicle_name.c_str()),
+               UTF8_TO_TCHAR(newton_opts.directory.c_str()));
+        backend = std::make_unique<msr::airlib::mpm::NewtonSidecarUrdfBackend>(newton_opts);
+    }
     else {
         throw std::invalid_argument(
             "Vehicle '" + getVehicleName() + "': PhysicsEngine \"" +
             vehicle_setting_->physics_engine + "\" is not a URDF physics backend. Available: " +
-            available + ".");
+            available + ", \"NewtonSidecar\".");
     }
 
     UAirBlueprintLib::LogMessageString(
@@ -738,7 +764,16 @@ void UrdfBotSimApi::loadModelAndBackend()
         // for exactly that reason. The mirror is memoised per UWorld, so every robot presents the
         // same shared_ptr and only the first one attaches it.
         if (coordinated_scene_ != nullptr) {
+            // ⚠ TEST FOR THE BACKEND YOU MEAN, NEVER FOR "not the other one". These guards were
+            // written as `!is_box3d` when Box3D and MuJoCo were the only backends, which made
+            // "not Box3D" and "is MuJoCo" the same statement. Adding NewtonSidecar silently broke
+            // that equivalence and every such guard started treating it as MuJoCo — one of them
+            // static_cast the pointer and read a std::vector<std::string> out of unrelated memory,
+            // which surfaced as "Ran out of memory allocating 4636737291354636296 bytes" inside a
+            // string concatenation. RTTI is off in Unreal builds, so nothing catches this at
+            // runtime and the name IS the discriminator.
             const bool mirror_is_box3d = (std::strcmp(backend->backendName(), "Box3D") == 0);
+            const bool mirror_is_mujoco = (std::strcmp(backend->backendName(), "MuJoCo") == 0);
 #if WITH_BOX3D_BINDING
             if (mirror_is_box3d) {
                 b3urdf::Box3DPhysicsScene& shared_scene = coordinated_scene_->box3dScene();
@@ -746,7 +781,7 @@ void UrdfBotSimApi::loadModelAndBackend()
             }
 #endif
 #if WITH_MUJOCO_BINDING
-            if (!mirror_is_box3d) {
+            if (mirror_is_mujoco) {
                 urdf::MuJoCoPhysicsScene& shared_scene = coordinated_scene_->mujocoScene();
                 if (!shared_scene.compiled()) shared_scene.setStaticWorld(static_world_);
             }
@@ -1029,6 +1064,7 @@ void UrdfBotSimApi::loadModelAndBackend()
         // off, so dynamic_cast is unavailable and a static_cast to the wrong type is undefined
         // behaviour that never announces itself.
         const bool shared_is_box3d = (std::strcmp(backend_->backendName(), "Box3D") == 0);
+        const bool shared_is_mujoco = (std::strcmp(backend_->backendName(), "MuJoCo") == 0);
 #if WITH_BOX3D_BINDING
         if (shared_is_box3d) {
             coordinated_scene_->publishBox3DBody(
@@ -1037,7 +1073,7 @@ void UrdfBotSimApi::loadModelAndBackend()
         }
 #endif
 #if WITH_MUJOCO_BINDING
-        if (!shared_is_box3d) {
+        if (shared_is_mujoco) {
             coordinated_scene_->publishMuJoCoBody(
                 ICoordinatedPhysicsScene::vehicleBodyId(getVehicleName()),
                 static_cast<urdf::MuJoCoSharedUrdfBackend*>(backend_.get())->articulation());
@@ -1064,6 +1100,9 @@ void UrdfBotSimApi::loadModelAndBackend()
     // discriminator; the same gap on VehicleApiBase is what lets a wrong-family RPC call SIGSEGV
     // the editor, so it is worth not repeating here.
     const bool is_box3d = (std::strcmp(backend_->backendName(), "Box3D") == 0);
+    // ⚠ NOT `!is_box3d`. See the note at the static-world mirror above: a third backend exists now
+    // and "not Box3D" no longer implies MuJoCo. The two blocks below static_cast on this.
+    const bool is_mujoco = (std::strcmp(backend_->backendName(), "MuJoCo") == 0);
 
     // Two things the BOX3D backend can only discover while building, both of which change what is
     // actually simulated and neither of which is visible in the render. Both are properties of
@@ -1213,7 +1252,7 @@ void UrdfBotSimApi::loadModelAndBackend()
     // which is a DIFFERENT class - static_cast-ing it to MuJoCoUrdfBackend is undefined behaviour
     // that will not announce itself, because Unreal builds with RTTI off and backendName() returns
     // "MuJoCo" for both. The shared scene reports its own cook through StaticWorldEmitStats.
-    if (!is_box3d && coordinated_scene_ == nullptr) {
+    if (is_mujoco && coordinated_scene_ == nullptr) {
         const urdf::MuJoCoUrdfBackend* mjw =
             static_cast<const urdf::MuJoCoUrdfBackend*>(backend_.get());
         const size_t emitted = mjw->staticGeomsEmitted();
@@ -1334,7 +1373,7 @@ void UrdfBotSimApi::loadModelAndBackend()
     // which is a DIFFERENT class - static_cast-ing it to MuJoCoUrdfBackend is undefined behaviour
     // that will not announce itself, because Unreal builds with RTTI off and backendName() returns
     // "MuJoCo" for both. The shared scene reports its own cook through StaticWorldEmitStats.
-    if (!is_box3d && coordinated_scene_ == nullptr) {
+    if (is_mujoco && coordinated_scene_ == nullptr) {
         const urdf::MuJoCoUrdfBackend* mj =
             static_cast<const urdf::MuJoCoUrdfBackend*>(backend_.get());
         const size_t declared = mj->collisionGeomsDeclared();
@@ -2150,6 +2189,9 @@ void UrdfBotSimApi::refreshGroundHeightField()
     urdf::BackendOptions::HeightField hf;
     if (!sampleGroundHeightField(root.position, height_field_half_extent_, hf)) return;
 
+    // ⚠ EXPLICIT, for the same reason as every other cast in this file. has_height_field_ is set
+    // from settings and says nothing about which backend is behind the pointer.
+    if (std::strcmp(backend_->backendName(), "MuJoCo") != 0) return;
     auto* mj = static_cast<urdf::MuJoCoUrdfBackend*>(backend_.get());
     if (mj->updateGroundHeightField(hf)) {
         height_field_centre_ = root.position;
@@ -2396,6 +2438,19 @@ void UrdfBotSimApi::resetImplementation()
     // Settling here as well makes "reset" mean "back to the resting initial state" rather than
     // "back to mid-air", which is what an initial condition should be.
     if (built_) settleAndPublish();
+}
+
+bool UrdfBotSimApi::sandRenderOffset(urdf::Vec3& out) const
+{
+    // ⚠ SAME LOCK AS EVERY OTHER BACKEND TOUCH, and for the same reason: resetImplementation()
+    // destroys and rebuilds the backend, and this is read from the render path on the game thread.
+    std::lock_guard<std::mutex> lock(backend_mutex_);
+    if (backend_ == nullptr) return false;
+    // ⚠ NAME THE BACKEND, never "not one of the others" - the negation form is what put a
+    // NewtonSidecar pointer through a static_cast to MuJoCoUrdfBackend and crashed the editor.
+    if (std::strcmp(backend_->backendName(), "NewtonSidecar") != 0) return false;
+    return static_cast<const msr::airlib::mpm::NewtonSidecarUrdfBackend*>(backend_.get())
+        ->frameOffset(out);
 }
 
 bool UrdfBotSimApi::applyLinkWrench(size_t link_index, const urdf::Wrench& wrench)

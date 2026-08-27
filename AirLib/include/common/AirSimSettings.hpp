@@ -782,6 +782,14 @@ namespace airlib
             /// PhysicsEngineBase and never sees this.
             std::string physics_engine;
 
+            /// ⚠ WHICH VEHICLE IN THE SIDECAR THIS ROBOT IS, for PhysicsEngine "NewtonSidecar"
+            /// (plan D15). It must equal the sidecar's `--own-vehicle` spec name — "scout",
+            /// "exomy" — because one wire block carries several vehicles and the name is how a
+            /// pose finds its robot. Empty falls back to the vehicle's own settings key lowercased,
+            /// which is right whenever the two were named the same and wrong silently otherwise,
+            /// so the backend logs which name it ended up using.
+            std::string newton_sidecar_vehicle;
+
             /// Anchor the root link to the world. URDF has no notion of a fixed base, so it is
             /// explicit here: true for an arm on a bench, false for anything that drives.
             bool urdf_fixed_base = false;
@@ -2763,6 +2771,8 @@ namespace airlib
             if (vehicle_type == kVehicleTypeUrdfBot) {
                 vehicle_setting->urdf_file = settings_json.getString("UrdfFile", "");
                 vehicle_setting->physics_engine = settings_json.getString("PhysicsEngine", "");
+                vehicle_setting->newton_sidecar_vehicle =
+                    settings_json.getString("NewtonSidecarVehicle", "");
                 vehicle_setting->urdf_fixed_base = settings_json.getBool("UrdfFixedBase", false);
                 vehicle_setting->urdf_allow_mimic_follower =
                     settings_json.getBool("UrdfAllowMimicFollower", false);

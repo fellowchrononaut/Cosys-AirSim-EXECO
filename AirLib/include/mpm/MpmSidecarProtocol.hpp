@@ -55,13 +55,16 @@ namespace mpm
 /// declared a region in settings and the sidecar spawned sand wherever its own CLI defaults said,
 /// with nothing carrying one to the other — the rover would drive through empty space while every
 /// diagnostic reported healthy. The region is not optional metadata; it is where the sand IS.
-constexpr uint32_t kProtocolVersion = 4;
+constexpr uint32_t kProtocolVersion = 5;
 
 constexpr uint32_t kRegistryMagic = 0x4D504D52u;  // 'MPMR'
 constexpr uint32_t kStateMagic = 0x4D504D53u;     // 'MPMS'
 constexpr uint32_t kStatusMagic = 0x4D504D48u;    // 'MPMH'
 constexpr uint32_t kImpulseMagic = 0x4D504D49; // 'MPMI'
 constexpr uint32_t kParticleMagic = 0x4D504D50u;  // 'MPMP'
+constexpr uint32_t kVehicleCommandMagic = 0x4D504D43u;  // 'MPMC' - Unreal -> sidecar
+constexpr uint32_t kVehiclePoseMagic = 0x4D504D56u;     // 'MPMV' - sidecar -> Unreal
+constexpr uint32_t kStaticWorldMagic = 0x4D504D57u;     // 'MPMW' - level collision geometry
 
 /// Hard ceilings, so both segments are fixed-size and can be mapped once.
 ///
@@ -74,6 +77,26 @@ constexpr uint32_t kMaxTerrainIdChars = 64;
 /// Convex hull vertices carried per shape. A wheel or foot is far below this; anything above it is
 /// a modelling choice that should be made deliberately rather than absorbed here.
 constexpr uint32_t kMaxShapeVertices = 64;
+
+/// ⚠ D15 LIMITS. Deliberately small: a sidecar-owned vehicle is one Newton model per process
+/// and the SOLVE cost, not the wire, is what bounds how many can exist. Four vehicles at 64
+/// links is ~42 KB of pose and ~20 KB of command, noise next to the 1.2 MB particle block.
+constexpr uint32_t kMaxVehicles = 4;
+constexpr uint32_t kMaxLinksPerVehicle = 64;
+constexpr uint32_t kMaxJointsPerVehicle = 64;
+constexpr uint32_t kMaxVehicleNameChars = 64;
+constexpr uint32_t kMaxLinkNameChars = 64;
+
+/// ⚠ THE LEVEL'S OWN COLLISION GEOMETRY, sized for a real map rather than for Blocks. Blocks is 172
+/// bodies / 39 696 triangles; these caps are ~25x that and cost ~24 MB of tmpfs - RAM, but cheap RAM
+/// next to the 1.2 MB particle block written every solve. Vertices are float32, unlike everything
+/// else on this wire: a level triangle is a picture of a surface, not a pose, and doubling its
+/// precision would double a 24 MB transfer to buy nothing a millimetre-scale sand grid can use.
+constexpr uint32_t kMaxStaticBodies = 512;
+constexpr uint32_t kMaxStaticShapes = 2048;
+constexpr uint32_t kMaxStaticVertices = 1000000;
+constexpr uint32_t kMaxStaticIndices = 3000000;
+constexpr uint32_t kMaxStaticNameChars = 64;
 
 /// Mirrors urdf::CollisionShape::Kind. Duplicated deliberately: this is a wire enum whose numeric
 /// values are frozen by `kProtocolVersion`, and inheriting them from a header that is free to be
@@ -334,14 +357,209 @@ struct MpmParticleBlock {
 
 /// Default segment names. A directory is a parameter, exactly as in SharedMemorySink — /dev/shm is
 /// only the default, and a container without the host's shm needs a bind-mounted path instead.
+
+/// WireJointTargetMode - numeric values frozen by kProtocolVersion.
+/// ⚠ NONE IS NOT "ZERO". A joint with mode None is left alone by the sidecar, which is what a
+/// passive rocker-bogie needs; a joint commanded to velocity 0 is actively HELD at zero, which is
+/// a brake. Conflating the two locks the suspension of any vehicle whose settings omit a joint.
+enum class WireJointTargetMode : uint32_t {
+    None = 0,
+    Position = 1,
+    Velocity = 2,
+    Torque = 3,
+};
+
+struct WireJointCommand {
+    char joint_name[kMaxLinkNameChars] = {};
+    uint32_t target_mode = 0;   ///< WireJointTargetMode
+    uint32_t _pad = 0;
+    double target = 0;
+};
+
+struct WireVehicleCommand {
+    char vehicle_name[kMaxVehicleNameChars] = {};
+    uint32_t joint_count = 0;
+    uint32_t _pad = 0;
+    WireJointCommand joints[kMaxJointsPerVehicle];
+};
+
+/// Unreal -> sidecar. Latest-wins.
+///
+/// ⚠ LATEST-WINS, AND THAT IS THE RATE-DECOUPLING DECISION MADE CONCRETE. The sidecar consumes
+/// whatever command is current when it starts a solve and never waits for a newer one. A dropped
+/// command is a target that was superseded before it could be applied, which is exactly what
+/// should happen to it - the alternative is the simulator blocking on the sand solver, which is
+/// what plan D15 calls "who owns time" and what PX4 lockstep forbids outright.
+struct MpmVehicleCommandBlock {
+    uint32_t magic = kVehicleCommandMagic;
+    uint32_t version = kProtocolVersion;
+    uint32_t sequence = 0;      ///< seqlock; ODD while the writer is inside an update
+    uint32_t vehicle_count = 0;
+    WireWorldStamp stamp;
+    uint64_t step = 0;
+    double simulation_time = 0;
+    /// ⚠ THE ONLY THING THAT CAN ACTUALLY RESET A SIDECAR-OWNED VEHICLE. The simulator resetting
+    /// its own world does nothing to a robot solved in another process: its Newton model keeps the
+    /// vehicle where it drove to and the sand keeps every rut. Bumping this is what tells the
+    /// sidecar to rebuild - fresh bed, vehicle back at its spawn.
+    uint64_t reset_epoch = 0;
+    WireVehicleCommand vehicles[kMaxVehicles];
+};
+
+/// ⚠ VELOCITIES ARE CARRIED ON PURPOSE, and they are what make rate decoupling work.
+///
+/// The sidecar publishes at 20-30 Hz and Unreal renders at 60. Interpolating position alone
+/// between two 33 ms-apart samples gives visible corner-cutting on a turning wheel; position plus
+/// twist gives a Hermite the consumer can evaluate at any instant, and extrapolation for frames
+/// past the newest sample. This is also why the pose path can afford to lag at all: a one-step-old
+/// POSE is a small position error, whereas a one-step-old FORCE applied to a light wheel is the
+/// instability this workstream spent 2026-08-26 chasing.
+struct WireLinkPose {
+    char link_name[kMaxLinkNameChars] = {};
+    WireVec3 position;
+    WireQuat orientation;
+    WireVec3 linear_velocity;
+    WireVec3 angular_velocity;
+};
+
+/// ⚠ `effort` IS NOT REPORTED YET, and `effort_reported` on the enclosing WireVehiclePose says so
+/// rather than leaving a consumer to trust a zero. Position and velocity come straight out of
+/// Newton's joint_q / joint_qd and are exact; applied joint torque needs the solver's own per-joint
+/// force array, which the coupled proxy does not expose today. A silent 0.0 would be
+/// indistinguishable from a motor doing nothing - exactly the shape of bug that cost this
+/// workstream a day, when a published velocity turned out to be the wrong half of a twist and read
+/// as a stationary vehicle.
+struct WireJointState {
+    char joint_name[kMaxLinkNameChars] = {};
+    double position = 0;   ///< rad or m
+    double velocity = 0;   ///< rad/s or m/s
+    double effort = 0;     ///< N.m or N - ONLY meaningful when effort_reported is non-zero
+};
+
+struct WireVehiclePose {
+    char vehicle_name[kMaxVehicleNameChars] = {};
+    uint32_t link_count = 0;
+    uint32_t joint_count = 0;
+    uint32_t effort_reported = 0;   ///< 0 = every WireJointState::effort below is a placeholder
+    uint32_t _pad = 0;
+    WireLinkPose links[kMaxLinksPerVehicle];
+    WireJointState joints[kMaxJointsPerVehicle];
+};
+
+/// Sidecar -> Unreal. Latest-wins, never blocking.
+///
+/// ⚠ `sidecar_time` IS THE TIMESTAMP THE INTERPOLATION IS ANCHORED TO, and it is the sidecar's
+/// SIMULATED time, not wall time. A consumer that interpolated against its own clock would drift
+/// whenever the solve ran slower than real time - which it does, routinely, at 1.37 M particles.
+///
+/// ⚠ `publish_interval_seconds` is the sidecar's NOMINAL cadence, published so the consumer can
+/// size its interpolation window without measuring it. It is advisory: the honest instantaneous
+/// interval is the difference of two consecutive `sidecar_time` values, and a consumer that needs
+/// to notice a stall must use that rather than trust this.
+struct MpmVehiclePoseBlock {
+    uint32_t magic = kVehiclePoseMagic;
+    uint32_t version = kProtocolVersion;
+    uint32_t sequence = 0;
+    uint32_t vehicle_count = 0;
+    WireWorldStamp stamp;
+    uint64_t sidecar_step = 0;
+    double sidecar_time = 0;
+    double publish_interval_seconds = 0;
+    uint64_t acknowledged_command_step = 0;
+    WireVehiclePose vehicles[kMaxVehicles];
+};
+
+
+/// Mirrors urdf::StaticShapeKind. Values frozen by kProtocolVersion.
+enum class WireStaticShapeKind : uint32_t { Hull = 0, Mesh = 1, Sphere = 2, Capsule = 3 };
+
+/// ⚠ VERTICES AND INDICES LIVE IN SHARED POOLS on the block, not in this struct. A per-shape array
+/// would have to be sized for the worst shape and multiplied by kMaxStaticShapes, which for a level
+/// mesh is absurd; the start/count pairs index the flat arrays instead.
+struct WireStaticShape {
+    uint32_t kind = 0;
+    uint32_t vertex_start = 0;
+    uint32_t vertex_count = 0;
+    uint32_t index_start = 0;
+    uint32_t index_count = 0;
+    uint32_t _pad = 0;
+    WireVec3 center_a;      ///< Sphere: centre. Capsule: first hemisphere centre.
+    WireVec3 center_b;      ///< Capsule: second hemisphere centre.
+    double radius = 0;
+};
+
+/// ⚠ BODY-LOCAL SHAPES PLUS A WORLD TRANSFORM, matching urdf::StaticBody rather than flattening to
+/// world space. That is what lets one cooked mesh be reused by every instance of the same asset
+/// placed in a level - the difference between cooking a map once and once per placed rock.
+struct WireStaticBody {
+    char name[kMaxStaticNameChars] = {};
+    WireVec3 position;
+    WireQuat orientation;
+    uint32_t shape_start = 0;
+    uint32_t shape_count = 0;
+    double friction = 0.7;
+    double restitution = 0;
+};
+
+/// Unreal -> sidecar. The level's collision geometry, published ONCE per revision.
+///
+/// ⚠ WHY THIS EXISTS. Without it the sidecar's robot stands on a flat plane at a height somebody
+/// typed in, and collides with nothing else in the level at all. Getting that height right by hand
+/// failed twice in one afternoon: the two ends disagree about z by the AirSim NED origin's offset
+/// from the Unreal world origin (0.640 m on Blocks), so a plausible number can be wrong by exactly
+/// that and look like a physics bug. A level whose ground is not flat cannot be expressed as a
+/// number at all, and a level with obstacles never could.
+///
+/// ⚠ PUBLISHED ON A REVISION, NOT PER TICK. It is 24 MB and static by construction; the sidecar
+/// rebuilds its collision only when `revision` changes.
+///
+/// ⚠ `frame_offset` TRAVELS WITH THE GEOMETRY. The vertices are in the SOLVER frame (origin: the
+/// Unreal world origin) and the sidecar works in its own frame, offset from it. Sending the vector
+/// alongside the data means the sidecar subtracts it itself, rather than the two ends separately
+/// agreeing on a convention that has already been got wrong once.
+struct MpmStaticWorldBlock {
+    uint32_t magic = kStaticWorldMagic;
+    uint32_t version = kProtocolVersion;
+    uint32_t sequence = 0;
+    uint32_t revision = 0;
+    uint32_t body_count = 0;
+    uint32_t shape_count = 0;
+    uint32_t vertex_count = 0;
+    uint32_t index_count = 0;
+    /// ⚠ Non-zero means the level did NOT fit and what follows is a PARTIAL world. A robot that
+    /// falls through a floor which was silently dropped is the worst outcome here, so both ends
+    /// report this rather than letting it look like geometry that was never there.
+    uint32_t truncated = 0;
+    uint32_t _pad = 0;
+    WireVec3 frame_offset;
+    WireStaticBody bodies[kMaxStaticBodies];
+    WireStaticShape shapes[kMaxStaticShapes];
+    float vertices[kMaxStaticVertices * 3];
+    int32_t indices[kMaxStaticIndices];
+};
+
 constexpr const char* kRegistrySegment = "execosim_mpm_registry";
 constexpr const char* kStateSegment = "execosim_mpm_state";
 constexpr const char* kStatusSegment = "execosim_mpm_status";
 constexpr const char* kImpulseSegment = "execosim_mpm_impulse";
 constexpr const char* kParticleSegment = "execosim_mpm_particles";
+constexpr const char* kVehicleCommandSegment = "execosim_mpm_vehicle_command";
+constexpr const char* kVehiclePoseSegment = "execosim_mpm_vehicle_pose";
+constexpr const char* kStaticWorldSegment = "execosim_mpm_static_world";
 
 static_assert(sizeof(WireVec3) == 24, "WireVec3 must be 3 packed doubles");
 static_assert(sizeof(WireQuat) == 32, "WireQuat must be 4 packed doubles");
+static_assert(sizeof(WireStaticShape) == 80, "WireStaticShape layout changed");
+static_assert(sizeof(WireStaticBody) == 144, "WireStaticBody layout changed");
+static_assert(sizeof(MpmStaticWorldBlock) == 24237632, "MpmStaticWorldBlock layout changed");
+static_assert(sizeof(WireJointCommand) == 80, "WireJointCommand layout changed");
+static_assert(sizeof(WireVehicleCommand) == 5192, "WireVehicleCommand layout changed");
+static_assert(sizeof(MpmVehicleCommandBlock) == 20840, "MpmVehicleCommandBlock layout changed");
+static_assert(sizeof(WireLinkPose) == 168, "WireLinkPose layout changed");
+static_assert(sizeof(WireJointState) == 88, "WireJointState layout changed");
+static_assert(sizeof(WireVehiclePose) == 16464, "WireVehiclePose layout changed");
+static_assert(sizeof(MpmVehiclePoseBlock) == 65936, "MpmVehiclePoseBlock layout changed");
+
 
 } // namespace mpm
 } // namespace airlib
