@@ -1,4 +1,5 @@
 #include "SimModeWorldBase.h"
+#include "NewtonSidecarLaunch.h"
 #include "CoordinatedPhysicsScene.h"
 #include "PhysicsCollisionDebugDraw.h"
 #include "Camera/PlayerCameraManager.h"
@@ -763,6 +764,20 @@ namespace
 /// has to be authored in the editor. This path needs no content at all: the engine's own sphere,
 /// GPU-instanced. It is uglier than sprites and it is available today, which is the trade that
 /// matters while the question is still "is the sand where I think it is".
+/// ⚠ OPT-IN, AND OFF BY DEFAULT. "It started something I did not ask for" is worse than one click,
+/// and there are runs where the editor is deliberately up with no sidecar behind it — a probe
+/// comparison, a level edit, anything that does not want a GPU process holding 1.2 GB.
+TAutoConsoleVariable<int32> CVarNewtonSidecarAutoStart(
+    TEXT("airsim.NewtonSidecarAutoStart"), 0,
+    TEXT("Start the Newton MPM sidecar automatically when the loaded settings select "
+         "PhysicsEngine \"NewtonSidecar\".\n0: off, the operator owns the sidecar\n1: on"),
+    ECVF_Default);
+
+TAutoConsoleVariable<FString> CVarNewtonSidecarControlScript(
+    TEXT("airsim.NewtonSidecarControlScript"), TEXT(""),
+    TEXT("Path to tools/sidecar_ctl.sh. Empty derives it from the project directory."),
+    ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarMpmRender(
     TEXT("airsim.MpmRenderParticles"), 1,
     TEXT("Draw the MPM sidecar's sand particles in the level.\n0: off\n1: on"),
@@ -922,6 +937,27 @@ void ASimModeWorldBase::updateMpmParticleRender()
     // ⚠ Attach lazily and KEEP RETRYING. The sidecar creates this segment, and it starts minutes
     // after the simulator does (Warp spends that long compiling kernels). Opening once at
     // BeginPlay would mean the renderer never connects on any normal run.
+    // ⚠ NOTICE A SEGMENT REPLACED UNDERNEATH US, EVERY FRAME, BEFORE ANYTHING ELSE. Restarting the
+    // sidecar deletes and recreates the block, and `mmap` keeps the old unlinked inode alive — so
+    // this reader stays bound to a frame that will never change again. The five-second stall clear
+    // below cannot cover it: that branch is gated on there being instances ON SCREEN, so the first
+    // time it fires it clears them and thereby disarms itself. Measured 2026-08-27: sidecar
+    // restarted at 18:38:53, renderer bound at 18:38:32, sand absent for the rest of the session
+    // while the backend — which does revalidate — re-attached and republished normally.
+    if (mpm_particle_reader_.isOpen() && mpm_particle_reader_.segmentReplaced()) {
+        UE_LOG(LogPhysicsCoordinator, Log,
+               TEXT("the MPM particle segment was replaced (the sidecar restarted) — re-attaching"));
+        mpm_particle_reader_.close();
+        // ⚠ AND FORGET THE DEAD RUN'S STEP. The new sidecar starts counting from zero, so a
+        // retained high-water mark would reject every frame it publishes as "not newer".
+        mpm_last_render_step_ = 0;
+        mpm_stale_render_step_ = 0;
+        mpm_last_frame_seconds_ = 0.0;
+        mpm_render_announced_ = false;
+        if (mpm_particle_mesh_ != nullptr)
+            mpm_particle_mesh_->ClearInstances();
+    }
+
     if (!mpm_particle_reader_.isOpen()) {
         if (!mpm_particle_reader_.open("/dev/shm"))
             return;
@@ -1211,6 +1247,56 @@ msr::airlib::mpm::WireWorldStamp ASimModeWorldBase::currentMpmStamp() const
     return stamp;
 }
 
+namespace
+{
+/// Start the D15 sidecar if the settings ask for it and the operator has opted in.
+///
+/// ⚠ A DIFFERENT SIDECAR FROM THE ONE ABOVE, and the distinction is the whole reason this exists.
+/// The `DeformableTerrains.<name>.Sidecar.AutoStart` path launches `sidecar.py` directly with
+/// voxel/fps/density taken from a settings block, and passes NO --own-vehicle flags at all. A D15
+/// settings file deliberately has no DeformableTerrains block — the sidecar owns the vehicle as
+/// well as the sand — so pointing that path at one would start a sidecar with no robot in it,
+/// configured from a block the file does not have, ignoring the profile the panel writes.
+///
+/// ⚠ LAUNCHED THROUGH tools/sidecar_ctl.sh, exactly as the panel's Start button does, so a
+/// sidecar started automatically and one started by hand are the same process with the same
+/// arguments. The script is also the guard: it refuses when one is already running, and it clears
+/// the shared segments before starting, which a second implementation here would have to relearn.
+void maybeStartNewtonSidecar()
+{
+    if (CVarNewtonSidecarAutoStart.GetValueOnGameThread() == 0)
+        return;
+
+    bool wants_sidecar = false;
+    FString vehicle_name;
+    for (const auto& entry : msr::airlib::AirSimSettings::singleton().vehicles) {
+        if (entry.second && entry.second->physics_engine == "NewtonSidecar") {
+            wants_sidecar = true;
+            vehicle_name = UTF8_TO_TCHAR(entry.first.c_str());
+            break;
+        }
+    }
+    if (!wants_sidecar)
+        return;
+
+    // ⚠ THROUGH THE SHARED LAUNCHER, which also claims ownership: a sidecar this editor started
+    // is one this editor stops on exit, and it is handed our pid so it exits by itself if we
+    // crash instead. A sidecar the operator started from a terminal is left alone.
+    FString Message;
+    if (RunNewtonSidecarControl(TEXT("start"), /*bTakeOwnership=*/true, Message)) {
+        UE_LOG(LogPhysicsCoordinator, Log,
+               TEXT("NewtonSidecar AutoStart: '%s' selects PhysicsEngine NewtonSidecar - %s. The "
+                    "script refuses if one is already running. Expect ~11 s before sand appears."),
+               *vehicle_name, *Message);
+    }
+    else {
+        // ⚠ SAY WHICH FILE. A launch that fails silently leaves the simulator waiting on a wire
+        // nothing is writing, which looks exactly like a sidecar that is merely slow to build.
+        UE_LOG(LogPhysicsCoordinator, Error, TEXT("NewtonSidecar AutoStart: %s"), *Message);
+    }
+}
+} // namespace
+
 void ASimModeWorldBase::startMpmSidecarProcess()
 {
     using AirSimSettings = msr::airlib::AirSimSettings;
@@ -1228,8 +1314,12 @@ void ASimModeWorldBase::startMpmSidecarProcess()
             break;
         }
     }
-    if (sc == nullptr)
-        return; // nobody opted in — the operator owns the sidecar, as before D14
+    if (sc == nullptr) {
+        // Nobody opted into the D14 collider-bridge sidecar. The D15 one is a separate question
+        // with a separate switch.
+        maybeStartNewtonSidecar();
+        return;
+    }
 
     // The script lives beside the simulator's own source, two levels above the Unreal project.
     FString script = UTF8_TO_TCHAR(sc->script.c_str());

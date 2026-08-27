@@ -32,7 +32,7 @@ import time
 # ⚠ 2 since 2026-08-25: the registry gained the terrain REGION. Before that the simulator declared
 # a region in settings and this sidecar spawned sand wherever its CLI defaults said, with nothing
 # carrying one to the other.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 REGISTRY_MAGIC = 0x4D504D52  # 'MPMR'
 STATE_MAGIC = 0x4D504D53     # 'MPMS'
@@ -424,6 +424,15 @@ class MpmVehicleCommandBlock(ctypes.Structure):
         # the vehicle where it drove to and the sand keeps every rut. Bumping this is what tells
         # the sidecar to rebuild — fresh bed, vehicle back at its spawn.
         ("reset_epoch", ctypes.c_uint64),
+        # ⚠ WHICH PIE SESSION THIS IS, AND WHY A COUNTER CANNOT ANSWER THAT. `reset_epoch` and
+        # `kinematic_revision` both live on the backend, and the backend is constructed fresh for
+        # every Play — so a new session restarts them from the same base the old one started from.
+        # Stop PIE without pressing BackSpace, press Play again, and the sidecar is sent epoch 0
+        # (already applied) and revision 1 (already built): no edge on either, so it carries on
+        # with the previous session's rutted bed and the robot wherever it was left. That is the
+        # "reset does not put the robot back" report of 2026-08-27, which was misdiagnosed as
+        # anchor drift. A value that is RANDOM per backend cannot collide across sessions.
+        ("session_id", ctypes.c_uint64),
         # ⚠ THE MOVING HALF OF THE LEVEL MIRROR, on the block that is already written every tick.
         # `kinematic_revision` says which registration these poses belong to; a consumer that has
         # built a different revision must ignore them rather than apply pose[i] to the wrong body.

@@ -55,7 +55,7 @@ namespace mpm
 /// declared a region in settings and the sidecar spawned sand wherever its own CLI defaults said,
 /// with nothing carrying one to the other — the rover would drive through empty space while every
 /// diagnostic reported healthy. The region is not optional metadata; it is where the sand IS.
-constexpr uint32_t kProtocolVersion = 5;
+constexpr uint32_t kProtocolVersion = 6;
 
 constexpr uint32_t kRegistryMagic = 0x4D504D52u;  // 'MPMR'
 constexpr uint32_t kStateMagic = 0x4D504D53u;     // 'MPMS'
@@ -446,6 +446,15 @@ struct MpmVehicleCommandBlock {
     /// vehicle where it drove to and the sand keeps every rut. Bumping this is what tells the
     /// sidecar to rebuild - fresh bed, vehicle back at its spawn.
     uint64_t reset_epoch = 0;
+    /// ⚠ WHICH PIE SESSION THIS IS, AND WHY A COUNTER CANNOT ANSWER THAT. `reset_epoch` and
+    /// `kinematic_revision` both live on this backend, and the backend is constructed fresh for
+    /// every Play - so a new session restarts them from the same base the old one started from.
+    /// Stop PIE without pressing BackSpace, press Play again, and the sidecar is sent epoch 0
+    /// (already applied) and revision 1 (already built): no edge on either, so it carries on with
+    /// the previous session's rutted bed and the robot wherever it was left. That is the "reset
+    /// does not put the robot back" report of 2026-08-27, which was misdiagnosed as anchor drift.
+    /// A value that is RANDOM per backend cannot collide across sessions.
+    uint64_t session_id = 0;
     /// ⚠ THE MOVING HALF OF THE LEVEL MIRROR, on the block already written every tick.
     /// `kinematic_revision` says which registration these poses belong to; a consumer that has
     /// built a different revision must ignore them rather than apply pose[i] to the wrong body.
@@ -612,7 +621,7 @@ static_assert(sizeof(WireStaticBody) == 144, "WireStaticBody layout changed");
 static_assert(sizeof(MpmStaticWorldBlock) == 24247368, "MpmStaticWorldBlock layout changed");
 static_assert(sizeof(WireJointCommand) == 80, "WireJointCommand layout changed");
 static_assert(sizeof(WireVehicleCommand) == 5192, "WireVehicleCommand layout changed");
-static_assert(sizeof(MpmVehicleCommandBlock) == 24432, "MpmVehicleCommandBlock layout changed");
+static_assert(sizeof(MpmVehicleCommandBlock) == 24440, "MpmVehicleCommandBlock layout changed");
 static_assert(sizeof(WireLinkPose) == 168, "WireLinkPose layout changed");
 static_assert(sizeof(WireJointState) == 88, "WireJointState layout changed");
 static_assert(sizeof(WireVehiclePose) == 16488, "WireVehiclePose layout changed");

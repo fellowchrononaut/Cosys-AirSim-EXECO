@@ -8,7 +8,9 @@
 #include <map>
 #include <utility>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <random>
 #include <cstring>
 #include <stdexcept>
 
@@ -110,6 +112,20 @@ struct NewtonSidecarUrdfBackend::Impl
     int command_fd = -1;
     const MpmVehiclePoseBlock* pose = nullptr;
     int pose_fd = -1;
+
+    /// ⚠ WHICH FILE EACH MAPPING IS OF, so a segment replaced underneath us can be NOTICED.
+    /// `tools/sidecar_ctl.sh` deletes and recreates every segment on restart — it has to, because
+    /// a stale particle block read once and then never updated is exactly the "sand appeared and
+    /// disappeared" the operator reported. But `mmap` keeps the OLD, now-unlinked inode alive, so
+    /// this side goes on writing commands into memory nobody will ever read and goes on reading
+    /// poses that will never change, with every counter reporting connected. That is why every
+    /// sidecar restart needed a PIE restart to go with it.
+    dev_t command_dev = 0; ino_t command_ino = 0;
+    dev_t pose_dev = 0;    ino_t pose_ino = 0;
+    dev_t static_dev = 0;  ino_t static_ino = 0;
+    /// Countdown to the next revalidation; stat-ing three paths every physics step would be three
+    /// syscalls at 333 Hz to answer a question that changes at human speed.
+    int revalidate_countdown = 0;
 #endif
 
     /// The two samples the current render time falls between. `previous` may be empty at startup.
@@ -165,6 +181,14 @@ struct NewtonSidecarUrdfBackend::Impl
     bool offset_resolved = false;
     /// Incremented by reset(); published on every command so the sidecar cannot miss the edge.
     uint64_t reset_epoch = 0;
+    /// ⚠ RANDOM, ONCE, PER BACKEND — and that is the entire point. This backend is constructed
+    /// fresh for every PIE session, so every COUNTER on it restarts from the same base the last
+    /// session started from: stop PIE without pressing BackSpace, press Play, and the sidecar is
+    /// sent reset_epoch 0 (already applied) and static revision 1 (already built). No edge on
+    /// either, so it carries on with the previous session's rutted bed and the robot wherever it
+    /// was left. Reported on 2026-08-27 as "the reset does not put the robot back", and
+    /// misdiagnosed at the time as anchor drift. A random value cannot collide across sessions.
+    uint64_t session_id = 0;
 
     std::shared_ptr<const urdf::StaticWorld> static_world;
 #if MPM_SHM_SUPPORTED
@@ -187,6 +211,18 @@ struct NewtonSidecarUrdfBackend::Impl
 NewtonSidecarUrdfBackend::NewtonSidecarUrdfBackend(Options options)
     : impl_(new Impl())
 {
+    // ⚠ SEEDED FROM THE CLOCK AND THE ADDRESS, not from a counter. Two editors launched in the
+    // same second must not produce the same id, and neither must two Play presses.
+    {
+        std::random_device rd;
+        std::mt19937_64 gen(static_cast<uint64_t>(rd()) ^
+                            static_cast<uint64_t>(std::chrono::steady_clock::now()
+                                                      .time_since_epoch().count()) ^
+                            reinterpret_cast<uintptr_t>(this));
+        impl_->session_id = gen();
+        if (impl_->session_id == 0) impl_->session_id = 1;   // 0 means "not set" on the wire
+    }
+
     impl_->options = std::move(options);
 }
 
@@ -231,6 +267,78 @@ void copyTailName(char* dst, size_t cap, const std::string& name)
 }
 } // namespace
 
+namespace
+{
+#if MPM_SHM_SUPPORTED
+/// True when `path` is no longer the file this side mapped — deleted, or replaced by a new one.
+bool segmentReplaced(const std::string& path, dev_t dev, ino_t ino)
+{
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0)
+        return true;                                  // gone entirely
+    return info.st_dev != dev || info.st_ino != ino;  // a DIFFERENT file now lives at that name
+}
+#endif
+} // namespace
+
+void NewtonSidecarUrdfBackend::revalidateSegments()
+{
+#if MPM_SHM_SUPPORTED
+    // ⚠ ONCE A SECOND-ISH, not every step. Three stat() calls at 333 Hz to answer a question that
+    // changes when a human restarts a process is a thousand syscalls a second for nothing.
+    if (--impl_->revalidate_countdown > 0)
+        return;
+    impl_->revalidate_countdown = 200;
+
+    const std::string dir = impl_->options.directory + "/";
+
+    // ---- commands: WE create this one, so remap it and carry on ----------------------------
+    if (impl_->command != nullptr &&
+        segmentReplaced(dir + kVehicleCommandSegment, impl_->command_dev, impl_->command_ino)) {
+        common_utils::Utils::log(
+            "NewtonSidecar: the command segment was replaced (the sidecar restarted). Re-attaching "
+            "and republishing the level — until now this needed a PIE restart as well.",
+            common_utils::Utils::kLogLevelInfo);
+        ::munmap(impl_->command, sizeof(MpmVehicleCommandBlock));
+        if (impl_->command_fd >= 0) ::close(impl_->command_fd);
+        impl_->command = nullptr;
+        impl_->command_fd = -1;
+        attachCommandSegment();
+
+        // ⚠ AND EVERYTHING WE HAD ALREADY TOLD IT IS NOW UNSAID. A restarted sidecar has no level,
+        // no registration and no anchor; leaving `static_published` true would leave it running on
+        // its flat fallback ground with the robot colliding with nothing, which is precisely what
+        // the operator saw all afternoon.
+        impl_->static_published = false;
+        impl_->offset_resolved = false;
+    }
+
+    // ---- poses: the sidecar owns this one; drop ours and let step() re-attach --------------
+    if (impl_->pose != nullptr &&
+        segmentReplaced(dir + kVehiclePoseSegment, impl_->pose_dev, impl_->pose_ino)) {
+        ::munmap(const_cast<MpmVehiclePoseBlock*>(impl_->pose), sizeof(MpmVehiclePoseBlock));
+        if (impl_->pose_fd >= 0) ::close(impl_->pose_fd);
+        impl_->pose = nullptr;
+        impl_->pose_fd = -1;
+        // ⚠ AND THE SAMPLES WE ARE INTERPOLATING BETWEEN BELONG TO A DEAD RUN. Keeping them would
+        // interpolate the new sidecar's first pose against the old one's last, which on a robot
+        // that has been driven is a link snapping across the map.
+        impl_->have_latest = false;
+        impl_->have_previous = false;
+    }
+
+    // ---- the level: ours, and republished by clearing the flag -----------------------------
+    if (impl_->static_block != nullptr &&
+        segmentReplaced(dir + kStaticWorldSegment, impl_->static_dev, impl_->static_ino)) {
+        ::munmap(impl_->static_block, sizeof(MpmStaticWorldBlock));
+        if (impl_->static_fd >= 0) ::close(impl_->static_fd);
+        impl_->static_block = nullptr;
+        impl_->static_fd = -1;
+        impl_->static_published = false;
+    }
+#endif
+}
+
 void NewtonSidecarUrdfBackend::publishStaticWorld()
 {
 #if MPM_SHM_SUPPORTED
@@ -272,6 +380,8 @@ void NewtonSidecarUrdfBackend::publishStaticWorld()
             return;
         }
         impl_->static_block = static_cast<MpmStaticWorldBlock*>(address);
+        impl_->static_dev = info.st_dev;
+        impl_->static_ino = info.st_ino;
     }
 
     MpmStaticWorldBlock* b = impl_->static_block;
@@ -512,6 +622,53 @@ void NewtonSidecarUrdfBackend::setKinematicPose(int handle, const urdf::Vec3& po
     impl_->kinematic_poses[handle] = {position, orientation};
 }
 
+void NewtonSidecarUrdfBackend::attachCommandSegment()
+{
+#if MPM_SHM_SUPPORTED
+    const std::string command_path = impl_->options.directory + "/" + kVehicleCommandSegment;
+    const std::string pose_path = impl_->options.directory + "/" + kVehiclePoseSegment;
+
+    // ⚠ THE COMMAND SEGMENT IS CREATED IF ABSENT; THE POSE SEGMENT IS NOT.
+    //
+    // We are the WRITER of commands, so a sidecar started later must find our block waiting. We
+    // are only a READER of poses, and creating that one would let a simulator started first
+    // present an all-zero block that the sidecar then overwrites — the window between is a robot
+    // rendered at the origin while every counter reports connected. Missing is the honest state,
+    // and step() reports it.
+    impl_->command_fd = ::open(command_path.c_str(), O_RDWR | O_CREAT, 0666);
+    if (impl_->command_fd < 0)
+        throw std::runtime_error("NewtonSidecar backend: cannot open " + command_path);
+    if (::ftruncate(impl_->command_fd, sizeof(MpmVehicleCommandBlock)) != 0) {
+        // ⚠ Not fatal on its own: another process may have created it at the right size already,
+        // and ftruncate on some filesystems refuses to shrink-or-grow a mapped file. The size
+        // check below is the authority.
+    }
+    struct stat info;
+    if (::fstat(impl_->command_fd, &info) != 0 ||
+        static_cast<size_t>(info.st_size) != sizeof(MpmVehicleCommandBlock)) {
+        ::close(impl_->command_fd);
+        impl_->command_fd = -1;
+        throw std::runtime_error(
+            "NewtonSidecar backend: " + command_path + " is the wrong size. This is a PROTOCOL "
+            "MISMATCH — the plugin and the sidecar were built from different versions of "
+            "MpmSidecarProtocol.hpp / protocol.py. Delete the segment and restart both.");
+    }
+    void* address = ::mmap(nullptr, sizeof(MpmVehicleCommandBlock), PROT_READ | PROT_WRITE,
+                           MAP_SHARED, impl_->command_fd, 0);
+    if (address == MAP_FAILED) {
+        ::close(impl_->command_fd);
+        impl_->command_fd = -1;
+        throw std::runtime_error("NewtonSidecar backend: cannot map " + command_path);
+    }
+    impl_->command = static_cast<MpmVehicleCommandBlock*>(address);
+    impl_->command_dev = info.st_dev;
+    impl_->command_ino = info.st_ino;
+    impl_->command->magic = kVehicleCommandMagic;
+    impl_->command->version = kProtocolVersion;
+
+#endif
+}
+
 void NewtonSidecarUrdfBackend::buildFromUrdf(const urdf::Robot& model,
                                              const urdf::BackendOptions& opts)
 {
@@ -551,47 +708,8 @@ void NewtonSidecarUrdfBackend::buildFromUrdf(const urdf::Robot& model,
     throw std::runtime_error("NewtonSidecar backend needs POSIX shared memory; this platform has "
                              "none compiled in.");
 #else
-    const std::string command_path = impl_->options.directory + "/" + kVehicleCommandSegment;
-    const std::string pose_path = impl_->options.directory + "/" + kVehiclePoseSegment;
-
-    // ⚠ THE COMMAND SEGMENT IS CREATED IF ABSENT; THE POSE SEGMENT IS NOT.
-    //
-    // We are the WRITER of commands, so a sidecar started later must find our block waiting. We
-    // are only a READER of poses, and creating that one would let a simulator started first
-    // present an all-zero block that the sidecar then overwrites — the window between is a robot
-    // rendered at the origin while every counter reports connected. Missing is the honest state,
-    // and step() reports it.
-    impl_->command_fd = ::open(command_path.c_str(), O_RDWR | O_CREAT, 0666);
-    if (impl_->command_fd < 0)
-        throw std::runtime_error("NewtonSidecar backend: cannot open " + command_path);
-    if (::ftruncate(impl_->command_fd, sizeof(MpmVehicleCommandBlock)) != 0) {
-        // ⚠ Not fatal on its own: another process may have created it at the right size already,
-        // and ftruncate on some filesystems refuses to shrink-or-grow a mapped file. The size
-        // check below is the authority.
-    }
-    struct stat info;
-    if (::fstat(impl_->command_fd, &info) != 0 ||
-        static_cast<size_t>(info.st_size) != sizeof(MpmVehicleCommandBlock)) {
-        ::close(impl_->command_fd);
-        impl_->command_fd = -1;
-        throw std::runtime_error(
-            "NewtonSidecar backend: " + command_path + " is the wrong size. This is a PROTOCOL "
-            "MISMATCH — the plugin and the sidecar were built from different versions of "
-            "MpmSidecarProtocol.hpp / protocol.py. Delete the segment and restart both.");
-    }
-    void* address = ::mmap(nullptr, sizeof(MpmVehicleCommandBlock), PROT_READ | PROT_WRITE,
-                           MAP_SHARED, impl_->command_fd, 0);
-    if (address == MAP_FAILED) {
-        ::close(impl_->command_fd);
-        impl_->command_fd = -1;
-        throw std::runtime_error("NewtonSidecar backend: cannot map " + command_path);
-    }
-    impl_->command = static_cast<MpmVehicleCommandBlock*>(address);
-    impl_->command->magic = kVehicleCommandMagic;
-    impl_->command->version = kProtocolVersion;
-
+    attachCommandSegment();
     // The pose segment may legitimately not exist yet — the sidecar creates it. step() retries.
-    (void)pose_path;
 #endif
 }
 
@@ -686,6 +804,9 @@ int NewtonSidecarUrdfBackend::step(double dt)
         // latest-wins and may miss any individual write; carrying the current value means it
         // notices the edge whenever it next looks, rather than depending on catching one frame.
         b->reset_epoch = impl_->reset_epoch;
+        // ⚠ Also every tick, for the same reason: the sidecar must be able to notice a new session
+        // whenever it next looks, not only on the one frame the session began.
+        b->session_id = impl_->session_id;
 
         // ⚠ ALL OF THEM INSIDE ONE UPDATE. setKinematicPose is called once per body per tick from
         // the game thread; taking the seqlock there would let a reader see half the actors moved,
@@ -743,8 +864,11 @@ int NewtonSidecarUrdfBackend::step(double dt)
                 static_cast<size_t>(info.st_size) == sizeof(MpmVehiclePoseBlock)) {
                 void* address = ::mmap(nullptr, sizeof(MpmVehiclePoseBlock), PROT_READ,
                                        MAP_SHARED, impl_->pose_fd, 0);
-                if (address != MAP_FAILED)
+                if (address != MAP_FAILED) {
                     impl_->pose = static_cast<const MpmVehiclePoseBlock*>(address);
+                    impl_->pose_dev = info.st_dev;
+                    impl_->pose_ino = info.st_ino;
+                }
             }
             if (!impl_->pose) {
                 ::close(impl_->pose_fd);
@@ -893,6 +1017,11 @@ int NewtonSidecarUrdfBackend::step(double dt)
             }
         }
     }
+
+    // ⚠ BEFORE the republish, because it is what decides whether a republish is owed: if the
+    // sidecar restarted, every segment we hold is an orphaned inode and everything we told it is
+    // unsaid.
+    revalidateSegments();
 
     // ⚠ AFTER the anchor, not before: the geometry is shifted into the sidecar's frame by the same
     // offset the poses use, and that is only known once the sidecar has told us where its robot is.

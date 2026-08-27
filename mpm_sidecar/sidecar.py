@@ -384,6 +384,8 @@ class Sidecar:
         self._spawn_position = (0.0, 0.0, 0.0)
         self._kinematic_bodies = []
         self._kinematic_joints = []
+        self._session_id = 0
+        self._session_reset_pending = False
         self._mirror_shape_index = None
         self._mirror_shape_joint = None
         self._mirror_body_index = None
@@ -1620,6 +1622,29 @@ class Sidecar:
         # model whose control array we are part-way through writing.
         self.requested_reset_epoch = int(block.reset_epoch)
 
+        # ⚠ A NEW PIE SESSION IS A RESET, and no counter on this wire can tell you one began. Both
+        # `reset_epoch` and `kinematic_revision` live on a backend that is constructed fresh for
+        # every Play, so they restart from the same base the last session started from: stop PIE
+        # without pressing BackSpace, press Play, and this sidecar is handed epoch 0 (already
+        # applied) and revision 1 (already built). It sees no edge on either and carries on with
+        # the previous session's rutted bed and the robot wherever it was left — reported on
+        # 2026-08-27 as "the reset does not put the robot back", and misdiagnosed then as anchor
+        # drift. The session id is random per backend, so it cannot collide.
+        session = int(block.session_id)
+        if session and session != self._session_id:
+            if self._session_id:
+                print(f"a NEW simulator session began (id {session:#x}, was {self._session_id:#x})"
+                      f" — treating it as a reset.", flush=True)
+                # ⚠ A FLAG, NOT A FABRICATED EPOCH. Setting `requested = applied + 1` here looks
+                # equivalent and loops forever: the rebuild sets `applied` to the fabricated value,
+                # the next tick reads the real epoch (0) off the wire, the two differ again, and
+                # the model is torn down every single tick. Routed as a flag, and through the reset
+                # path rather than rebuilt here — consume_vehicle_command runs part-way through
+                # writing this model's control array, and tearing the model down from inside it
+                # would destroy what is being written.
+                self._session_reset_pending = True
+            self._session_id = session
+
         if self.vehicle.unknown_joints and not self._unknown_joint_warned:
             self._unknown_joint_warned = True
             print(f"⚠ wire commanded joint(s) this vehicle does not have: "
@@ -2659,11 +2684,14 @@ class Sidecar:
         simulator's world at all. The simulator resets its own actors and the robot's poses keep
         arriving from a Newton model that never heard about it.
         """
-        if self.requested_reset_epoch == self._applied_reset_epoch:
+        session_reset = self._session_reset_pending
+        if self.requested_reset_epoch == self._applied_reset_epoch and not session_reset:
             return False
         epoch = self.requested_reset_epoch
-        self.rebuild_model(f"reset requested by the simulator (epoch {epoch})")
+        self.rebuild_model("a new simulator session began" if session_reset
+                           else f"reset requested by the simulator (epoch {epoch})")
         self._applied_reset_epoch = epoch
+        self._session_reset_pending = False
         # ⚠ DO NOT WITHHOLD THE SAND AFTERWARDS. An earlier version cleared _static_settled here,
         # on the theory that the bed should stay hidden until the level question was resettled. But
         # rebuild_model is SYNCHRONOUS — by the time it returns the new bed exists and is standing
@@ -2807,9 +2835,31 @@ class Sidecar:
         rows = []
         started = time.time()
 
+        parent_pid = int(self.args.parent_pid)
+        last_parent_check = 0.0
+
         try:
             for i in range(steps):
                 t = i * frame_dt
+
+                # ⚠ ORPHAN CONTROL, AND IT WAS MISSING FROM THIS LOOP ENTIRELY. The collider-bridge
+                # loop has had this since 2026-08-26, when two abandoned sidecars were found by
+                # hand, one after 32 minutes. The own-vehicle loop never got it — so an editor that
+                # launched a D15 sidecar and then CRASHED left a process holding 1.2 GB of GPU with
+                # nothing to publish for, and `--parent-pid` looked like it covered that and did
+                # not. A clean editor exit can stop the sidecar itself; only this covers the
+                # unclean one.
+                if parent_pid > 0:
+                    now_wall = time.time()
+                    if now_wall - last_parent_check > 1.0:
+                        last_parent_check = now_wall
+                        try:
+                            os.kill(parent_pid, 0)
+                        except OSError:
+                            print(f"\nparent process {parent_pid} is gone — exiting rather than "
+                                  f"holding the GPU for a simulator that has stopped.", flush=True)
+                            return 0
+
                 # ⚠ THE WIRE WINS WHEN IT IS PRESENT. The built-in ramp is a standalone convenience
                 # for step 1; once a simulator is commanding joints, a local ramp writing the same
                 # targets would fight it and the vehicle would obey whichever ran last.
@@ -2860,6 +2910,7 @@ class Sidecar:
                             continue
                     except Exception as error:
                         self._applied_reset_epoch = self.requested_reset_epoch
+                        self._session_reset_pending = False
                         self._static_settled = True
                         print(f"⚠ reset FAILED ({error}); continuing on the model already built. "
                               f"The sand and the vehicle are NOT back at their initial state.",
@@ -3024,6 +3075,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dir", default="/dev/shm", help="directory holding the MPM segments")
+    parser.add_argument("--profile", default=None, metavar="PATH",
+                        help="JSON file of parameter defaults, keyed by argparse destination "
+                             "(voxel_size, density, sand_friction, ...). ⚠ A BASE, not an "
+                             "override: anything typed on the command line still wins. This is "
+                             "what makes a run reproducible from a file rather than from a shell "
+                             "script's environment, and what the editor panel writes.")
     parser.add_argument("--voxel-size", type=float, default=0.05, help="MPM voxel size, metres")
     parser.add_argument("--fps", type=float, default=60.0, help="MPM frames per simulated second")
     parser.add_argument("--gravity", type=float, default=-9.81)
@@ -3231,7 +3288,50 @@ def main() -> int:
                           "<repo>/PhysicsEngineDiscussion/newton_probes/results/"
                           "sidecar_own_<vehicle>.csv, next to the probe results it has to be "
                           "compared against.")
+    # ⚠ THE PROFILE IS A BASE, THE COMMAND LINE STILL WINS, AND THAT ORDER IS LOAD-BEARING.
+    # `set_defaults` replaces the parser's built-in defaults, so a flag actually typed on the
+    # command line still overrides the file — which is what lets a probe pin one value without
+    # editing the operator's profile. It also means the reverse trap is real and quiet: a RUNNER
+    # that passes `--voxel-size` unconditionally makes the profile's voxel size a decorative
+    # number, and the panel that wrote it looks broken while both ends report healthy. That is why
+    # run_d15_step3_sidecar.sh no longer passes the tunable flags, and why the resolved values are
+    # printed with their PROVENANCE below rather than just their values.
+    profile_path = None
+    for i, a in enumerate(sys.argv[1:]):
+        if a == "--profile" and i + 2 <= len(sys.argv) - 1:
+            profile_path = sys.argv[i + 2]
+        elif a.startswith("--profile="):
+            profile_path = a.split("=", 1)[1]
+    profile_values = {}
+    if profile_path:
+        import json as _json
+        try:
+            with open(profile_path) as fh:
+                raw = _json.load(fh)
+        except Exception as error:                              # noqa: BLE001
+            raise SystemExit(f"--profile {profile_path}: {error}")
+        known = {a.dest for a in parser._actions}               # noqa: SLF001
+        unknown = sorted(k for k in raw if k not in known)
+        if unknown:
+            # ⚠ REFUSED, NOT IGNORED. A typo in a profile that is silently dropped is a setting the
+            # operator believes is applied and is not — the same class of quiet wrong answer as a
+            # runner overriding the file.
+            raise SystemExit(f"--profile {profile_path}: unknown key(s) {unknown}. Valid keys are "
+                             f"argparse destinations, e.g. voxel_size, density, sand_friction.")
+        profile_values = raw
+        parser.set_defaults(**raw)
+
     args = parser.parse_args()
+
+    if profile_path:
+        typed = {a.lstrip("-").split("=")[0].replace("-", "_") for a in sys.argv[1:]
+                 if a.startswith("--")}
+        print(f"profile {profile_path}:")
+        for key in sorted(profile_values):
+            overridden = key in typed
+            print(f"  {key:28} = {getattr(args, key)!r}"
+                  + ("   ⚠ OVERRIDDEN ON THE COMMAND LINE — the profile said "
+                     f"{profile_values[key]!r}" if overridden else ""))
 
     # ⚠ RESOLVED ONCE, HERE, so every later read sees a concrete choice rather than "auto".
     # Two-way with kinematic colliders is the combination that ejected the rover: the sand is

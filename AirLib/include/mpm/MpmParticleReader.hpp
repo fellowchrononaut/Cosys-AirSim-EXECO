@@ -51,6 +51,14 @@ public:
     void close();
     bool isOpen() const;
 
+    /// ⚠ HAS THE SEGMENT BEEN REPLACED UNDERNEATH US? Restarting the sidecar deletes and recreates
+    /// the block; `mmap` keeps the old, unlinked inode alive, so a reader that never asks this goes
+    /// on reading a frame that will never change while reporting itself open. The renderer's own
+    /// five-second stall clear cannot cover this: it is gated on there being instances on screen,
+    /// so once it has fired and cleared them it disarms itself and the reader stays bound to a
+    /// dead segment for the life of the session. Measured exactly that way on 2026-08-27.
+    bool segmentReplaced() const;
+
     /// Read the newest frame. Returns false if nothing new since `last_step`, so a caller can skip
     /// the conversion and the renderer update entirely on an unchanged frame.
     bool read(Frame& out, uint64_t last_step) const;

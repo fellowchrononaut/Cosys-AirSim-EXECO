@@ -99,6 +99,17 @@ public class AirSim : ModuleRules
         PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "ImageWrapper", "RenderCore", "RHI", "AssetRegistry", "PhysicsCore", "Chaos", "ChaosVehicles", "Landscape", "CinematicCamera", "Projects", "ProceduralMeshComponent", "MeshDescription", "StaticMeshDescription" });
         PrivateDependencyModuleNames.AddRange(new string[] { "UMG", "Slate", "SlateCore", "RenderCore", "ChaosVehicles", "DesktopPlatform" });
 
+        // ⚠ EDITOR ONLY, and guarded so a packaged build never links them. The Newton sidecar
+        // status panel is a development tool: it registers a nomad tab, which needs the editor's
+        // workspace menu structure. Adding these unconditionally would put UnrealEd into a runtime
+        // module and break packaging for something no shipped game can open.
+        if (Target.bBuildEditor)
+        {
+            // ⚠ Json is here rather than in the unconditional list because the only thing in this
+            // plugin that parses JSON is the editor panel's sidecar profile reader.
+            PrivateDependencyModuleNames.AddRange(new string[] { "UnrealEd", "WorkspaceMenuStructure", "Json" });
+        }
+
         //suppress VC++ proprietary warnings
         PublicDefinitions.Add("_SCL_SECURE_NO_WARNINGS=1");
         PublicDefinitions.Add("_CRT_SECURE_NO_WARNINGS=1");

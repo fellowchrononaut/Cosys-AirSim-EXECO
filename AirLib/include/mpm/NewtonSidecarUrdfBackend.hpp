@@ -175,6 +175,17 @@ private:
     /// is known. Cheap no-op on every later call.
     void publishStaticWorld();
 
+    /// Open and map the command segment. Called at build, and again whenever the segment is
+    /// replaced underneath us — see `revalidateSegments`.
+    void attachCommandSegment();
+
+    /// ⚠ NOTICE WHEN A SEGMENT HAS BEEN REPLACED UNDERNEATH US. Restarting the sidecar deletes and
+    /// recreates every block; `mmap` keeps the old, now-unlinked inode alive, so without this the
+    /// plugin goes on writing commands nobody reads and reading poses that never change, with
+    /// every counter reporting connected. That is why a sidecar restart needed a PIE restart to go
+    /// with it.
+    void revalidateSegments();
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 

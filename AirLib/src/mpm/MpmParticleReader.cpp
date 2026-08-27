@@ -25,6 +25,15 @@ struct MpmParticleReader::Impl
 #if MPM_SHM_SUPPORTED
     MpmParticleBlock* block = nullptr;
     int fd = -1;
+    /// ⚠ WHICH FILE THIS MAPPING IS OF, so a segment replaced underneath us can be NOTICED.
+    /// `tools/sidecar_ctl.sh` deletes and recreates the segment on every restart; `mmap` keeps the
+    /// old, now-unlinked inode alive, so without this the renderer goes on reading a block that
+    /// will never advance again. Measured 2026-08-27: the sidecar restarted at 18:38:53, the
+    /// renderer had attached at 18:38:32 and stayed bound to the dead inode with the sand simply
+    /// absent, while the backend — which does revalidate — re-attached and republished normally.
+    dev_t dev = 0;
+    ino_t ino = 0;
+    std::string path;
 #endif
 };
 
@@ -35,6 +44,20 @@ bool MpmParticleReader::isOpen() const
 {
 #if MPM_SHM_SUPPORTED
     return impl_ && impl_->block != nullptr;
+#else
+    return false;
+#endif
+}
+
+bool MpmParticleReader::segmentReplaced() const
+{
+#if MPM_SHM_SUPPORTED
+    if (!impl_ || impl_->block == nullptr)
+        return false;
+    struct stat info;
+    if (::stat(impl_->path.c_str(), &info) != 0)
+        return true;                                        // gone entirely
+    return info.st_dev != impl_->dev || info.st_ino != impl_->ino;
 #else
     return false;
 #endif
@@ -70,6 +93,9 @@ bool MpmParticleReader::open(const std::string& directory)
         return false;
     }
     impl_->block = static_cast<MpmParticleBlock*>(address);
+    impl_->dev = info.st_dev;
+    impl_->ino = info.st_ino;
+    impl_->path = path;
     return true;
 #else
     (void)directory;
