@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <vector>
+#include <map>
+#include <utility>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -173,7 +175,10 @@ struct NewtonSidecarUrdfBackend::Impl
     uint32_t static_revision = 0;
 
     /// Mirrored dynamic actors: shapes registered once, poses refreshed every tick.
+    std::vector<std::vector<urdf::Collision>> link_collisions;
     std::vector<urdf::KinematicBody> kinematic;
+    /// name -> (interact_with_mpm, collide_with_robots), from an authored NewtonPhysicsComponent.
+    std::map<std::string, std::pair<bool, bool>> kinematic_flags;
     struct KinPose { urdf::Vec3 position; urdf::Quat orientation; };
     std::vector<KinPose> kinematic_poses;
     bool kinematic_warned = false;
@@ -206,6 +211,25 @@ void NewtonSidecarUrdfBackend::setStaticWorld(std::shared_ptr<const urdf::Static
     impl_->static_world = std::move(world);
     impl_->static_published = false;
 }
+
+namespace
+{
+/// Copy the END of a long name into a fixed buffer, prefixed with "~" when it was shortened.
+///
+/// ⚠ Unreal path names share a long, identical prefix and differ only at the tail, so a head
+/// truncation throws away the identifying half and keeps the useless one. Everything that reads
+/// these — the contact reporter, the sidecar's logs — is trying to answer "WHICH object is this".
+void copyTailName(char* dst, size_t cap, const std::string& name)
+{
+    if (cap == 0) return;
+    if (name.size() < cap) {
+        std::snprintf(dst, cap, "%s", name.c_str());
+        return;
+    }
+    const std::string tail = name.substr(name.size() - (cap - 2));
+    std::snprintf(dst, cap, "~%s", tail.c_str());
+}
+} // namespace
 
 void NewtonSidecarUrdfBackend::publishStaticWorld()
 {
@@ -284,7 +308,7 @@ void NewtonSidecarUrdfBackend::publishStaticWorld()
         }
 
         WireStaticBody& wb = b->bodies[bodies];
-        std::snprintf(wb.name, kMaxStaticNameChars, "%s", sb.name.c_str());
+        copyTailName(wb.name, kMaxStaticNameChars, sb.name);
         wb.position.x = sb.position.x;
         wb.position.y = sb.position.y;
         wb.position.z = sb.position.z;
@@ -327,7 +351,8 @@ void NewtonSidecarUrdfBackend::publishStaticWorld()
     // would let a consumer hold shapes from one registration and poses meant for another; keeping
     // them here makes that impossible by construction.
     uint32_t kin = 0;
-    for (const urdf::KinematicBody& kb : impl_->kinematic) {
+    for (size_t k = 0; k < impl_->kinematic.size(); ++k) {
+        const urdf::KinematicBody& kb = impl_->kinematic[k];
         if (kin >= kMaxKinematicBodies) { truncated = true; break; }
         uint32_t need_shapes = 0, need_verts = 0, need_indices = 0;
         for (const urdf::StaticShape& ss : kb.shapes) {
@@ -342,11 +367,39 @@ void NewtonSidecarUrdfBackend::publishStaticWorld()
             break;
         }
         WireKinematicBody& wk = b->kinematic[kin];
-        std::snprintf(wk.name, kMaxStaticNameChars, "%s", kb.name.c_str());
+        // ⚠ KEEP THE TAIL, NOT THE HEAD. These names are Unreal path names —
+        // "/Game/FlyingCPP/Maps/UEDPIE_0_execo_test.execo_test:PersistentLevel.StaticMeshActor_0
+        // .StaticMeshComponent0" — and a 64-character head truncation keeps the map path, which is
+        // identical for every actor in the level, and discards the actor name, which is the only
+        // part anyone needs. Reported 2026-08-27 when a contact list named the object the robot was
+        // stuck against as "...execo_test:PersistentL" and could not distinguish it from anything
+        // else in the map.
+        copyTailName(wk.name, kMaxStaticNameChars, kb.name);
         wk.friction = kb.friction;
         wk.restitution = kb.restitution;
+        // ⚠ DEFAULTS ARE BOTH ON. An actor with no NewtonPhysicsComponent must behave exactly as
+        // it did before the component existed; the flags are narrowed only where one was authored.
+        wk.interact_with_mpm = 1;
+        wk.collide_with_robots = 1;
+        auto it = impl_->kinematic_flags.find(kb.name);
+        if (it != impl_->kinematic_flags.end()) {
+            wk.interact_with_mpm = it->second.first ? 1u : 0u;
+            wk.collide_with_robots = it->second.second ? 1u : 0u;
+        }
         wk.shape_start = shapes;
         wk.shape_count = need_shapes;
+        // ⚠ SHIFTED INTO THE SIDECAR'S FRAME, like every other pose on this wire. The registration
+        // pose is in the solver frame; the sidecar builds in its own.
+        const auto& kpose = (k < impl_->kinematic_poses.size())
+                                ? impl_->kinematic_poses[k]
+                                : Impl::KinPose{kb.position, kb.orientation};
+        wk.position.x = kpose.position.x - impl_->frame_offset.x;
+        wk.position.y = kpose.position.y - impl_->frame_offset.y;
+        wk.position.z = kpose.position.z - impl_->frame_offset.z;
+        wk.orientation.x = kpose.orientation.x;
+        wk.orientation.y = kpose.orientation.y;
+        wk.orientation.z = kpose.orientation.z;
+        wk.orientation.w = kpose.orientation.w;
         for (const urdf::StaticShape& ss : kb.shapes) {
             WireStaticShape& ws = b->shapes[shapes++];
             ws.kind = static_cast<uint32_t>(ss.kind);
@@ -415,6 +468,15 @@ bool NewtonSidecarUrdfBackend::staticWorldPublished() const
     return impl_->static_published;
 }
 
+void NewtonSidecarUrdfBackend::setKinematicFlags(const std::string& name, bool interact_with_mpm,
+                                                 bool collide_with_robots)
+{
+    // ⚠ KEYED BY NAME, and set BEFORE addKinematicBody, because the caller resolves the authored
+    // component from the Unreal actor and the sidecar only ever sees the name.
+    impl_->kinematic_flags[name] = {interact_with_mpm, collide_with_robots};
+    impl_->static_published = false;
+}
+
 int NewtonSidecarUrdfBackend::addKinematicBody(const urdf::KinematicBody& body)
 {
     // ⚠ REGISTERED HERE, PUBLISHED WITH THE STATIC WORLD. Both halves of the level mirror are known
@@ -463,9 +525,14 @@ void NewtonSidecarUrdfBackend::buildFromUrdf(const urdf::Robot& model,
     // its own copy of the same file; this side never integrates anything. Keeping the name list in
     // URDF order matters because every consumer above (sensors, ROS, the render component)
     // addresses links by the index this vector defines.
+    impl_->link_collisions.clear();
     for (const auto& link : model.links) {
         link_names_.push_back(link.name);
         total_mass_ += link.inertial.mass;
+        // ⚠ KEPT FOR THE OVERLAY ONLY. Nothing here is simulated on this side; these are the URDF's
+        // own collision primitives, drawn at the poses Newton reports so an operator can see where
+        // the solver believes the robot is rather than infer it from what the sand does.
+        impl_->link_collisions.push_back(link.collisions);
     }
     for (const auto& joint : model.joints)
         joint_names_.push_back(joint.name);
@@ -1032,6 +1099,270 @@ void NewtonSidecarUrdfBackend::applyExternalWrench(size_t, const urdf::Wrench&)
             "on Box3D/MuJoCo. This is reported once per run.",
             common_utils::Utils::kLogLevelError);
     }
+}
+
+namespace
+{
+
+/// Turn one URDF collision primitive into an overlay geom, placed by `body` in the solver frame.
+///
+/// ⚠ The URDF's own `origin` is body-LOCAL, so it composes with the body pose rather than replacing
+/// it. Getting that wrong draws every shape at its link's origin, which looks plausible on a wheel
+/// whose collision is centred and wrong on everything else.
+bool overlayGeomFromCollision(const urdf::Collision& c, const urdf::LinkPose& body,
+                              urdf::CollisionShape::Provenance provenance,
+                              urdf::CollisionShape& out, std::string& unhandled_kind)
+{
+    const urdf::Vec3 local = c.origin.xyz;
+    const urdf::Quat body_q = body.orientation;
+
+    // world = body_pos + R(body_q) * local
+    const double x = body_q.x, y = body_q.y, z = body_q.z, w = body_q.w;
+    const double xx = x * x, yy = y * y, zz = z * z;
+    const double xy = x * y, xz = x * z, yz = y * z;
+    const double wx = w * x, wy = w * y, wz = w * z;
+    out.position.x = body.position.x +
+        (1 - 2 * (yy + zz)) * local.x + 2 * (xy - wz) * local.y + 2 * (xz + wy) * local.z;
+    out.position.y = body.position.y +
+        2 * (xy + wz) * local.x + (1 - 2 * (xx + zz)) * local.y + 2 * (yz - wx) * local.z;
+    out.position.z = body.position.z +
+        2 * (xz - wy) * local.x + 2 * (yz + wx) * local.y + (1 - 2 * (xx + yy)) * local.z;
+
+    // ⚠ THE URDF ORIGIN'S rpy IS NOT OPTIONAL, and omitting it made this overlay lie.
+    //
+    // An earlier version dropped it "for primitives whose orientation the overlay does not need to
+    // be exact about". That is false for the most important primitive in the scene: a wheel's
+    // collision cylinder carries rpy = (pi/2, 0, 0) to lay its axis along the axle, so dropping it
+    // draws every wheel rotated 90 degrees — as a flipper rather than a wheel. Reported on
+    // 2026-08-27 as "Newton must be seeing flippers", which is exactly what a diagnostic that
+    // misdraws orientation is for: producing confident wrong conclusions about the solver.
+    //
+    // world_q = body_q * rpy_q, fixed-axis roll/pitch/yaw as URDF defines it.
+    const urdf::Vec3 rpy = c.origin.rpy;
+    const double cr = std::cos(rpy.x * 0.5), sr = std::sin(rpy.x * 0.5);
+    const double cp = std::cos(rpy.y * 0.5), sp = std::sin(rpy.y * 0.5);
+    const double cy = std::cos(rpy.z * 0.5), sy = std::sin(rpy.z * 0.5);
+    const urdf::Quat lq{sr * cp * cy - cr * sp * sy,
+                        cr * sp * cy + sr * cp * sy,
+                        cr * cp * sy - sr * sp * cy,
+                        cr * cp * cy + sr * sp * sy};
+    out.orientation = urdf::Quat{
+        body_q.w * lq.x + body_q.x * lq.w + body_q.y * lq.z - body_q.z * lq.y,
+        body_q.w * lq.y - body_q.x * lq.z + body_q.y * lq.w + body_q.z * lq.x,
+        body_q.w * lq.z + body_q.x * lq.y - body_q.y * lq.x + body_q.z * lq.w,
+        body_q.w * lq.w - body_q.x * lq.x - body_q.y * lq.y - body_q.z * lq.z};
+    out.provenance = provenance;
+
+    switch (c.geometry.type) {
+    case urdf::GeometryType::Sphere:
+        out.kind = urdf::CollisionShape::Kind::Sphere;
+        out.radius = c.geometry.radius;
+        return true;
+    case urdf::GeometryType::Cylinder:
+        out.kind = urdf::CollisionShape::Kind::Cylinder;
+        out.radius = c.geometry.radius;
+        out.half_length = 0.5 * c.geometry.length;
+        return true;
+    case urdf::GeometryType::Box:
+        out.kind = urdf::CollisionShape::Kind::Box;
+        out.half_extents = urdf::Vec3{0.5 * c.geometry.box_size.x, 0.5 * c.geometry.box_size.y,
+                                      0.5 * c.geometry.box_size.z};
+        return true;
+    case urdf::GeometryType::Mesh:
+    default:
+        // ⚠ COUNTED, NOT DRAWN. Re-loading every collision mesh to draw it would put a file read on
+        // the game thread; an overlay that quietly skipped them would be an overlay that is missing
+        // exactly the geometry a wheel actually collides with, with nothing saying so.
+        unhandled_kind = "mesh";
+        return false;
+    }
+}
+
+} // namespace
+
+bool NewtonSidecarUrdfBackend::collisionDebugGeometry(const urdf::CollisionDebugFilter& filter,
+                                                      urdf::CollisionDebugSnapshot& out) const
+{
+    out.backend = "newton-sidecar";
+    out.solver_time = impl_->have_latest ? impl_->latest.time : 0.0;
+
+    const bool have_radius = filter.radius > 0.0;
+    auto within = [&](const urdf::Vec3& p) {
+        if (!have_radius) return true;
+        const double dx = p.x - filter.center.x, dy = p.y - filter.center.y;
+        return (dx * dx + dy * dy) <= filter.radius * filter.radius;
+    };
+    std::string unhandled;
+    bool hull_boxes = false;
+    bool big_meshes = false;
+
+    // ---- the robot, as NEWTON reports it ---------------------------------------------------
+    //
+    // ⚠ REALISED, and it is the only Realised thing this backend can offer: these poses came back
+    // from the solver itself over the wire. If the overlay and the rendered robot disagree, the
+    // render is wrong; if the overlay and the sand disagree, the sand is telling the truth.
+    if (filter.include_robots && impl_->have_latest) {
+        for (size_t l = 0; l < link_names_.size() && l < impl_->link_collisions.size(); ++l) {
+            const urdf::LinkPose pose = getLinkPose(l);
+            if (!within(pose.position)) continue;
+            for (const urdf::Collision& c : impl_->link_collisions[l]) {
+                if (out.geoms.size() >= filter.max_geoms) { ++out.omitted; continue; }
+                urdf::CollisionShape g;
+                if (overlayGeomFromCollision(c, pose, urdf::CollisionShape::Provenance::Realised,
+                                             g, unhandled))
+                    out.geoms.push_back(std::move(g));
+                else
+                    ++out.omitted;
+            }
+        }
+    }
+
+    // ---- mirrored level actors, as WE SENT THEM --------------------------------------------
+    //
+    // ⚠ SUBMITTED, deliberately marked as such. These are drawn where this side TOLD the sidecar to
+    // put them, not where the sidecar has them — and that distinction is the whole diagnostic when
+    // a robot reacts to an object the sand ignores. If the overlay sits on the Unreal actor, the
+    // pose is leaving here correctly and the problem is downstream.
+    if (filter.include_world) {
+        for (size_t k = 0; k < impl_->kinematic.size() && k < impl_->kinematic_poses.size(); ++k) {
+            const auto& kp = impl_->kinematic_poses[k];
+            urdf::LinkPose pose;
+            pose.position = kp.position;
+            pose.orientation = kp.orientation;
+            if (!within(pose.position)) continue;
+            for (const urdf::StaticShape& ss : impl_->kinematic[k].shapes) {
+                if (out.geoms.size() >= filter.max_geoms) { ++out.omitted; continue; }
+                urdf::CollisionShape g;
+                g.provenance = urdf::CollisionShape::Provenance::Submitted;
+                g.position = pose.position;
+                g.orientation = pose.orientation;
+                switch (ss.kind) {
+                case urdf::StaticShapeKind::Sphere:
+                    g.kind = urdf::CollisionShape::Kind::Sphere;
+                    g.radius = ss.radius;
+                    break;
+                case urdf::StaticShapeKind::Capsule:
+                    g.kind = urdf::CollisionShape::Kind::Capsule;
+                    g.radius = ss.radius;
+                    g.half_length = 0.5 * std::sqrt(
+                        (ss.center_b.x - ss.center_a.x) * (ss.center_b.x - ss.center_a.x) +
+                        (ss.center_b.y - ss.center_a.y) * (ss.center_b.y - ss.center_a.y) +
+                        (ss.center_b.z - ss.center_a.z) * (ss.center_b.z - ss.center_a.z));
+                    break;
+                default: {
+                    // ⚠ REAL TRIANGLES WHEN WE HAVE THEM. A cooked mesh carries indices, so draw
+                    // the actual surface — a cone drawn as its bounding cube reads as "Newton has
+                    // a cube there", which is a claim about the solver that the overlay is not
+                    // entitled to make. Reported as exactly that on 2026-08-27.
+                    if (ss.indices.size() >= 3 && !ss.points.empty()) {
+                        g.kind = urdf::CollisionShape::Kind::Mesh;
+                        g.vertices = ss.points;
+                        g.indices = ss.indices;
+                        break;
+                    }
+                    // A hull arrives as a point cloud with no triangles, and triangulating it here
+                    // would put a convex hull on the game thread every frame. The bounding box is
+                    // the honest fallback — it answers "is the object where I think it is" — and it
+                    // is COUNTED as an approximation rather than passed off as the shape.
+                    double mx = 0, my = 0, mz = 0;
+                    for (const urdf::Vec3& p : ss.points) {
+                        mx = std::max(mx, std::abs(p.x));
+                        my = std::max(my, std::abs(p.y));
+                        mz = std::max(mz, std::abs(p.z));
+                    }
+                    if (mx <= 0 && my <= 0 && mz <= 0) { ++out.omitted; continue; }
+                    g.kind = urdf::CollisionShape::Kind::Box;
+                    g.half_extents = urdf::Vec3{mx, my, mz};
+                    hull_boxes = true;
+                    break;
+                }
+                }
+                out.geoms.push_back(std::move(g));
+            }
+        }
+    }
+
+    // ---- the mirrored STATIC level, radius-filtered ----------------------------------------
+    //
+    // ⚠ THIS WAS EXCLUDED AND THAT WAS THE WRONG CALL. It was left out because it is 172 bodies and
+    // 39 696 triangles on Blocks and "does not move" — but the level mirror includes every BLOCKING
+    // component, and a blocking volume is invisible in the level by design. So the one class of
+    // geometry an operator cannot see in Unreal was the one class this overlay refused to draw, and
+    // the result was a robot colliding with thin air and no way to look at what it hit.
+    //
+    // The filter's radius is what makes it affordable: at the default 15 m only the handful of
+    // bodies near the camera are emitted, and max_geoms still caps it.
+    if (filter.include_world && impl_->static_world != nullptr) {
+        for (const urdf::StaticBody& sb : impl_->static_world->bodies) {
+            for (const urdf::StaticShape& ss : sb.shapes) {
+                // ⚠ TEST THE SHAPE'S EXTENT, NOT THE BODY'S ORIGIN. An earlier version rejected a
+                // body whose ORIGIN was outside the radius, which excluded everything on Blocks:
+                // its ground is a single 40 km mesh whose origin is kilometres from the camera
+                // while its triangles are under the wheels. The overlay drew nothing at all and
+                // looked like the static world had not been mirrored.
+                double bound = ss.radius;
+                for (const urdf::Vec3& p : ss.points) {
+                    const double d = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+                    bound = std::max(bound, d);
+                }
+                if (have_radius) {
+                    const double dx = sb.position.x - filter.center.x;
+                    const double dy = sb.position.y - filter.center.y;
+                    if (std::sqrt(dx * dx + dy * dy) - bound > filter.radius) continue;
+                }
+                // ⚠ AND SKIP THE ENORMOUS ONES. A 40 km ground mesh now PASSES the test above, and
+                // drawing 39 696 triangles of it would bury the small blocking volumes this
+                // overlay exists to reveal — and those are the only geometry that is invisible in
+                // the level to begin with. Counted, so the omission is never silent.
+                if (ss.indices.size() / 3 > 2000) {
+                    ++out.omitted;
+                    big_meshes = true;
+                    continue;
+                }
+                if (out.geoms.size() >= filter.max_geoms) { ++out.omitted; continue; }
+                urdf::CollisionShape g;
+                g.provenance = urdf::CollisionShape::Provenance::Submitted;
+                g.position = sb.position;
+                g.orientation = sb.orientation;
+                if (ss.kind == urdf::StaticShapeKind::Sphere) {
+                    g.kind = urdf::CollisionShape::Kind::Sphere;
+                    g.radius = ss.radius;
+                }
+                else if (ss.indices.size() >= 3 && !ss.points.empty()) {
+                    g.kind = urdf::CollisionShape::Kind::Mesh;
+                    g.vertices = ss.points;
+                    g.indices = ss.indices;
+                }
+                else {
+                    double mx = 0, my = 0, mz = 0;
+                    for (const urdf::Vec3& p : ss.points) {
+                        mx = std::max(mx, std::abs(p.x));
+                        my = std::max(my, std::abs(p.y));
+                        mz = std::max(mz, std::abs(p.z));
+                    }
+                    if (mx <= 0 && my <= 0 && mz <= 0) { ++out.omitted; continue; }
+                    g.kind = urdf::CollisionShape::Kind::Box;
+                    g.half_extents = urdf::Vec3{mx, my, mz};
+                    hull_boxes = true;
+                }
+                out.geoms.push_back(std::move(g));
+            }
+        }
+    }
+
+    if (!unhandled.empty())
+        out.omitted_kinds.push_back(unhandled);
+    // ⚠ SAY WHERE THE PICTURE IS AN APPROXIMATION. A bounding box drawn for a hull is in the right
+    // place and the wrong shape, and an operator reading it as the solver's actual geometry will
+    // conclude the wrong thing about a cone.
+    if (hull_boxes)
+        out.omitted_kinds.push_back("hull (drawn as its bounding box, not its true shape)");
+    if (big_meshes)
+        out.omitted_kinds.push_back("static mesh >2000 tris (the level's ground; you can see it)");
+    // ⚠ SAY WHAT IS NOT HERE. The mirrored STATIC level is deliberately absent: it is 172 bodies and
+    // 39 696 triangles on Blocks, it does not move, and drawing it would bury the two things that
+    // do. It is reported as an omitted kind so the overlay never implies the level was not sent.
+    return true;
 }
 
 bool NewtonSidecarUrdfBackend::isConnected() const

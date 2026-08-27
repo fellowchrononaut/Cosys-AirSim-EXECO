@@ -41,6 +41,7 @@
 #pragma once
 
 #include "urdf/UrdfRobotBackend.hpp"
+#include "urdf/UrdfCollisionDebug.hpp"
 
 #include <chrono>
 #include <memory>
@@ -98,6 +99,11 @@ public:
     bool needsScaffoldingGroundPlane() const override { return false; }
 
     int addKinematicBody(const urdf::KinematicBody& body) override;
+    /// Narrow what a named mirrored actor is solid to, from an authored NewtonPhysicsComponent.
+    /// ⚠ Call BEFORE addKinematicBody: both default to true, so an actor with no component keeps
+    /// exactly the behaviour it had before the component existed.
+    void setKinematicFlags(const std::string& name, bool interact_with_mpm,
+                           bool collide_with_robots);
     void setKinematicPose(int handle, const urdf::Vec3& position,
                           const urdf::Quat& orientation) override;
 
@@ -134,6 +140,19 @@ public:
     void applyExternalWrench(size_t link, const urdf::Wrench& wrench) override;
 
     // ---- diagnostics -------------------------------------------------------------------
+
+    /// ⚠ THE OVERLAY EXISTS BECAUSE THIS BACKEND'S GEOMETRY IS IN ANOTHER PROCESS. With Box3D and
+    /// MuJoCo an operator can at least reason about shapes the same process built; here the solver
+    /// is a separate program and the only evidence of where anything is has been the sand's
+    /// reaction to it. That cost two wrong diagnoses on 2026-08-27 — "the mirrored ball is frozen
+    /// at its build pose" was inferred from sand displacement and was wrong.
+    ///
+    /// ⚠ PROVENANCE IS NOT DECORATION HERE. Vehicle links are `Realised`: their poses come back
+    /// from Newton itself over the wire, so they are what the solver actually has. Mirrored actors
+    /// are `Submitted`: they are drawn where we TOLD the sidecar to put them, which is exactly the
+    /// claim that needs checking when a robot reacts to something the sand ignores.
+    bool collisionDebugGeometry(const urdf::CollisionDebugFilter& filter,
+                                urdf::CollisionDebugSnapshot& out) const override;
 
     /// True once a pose block with our vehicle in it has been read at least once.
     bool isConnected() const;

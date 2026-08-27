@@ -28,6 +28,7 @@
 // always-on src/mpm/*.cpp glob, exactly like the rest of the MPM link, so it is available in every
 // build and needs no "is it in this build" story.
 #include "mpm/NewtonSidecarUrdfBackend.hpp"
+#include "NewtonPhysicsComponent.h"
 
 #include "HAL/PlatformFileManager.h"
 #include "Interfaces/IPluginManager.h"
@@ -2013,6 +2014,23 @@ void UrdfBotSimApi::coordinatedPostSolve(double dt)
 // ---------------------------------------------------------------------------------------------
 // GAME THREAD, under physics_world_->lock()
 // ---------------------------------------------------------------------------------------------
+namespace
+{
+/// ⚠ HOW OFTEN TO LOOK FOR NEW MOVABLE ACTORS, in seconds. Anything spawned after the level loaded
+/// — an object an operator drops in, a vehicle added at runtime — does not exist to a solver that
+/// only mirrored the world once. Rate-limited in wall time because each scan walks the level.
+///
+/// ⚠ Every newly registered body forces the consuming backend to rebuild, because a Newton model is
+/// immutable once finalised: a body cannot be added to a built model. So this trades "the object is
+/// invisible to physics" for "a rebuild pause when it appears", and 2 s is slow enough that a
+/// handful of objects dropped in succession coalesce into few rebuilds rather than one each.
+TAutoConsoleVariable<float> CVarUrdfKinematicRefreshSeconds(
+    TEXT("airsim.UrdfKinematicRefreshSeconds"), 2.0f,
+    TEXT("Seconds between re-scans for newly spawned movable actors to mirror into the solver.\n"
+         "Only applies to backends that consume kinematic bodies. 0 disables."),
+    ECVF_Default);
+} // namespace
+
 void UrdfBotSimApi::refreshKinematicMirror()
 {
     // ⚠ WHY THIS EXISTS. The level mirror is memoised per UWorld and is therefore built exactly
@@ -2087,9 +2105,65 @@ void UrdfBotSimApi::refreshKinematicMirror()
         if (src->GetOwner() == getPawn()) continue;   // never mirror yourself
         if (tracked.count(src) != 0) continue;        // already registered
 
+        // ⚠ AN AUTHORED COMPONENT OVERRIDES THE SCAN, IN BOTH DIRECTIONS. Without this the only
+        // way to control what reaches the sand solver is a level-wide heuristic, and both failure
+        // directions are silent: an object the operator wanted is absent and the sand ignores it,
+        // or one they did not want is mirrored and quietly costs a solver rebuild.
+        //
+        // ⚠ ABSENT MEANS "ASK THE SCAN", NOT "DO NOT MIRROR". Adding the component to one crate
+        // must not change the meaning of every other crate in the level.
+        UNewtonPhysicsComponent::FResolved authored;
+        const bool has_component =
+            UNewtonPhysicsComponent::ResolveFor(src->GetOwner(), authored);
+        float authored_friction = authored.Friction;
+        if (has_component) {
+            if (!authored.bMirror) {
+                UE_LOG(LogUrdfBot, Verbose,
+                       TEXT("kinematic mirror: '%s' has a NewtonPhysicsComponent with 'Mirror in "
+                            "sidecar' unticked - skipped deliberately"),
+                       *src->GetOwner()->GetName());
+                continue;
+            }
+            // ⚠ REFUSED, NOT SILENTLY DOWNGRADED. A crate that sinks when the operator asked for
+            // one that floats is exactly the quiet wrong answer this seam exists to prevent.
+            if (authored.Role == ENewtonPhysicsRole::SolveInSidecar) {
+                UE_LOG(LogUrdfBot, Error,
+                       TEXT("'%s' asks for NewtonPhysics Role=SolveInSidecar, which is NOT "
+                            "IMPLEMENTED. It is being skipped rather than mirrored one-way, "
+                            "because a mirrored object falls THROUGH sand and a solved one would "
+                            "rest ON it. Set Role=MirrorToSidecar if one-way is what you want."),
+                       *src->GetOwner()->GetName());
+                continue;
+            }
+        }
+
+        // ⚠ COPIED, not mutated in place: `mirror.World` is a shared const cook — the same one every
+        // robot in the level consumes — so writing this robot's authored friction into it would
+        // change what every OTHER robot feels against the same crate.
+        urdf::KinematicBody body = mirror.World->kinematic[i];
+        body.friction = authored_friction;
+
+        // ⚠ NARROWED ONLY WHEN AUTHORED, and set BEFORE the body is registered — the backend keys
+        // the flags by name and reads them when it publishes. Both default to true so an actor
+        // without the component behaves exactly as it did before the component existed.
+        if (has_component && (!authored.bInteractWithMpm || !authored.bCollideWithRobots)) {
+            if (!authored.bInteractWithMpm && !authored.bCollideWithRobots) {
+                UE_LOG(LogUrdfBot, Warning,
+                       TEXT("'%s' is mirrored but is solid to NEITHER the sand nor the robots - "
+                            "it will be registered and nothing will be able to touch it. Untick "
+                            "'Mirror in sidecar' instead if that is what you meant."),
+                       *src->GetOwner()->GetName());
+            }
+            if (std::strcmp(backend->backendName(), "NewtonSidecar") == 0) {
+                static_cast<msr::airlib::mpm::NewtonSidecarUrdfBackend*>(backend)
+                    ->setKinematicFlags(body.name, authored.bInteractWithMpm,
+                                        authored.bCollideWithRobots);
+            }
+        }
+
         KinematicMirror km;
         km.component = mirror.KinematicSources[static_cast<int32>(i)];
-        km.handle = backend->addKinematicBody(mirror.World->kinematic[i]);
+        km.handle = backend->addKinematicBody(body);
         kinematic_mirrors_.push_back(km);
         ++added;
     }
@@ -2219,6 +2293,30 @@ void UrdfBotSimApi::updateRenderedState(float dt)
         --kinematic_refresh_frames_;
         refreshKinematicMirror();
     }
+    // ⚠ AND KEEP LOOKING, otherwise nothing spawned after the first eight frames exists to the
+    // solver at all. The countdown above was written to catch other URDF robots still being
+    // spawned during initialisation; it was never meant to catch an object an operator drops into
+    // the level three minutes in. Measured 2026-08-27: a sphere ejected with F8 fell through the
+    // sand and landed on the floor, because Newton had never been told it existed — the mirror
+    // still read "tracking 1 bodies", the number it had at load.
+    //
+    // ⚠ RATE-LIMITED IN WALL TIME, not per frame. refreshKinematicMirror walks the level through
+    // UrdfWorldGeometry::MirrorVehicles; doing that every tick would put a world traversal on the
+    // game thread at frame rate. Seconds, not frames, so the cost does not scale with how fast the
+    // renderer happens to be running.
+    //
+    // ⚠ ONLY FOR BACKENDS THAT CONSUME THEM. Box3D and MuJoCo mirror kinematic bodies too, but
+    // they were doing so happily with the eight-frame rule; turning a periodic world walk on for
+    // every urdfbot to serve one backend would be a cost paid by robots that did not ask for it.
+    // 0 disables.
+    const float refresh_seconds = CVarUrdfKinematicRefreshSeconds.GetValueOnGameThread();
+    if (refresh_seconds > 0.0f && backend_ != nullptr && backend_->mirrorsKinematicBodies()) {
+        kinematic_refresh_seconds_ += dt;
+        if (kinematic_refresh_seconds_ >= refresh_seconds) {
+            kinematic_refresh_seconds_ = 0.0f;
+            refreshKinematicMirror();
+        }
+    }
 
     // ⚠ Kinematic poses are pushed HERE, and this is the only correct place for them.
     //
@@ -2233,7 +2331,23 @@ void UrdfBotSimApi::updateRenderedState(float dt)
     // source of truth is Unreal's game thread and it cannot be sampled faster than it runs.
     for (const KinematicMirror& km : kinematic_mirrors_) {
         UPrimitiveComponent* c = km.component.Get();
-        if (c == nullptr) continue;  // actor destroyed mid-run: stop pushing, do not crash
+        if (c == nullptr) {
+            // ⚠ SAID OUT LOUD, BECAUSE THE OBJECT IS STILL SOLID. Skipping the push is the only
+            // thing that can be done here — a body cannot be removed from a finalised Newton model
+            // — so the destroyed actor stays in the solver, FROZEN at its last pose, invisible and
+            // still collided with. That is precisely the failure that cost an afternoon on
+            // 2026-08-27 ("see how it is colliding with the air?"), arriving by a different route,
+            // and the only defence until removal exists is that it announces itself.
+            if (!kinematic_orphan_warned_) {
+                kinematic_orphan_warned_ = true;
+                UE_LOG(LogUrdfBot, Warning,
+                       TEXT("a mirrored actor was destroyed while '%s' was driving. It CANNOT be "
+                            "removed from the solver, so it remains as an invisible solid body at "
+                            "the pose it was destroyed in. Restart PIE to clear it."),
+                       UTF8_TO_TCHAR(getVehicleName().c_str()));
+            }
+            continue;
+        }
         const FTransform tm = c->GetComponentTransform();
         const float w2m = getNedTransform().fromNed(1.0f);
         backend_->setKinematicPose(km.handle, UrdfTransform::toUrdfVec(tm.GetTranslation(), w2m),

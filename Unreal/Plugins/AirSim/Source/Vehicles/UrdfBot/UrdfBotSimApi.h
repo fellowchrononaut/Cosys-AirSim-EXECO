@@ -160,6 +160,8 @@ private:
     /// kinematic half on the game thread once everything exists is what makes Box3D robots
     /// interact with each other at all.
     int kinematic_refresh_frames_ = 8;
+    /// Wall-clock accumulator for the periodic re-scan. See airsim.UrdfKinematicRefreshSeconds.
+    float kinematic_refresh_seconds_ = 0.0f;
 
     /// Re-collect kinematic bodies and register any that are not already tracked.
     ///
@@ -171,6 +173,8 @@ private:
     /// Whether THIS robot maintains the world's kinematic obstacle mirror. Always true in Legacy
     /// mode, where each robot owns a private world; in a shared world exactly one robot claims it.
     bool owns_kinematic_mirror_ = true;
+    /// Said once when a mirrored actor is destroyed mid-run; see updateRenderedState.
+    bool kinematic_orphan_warned_ = false;
 
     /// Last drive axes written to the log, so the diagnostic fires on change rather than at 333 Hz.
     float last_logged_throttle_ = 0.0f;

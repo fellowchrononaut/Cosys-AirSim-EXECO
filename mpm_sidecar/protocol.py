@@ -340,8 +340,23 @@ class WireKinematicBody(ctypes.Structure):
         ("name", ctypes.c_char * MAX_STATIC_NAME_CHARS),
         ("shape_start", ctypes.c_uint32),
         ("shape_count", ctypes.c_uint32),
+        # ⚠ SOLID TO THE SAND AND SOLID TO THE ROBOT ARE SEPARATE, and they fail separately: on
+        # 2026-08-27 a mirrored sphere collided with the robot while the sand ignored it entirely.
+        # Carrying both makes that a choice rather than a mystery, and lets a large moving object
+        # stay in the scene without paying for it in the MPM contact solve.
+        ("interact_with_mpm", ctypes.c_uint32),
+        ("collide_with_robots", ctypes.c_uint32),
         ("friction", ctypes.c_double),
         ("restitution", ctypes.c_double),
+        # ⚠ WHERE THE ACTOR WAS WHEN IT WAS REGISTERED, and building the body anywhere else is a
+        # bug that only a MOVING object recovers from. The sidecar used to build every mirrored
+        # body at the identity transform and rely on the per-tick pose to move it there; a cone
+        # that never moves therefore sat at the sidecar's ORIGIN — an invisible solid a metre in
+        # front of the robot's spawn — while the overlay drew it correctly 9 m away, because the
+        # overlay draws where Unreal says it is. Reported 2026-08-27 as "the scout is colliding
+        # with the air".
+        ("position", WireVec3),
+        ("orientation", WireQuat),
     ]
 
     def label(self) -> str:

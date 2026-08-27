@@ -388,8 +388,19 @@ struct WireKinematicBody {
     char name[kMaxStaticNameChars] = {};
     uint32_t shape_start = 0;
     uint32_t shape_count = 0;
+    /// ⚠ SOLID TO THE SAND AND SOLID TO THE ROBOT ARE SEPARATE, and they fail separately: a
+    /// mirrored sphere collided with the robot while the sand ignored it entirely (2026-08-27).
+    /// Carrying both makes that a choice rather than a mystery.
+    uint32_t interact_with_mpm = 1;
+    uint32_t collide_with_robots = 1;
     double friction = 0.7;
     double restitution = 0;
+    /// ⚠ WHERE THE ACTOR WAS WHEN IT WAS REGISTERED. The sidecar must BUILD the body here; building
+    /// at the identity and relying on the per-tick pose to move it means a stationary object sits
+    /// at the sidecar's origin forever - an invisible solid in front of the robot's spawn, while
+    /// the overlay correctly draws it metres away. Reported 2026-08-27 as "colliding with the air".
+    WireVec3 position;
+    WireQuat orientation;
 };
 
 /// ⚠ POSITIONALLY MATCHED to the kinematic array in the static world block, not keyed by name. A
@@ -598,7 +609,7 @@ static_assert(sizeof(WireVec3) == 24, "WireVec3 must be 3 packed doubles");
 static_assert(sizeof(WireQuat) == 32, "WireQuat must be 4 packed doubles");
 static_assert(sizeof(WireStaticShape) == 80, "WireStaticShape layout changed");
 static_assert(sizeof(WireStaticBody) == 144, "WireStaticBody layout changed");
-static_assert(sizeof(MpmStaticWorldBlock) == 24243272, "MpmStaticWorldBlock layout changed");
+static_assert(sizeof(MpmStaticWorldBlock) == 24247368, "MpmStaticWorldBlock layout changed");
 static_assert(sizeof(WireJointCommand) == 80, "WireJointCommand layout changed");
 static_assert(sizeof(WireVehicleCommand) == 5192, "WireVehicleCommand layout changed");
 static_assert(sizeof(MpmVehicleCommandBlock) == 24432, "MpmVehicleCommandBlock layout changed");

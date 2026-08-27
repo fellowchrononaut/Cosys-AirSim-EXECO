@@ -180,6 +180,9 @@ class OwnVehicle:
         self.spec = spec
         self.body_start = 0
         self.body_end = 0
+        # Length of the vehicle's own prefix of joint_q / joint_qd — see add_to().
+        self.coord_count = 0
+        self.dof_count = 0
         self.drive_dofs: list = []
         self.wheel_bodies: list = []
         self.bodies: list = []
@@ -215,6 +218,15 @@ class OwnVehicle:
         )
         self.body_end = builder.body_count
         self.bodies = list(range(self.body_start, self.body_end))
+
+        # ⚠ THE VEHICLE IS BUILT FIRST, so its coordinates occupy a PREFIX of joint_q/joint_qd and
+        # these two counts are that prefix's length. Recorded because a rebuild caused by a newly
+        # mirrored actor CHANGES joint_count — every mirrored body adds a fixed joint — so carrying
+        # the robot's pose across such a rebuild by copying the whole array would compare arrays of
+        # different lengths, and copying the shorter one would write a base coordinate over a
+        # mirrored actor's joint.
+        self.coord_count = int(builder.joint_coord_count)
+        self.dof_count = int(builder.joint_dof_count)
 
         if spec.sand_links not in ("all", "wheels"):
             raise SystemExit(f"sand_links must be 'all' or 'wheels', not {spec.sand_links!r}")

@@ -47,6 +47,231 @@ if os.path.isdir(os.path.join(_VENDORED_NEWTON, "newton")):
 
 import protocol as P  # noqa: E402
 
+# ⚠ THE MPM SOLVER'S PER-PARTICLE HISTORY, named in one place. This is what makes a rut a rut
+# rather than a hole in the initial positions: the elastic strain, the plastic determinant and the
+# stress are how the sand remembers being compacted. Carrying particle_q alone across a rebuild
+# would restore the SHAPE of the bed and reset how packed it is, and the difference shows up as the
+# bed visibly relaxing a moment after a crate is dropped nearby.
+MPM_STATE_FIELDS = ("particle_qd_grad", "particle_elastic_strain", "particle_Jp",
+                    "particle_stress", "particle_transform")
+
+# Newton GeoType values, named here so the eviction code reads as geometry rather than as integers.
+_GEO_SPHERE, _GEO_CAPSULE, _GEO_CYLINDER, _GEO_BOX = 3, 4, 6, 7
+
+
+def _rot_matrix_xyzw(q):
+    """Rotation matrix from an xyzw quaternion. `pts @ R` takes world offsets into local."""
+    import numpy as np
+    x, y, z, w = (float(v) for v in q)
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _rotate_xyzw(q, v):
+    """Rotate vector `v` by xyzw quaternion `q`."""
+    import numpy as np
+    return _rot_matrix_xyzw(q) @ np.asarray(v, dtype=float)
+
+
+def _quat_mul_xyzw(a, b):
+    """Quaternion product a*b, both xyzw."""
+    import numpy as np
+    ax, ay, az, aw = (float(v) for v in a)
+    bx, by, bz, bw = (float(v) for v in b)
+    return np.array([aw * bx + ax * bw + ay * bz - az * by,
+                     aw * by - ax * bz + ay * bw + az * bx,
+                     aw * bz + ax * by - ay * bx + az * bw,
+                     aw * bw - ax * bx - ay * by - az * bz], dtype=float)
+
+
+_SYNC_BODYQ_KERNEL = None
+
+
+def _sync_bodyq_kernel():
+    """Kernel that writes a mirrored actor's CURRENT pose into state.body_q. Built on first use.
+
+    ⚠ WITHOUT THIS A MIRRORED ACTOR IS SOLID WHERE IT WAS BUILT, NOT WHERE IT IS. The two consumers
+    of a mirrored pose read it from different places:
+
+      * MuJoCo and the sand get it from `joint_X_p` — the mocap refresh, and `eval_fk` inside the
+        MuJoCo entry, both derive from `joint_X_p * inv(joint_X_c)`;
+      * `CollisionPipeline` gets it from `state.body_q`, which NEVER follows a mocap body.
+
+    So driving an actor with `joint_X_p` moves it for the sand and leaves a solid ghost of it, at
+    its build pose, for the robot. Measured in newton_probes/probe_kinematic_contact.py: a slab
+    built at z=-5 and driven to z=0.25 let a box fall straight through it (z=0.100), while the same
+    slab BUILT at 0.25 held it up (z=0.400). Reported by the operator on 2026-08-27 as "the sand
+    gets pushed by the sphere but the robot does not interact with it" — one sentence naming both
+    halves of exactly this split.
+    """
+    global _SYNC_BODYQ_KERNEL
+    if _SYNC_BODYQ_KERNEL is not None:
+        return _SYNC_BODYQ_KERNEL
+    import warp as wp
+
+    @wp.kernel
+    def sync(body_index: wp.array(dtype=wp.int32),          # noqa: F821
+             joint_index: wp.array(dtype=wp.int32),         # noqa: F821
+             joint_X_p: wp.array(dtype=wp.transform),       # noqa: F821
+             joint_X_c: wp.array(dtype=wp.transform),       # noqa: F821
+             body_q: wp.array(dtype=wp.transform)):         # noqa: F821
+        k = wp.tid()
+        j = joint_index[k]
+        body_q[body_index[k]] = joint_X_p[j] * wp.transform_inverse(joint_X_c[j])
+
+    _SYNC_BODYQ_KERNEL = sync
+    return _SYNC_BODYQ_KERNEL
+
+
+_EVICT_KERNEL = None
+
+
+def _evict_kernel():
+    """Warp kernel that pushes particles out of mirrored primitive colliders. Built on first use.
+
+    ⚠ ON THE GPU, EVERY SOLVE, AND THAT IS THE POINT. The host version of this runs once per model
+    build and cannot help with the case that actually bites: a mirrored actor FALLING into the bed.
+    Measured on 2026-08-27, a 0.5 m sphere dropped from 2.4 m crossed the whole bed between two
+    consecutive samples — over 0.7 m in one step, ten voxels — and came to rest holding 1963 grains
+    against a control volume's 1982. The bed's surface height did not change by a millimetre
+    through the entire impact. A collider that teleports past the grid cannot sweep, and MPM never
+    evicts what is already inside, so nothing else was ever going to move that sand.
+    """
+    global _EVICT_KERNEL
+    if _EVICT_KERNEL is not None:
+        return _EVICT_KERNEL
+    import warp as wp
+
+    @wp.kernel
+    def evict(particle_q: wp.array(dtype=wp.vec3),          # noqa: F821
+              particle_qd: wp.array(dtype=wp.vec3),         # noqa: F821
+              joint_X_p: wp.array(dtype=wp.transform),      # noqa: F821
+              joint_X_c: wp.array(dtype=wp.transform),      # noqa: F821
+              shape_index: wp.array(dtype=wp.int32),        # noqa: F821
+              shape_joint: wp.array(dtype=wp.int32),        # noqa: F821
+              shape_transform: wp.array(dtype=wp.transform),  # noqa: F821
+              shape_type: wp.array(dtype=wp.int32),         # noqa: F821
+              shape_scale: wp.array(dtype=wp.vec3),         # noqa: F821
+              skin: float,
+              floor_z: float,
+              moved: wp.array(dtype=wp.int32)):             # noqa: F821
+        i = wp.tid()
+        p = particle_q[i]
+        hit = int(0)
+        for k in range(shape_index.shape[0]):
+            si = shape_index[k]
+            jt = shape_joint[k]
+            # ⚠ FROM THE JOINT, NEVER FROM body_q. `state.body_q` does NOT follow a mirrored actor:
+            # it is a mocap body, MuJoCo drives it through its own state and nothing writes the
+            # pose back to the outer state. Measured — joint_X_p.z walked 0.850 -> 0.100 across six
+            # steps while body_q.z read 1.000 at every one of them. The first version of this
+            # kernel read body_q, found nothing inside a collider it believed was still at its
+            # build pose, and reported zero evictions while the sand sat inside the ball. The
+            # mocap refresh uses joint_X_p * inv(joint_X_c) and so must this.
+            X = (joint_X_p[jt] * wp.transform_inverse(joint_X_c[jt])) * shape_transform[si]
+            local = wp.transform_point(wp.transform_inverse(X), p)
+            sc = shape_scale[si]
+            t = shape_type[si]
+            out = local
+            inside = int(0)
+            # ⚠ THE FLOOR IS SOLID — and that is the whole constraint, not "never push a grain
+            # down". A ball pressing into sand DOES drive grains downward, and a rule forbidding
+            # that would be inventing physics to paper over a bug. What actually went wrong is
+            # narrower: the shortest exit from a ball RESTING ON the floor points straight through
+            # the floor, and a grain put below the ground collider falls forever. Measured as a
+            # matched pair in newton_probes/probe_falling_mirror.py — 0 grains below the ground
+            # with the eviction off, 53 with it on, the lowest 1.9 m down — and then reported by
+            # the sidecar as "SAND IS FALLING THROUGH", a message about the patch height that
+            # sends the reader somewhere else entirely.
+            #
+            # So: take the SHORTEST exit, and reject only the ones that land under the floor.
+            # `floor_z` is the same number the falling-through check uses, so the two cannot
+            # disagree about where the floor is.
+            if t == 3:                                   # SPHERE
+                r = sc[0] + skin
+                d = wp.length(local)
+                if d < r:
+                    inside = 1
+                    if d > 1.0e-9:
+                        out = local * (r / d)
+                    else:
+                        out = wp.vec3(0.0, 0.0, r)
+                    # If leaving radially would put it under the floor, leave SIDEWAYS at its own
+                    # height instead: on a sphere that exit is exact and no longer than the radial
+                    # one, and a grain already above the floor stays above it.
+                    if wp.transform_point(X, out)[2] < floor_z:
+                        up = wp.transform_vector(wp.transform_inverse(X), wp.vec3(0.0, 0.0, 1.0))
+                        h = local - up * wp.dot(local, up)
+                        hl = wp.length(h)
+                        rho = wp.sqrt(wp.max(r * r - wp.dot(local, up) * wp.dot(local, up), 0.0))
+                        if hl > 1.0e-9:
+                            out = up * wp.dot(local, up) + h * (rho / hl)
+                        else:
+                            e = wp.vec3(1.0, 0.0, 0.0) - up * up[0]
+                            out = up * wp.dot(local, up) + wp.normalize(e) * rho
+            elif t == 7:                                 # BOX
+                hx = wp.abs(sc[0]) + skin
+                hy = wp.abs(sc[1]) + skin
+                hz = wp.abs(sc[2]) + skin
+                if wp.abs(local[0]) < hx and wp.abs(local[1]) < hy and wp.abs(local[2]) < hz:
+                    inside = 1
+                    # ⚠ THE NEAREST FACE THAT DOES NOT LAND UNDER THE FLOOR. Six candidates,
+                    # judged in WORLD space because the floor is a world fact and the box may be
+                    # rotated. Downward faces are perfectly acceptable when there is room below.
+                    best = float(1.0e30)
+                    for f in range(6):
+                        q = local
+                        if f == 0:
+                            q = wp.vec3(hx, local[1], local[2])
+                        elif f == 1:
+                            q = wp.vec3(-hx, local[1], local[2])
+                        elif f == 2:
+                            q = wp.vec3(local[0], hy, local[2])
+                        elif f == 3:
+                            q = wp.vec3(local[0], -hy, local[2])
+                        elif f == 4:
+                            q = wp.vec3(local[0], local[1], hz)
+                        else:
+                            q = wp.vec3(local[0], local[1], -hz)
+                        w = wp.transform_point(X, q)
+                        if w[2] >= floor_z:
+                            dd = wp.length(q - local)
+                            if dd < best:
+                                best = dd
+                                out = q
+                    if best > 1.0e29:      # every face is under the floor: leave through the top
+                        out = wp.vec3(local[0], local[1], hz)
+            elif t == 4 or t == 6:                       # CAPSULE, CYLINDER (axis is local z)
+                r = sc[0] + skin
+                hl = sc[1] + skin
+                radial = wp.sqrt(local[0] * local[0] + local[1] * local[1])
+                if radial < r and wp.abs(local[2]) < hl:
+                    inside = 1
+                    if radial > 1.0e-9:
+                        out = wp.vec3(local[0] * r / radial, local[1] * r / radial, local[2])
+                    else:
+                        out = wp.vec3(r, 0.0, local[2])
+                    # A capsule resting on the floor has a radial exit that goes through it for
+                    # the grains underneath; leave through the end cap instead.
+                    if wp.transform_point(X, out)[2] < floor_z:
+                        out = wp.vec3(local[0], local[1], hl)
+            if inside == 1:
+                p = wp.transform_point(X, out)
+                hit = 1
+        if hit == 1:
+            particle_q[i] = p
+            # They were in an invalid state; do not launch them out of it.
+            particle_qd[i] = wp.vec3(0.0, 0.0, 0.0)
+            wp.atomic_add(moved, 0, 1)
+
+    _EVICT_KERNEL = evict
+    return _EVICT_KERNEL
+
 
 def report_newton_provenance() -> None:
     """Print where `newton` and `warp` were actually loaded from. Cheap, and it settles arguments."""
@@ -158,6 +383,15 @@ class Sidecar:
         self._static_settled = False
         self._spawn_position = (0.0, 0.0, 0.0)
         self._kinematic_bodies = []
+        self._kinematic_joints = []
+        self._mirror_shape_index = None
+        self._mirror_shape_joint = None
+        self._mirror_body_index = None
+        self._mirror_body_joint = None
+        self._mirror_evict_counter = None
+        self._mocap_warned = False
+        self._kin_revision_warned = False
+        self._kin_applied_logged = False
         self.requested_reset_epoch = 0
         self._applied_reset_epoch = 0
         self.control = None
@@ -1649,6 +1883,27 @@ class Sidecar:
               f"({self._spawn_position[0]:+.3f} {self._spawn_position[1]:+.3f} "
               f"{self._spawn_position[2]:+.3f})")
 
+        # ⚠ WHAT MPM ACTUALLY ACCEPTED AS A COLLIDER, not what we asked it to. A mirrored actor can
+        # be a perfectly good rigid body — the robot collides with it — while the sand has no
+        # collider for it at all, and the two facts look identical from outside: "the object is
+        # there" and "the sand ignores it". Reported at build so the question is answered before
+        # anyone drives into it.
+        try:
+            n_mpm = int(self.mpm.collider_body_index.numpy().shape[0])
+            expect = len(self.vehicle.bodies) + len(self._kinematic_bodies)
+            print(f"MPM colliders: {n_mpm} registered for {expect} proxied bodies "
+                  f"({len(self.vehicle.bodies)} vehicle + {len(self._kinematic_bodies)} mirrored)"
+                  + ("" if n_mpm >= expect else
+                     "   ⚠ FEWER THAN PROXIED — some bodies are solid to the ROBOT but invisible "
+                     "to the SAND"))
+        except Exception as error:
+            print(f"  (could not read the MPM collider set: {error})")
+
+        # ⚠ AFTER eval_fk, because it needs the mirrored bodies' WORLD poses, and before the first
+        # step, because a grain that starts inside a collider never leaves on its own.
+        self._prepare_mirror_eviction()
+        self._evict_sand_from_mirrors("build")
+
         print(f"built: vehicle '{spec.name}' + {self.particle_count} sand particles, "
               f"voxel {config.voxel_size} m, {self.args.own_vehicle_proxy_iterations} "
               f"fixed-point coupling iteration(s)")
@@ -1726,14 +1981,62 @@ class Sidecar:
         # it fell straight through (z=0.100) instead of resting (z=0.400). Outside the entry the
         # robot would drive through every mirrored crate while every counter reported healthy.
         self._kinematic_bodies = []
+        self._kinematic_joints = []
         for k in range(min(block.kinematic_count, P.MAX_KINEMATIC_BODIES)):
             wk = block.kinematic[k]
             # ⚠ mass=0 + is_kinematic: the simulator dictates this body's motion and Newton must
             # never integrate it. To the sand that reads as infinitely heavy, which is correct for
             # something whose position is decided elsewhere — and is exactly why the coupling is
             # one-way: the crate pushes the sand, the sand cannot push the crate.
-            body = builder.add_body(xform=wp.transform_identity(), mass=0.0, is_kinematic=True,
+            # ⚠ A KINEMATIC BODY NEEDS A JOINT TO BE DRIVEABLE, and the pose goes on the JOINT.
+            #
+            # SolverMuJoCo turns a kinematic body into a MuJoCo MOCAP body inside
+            # `add_body_from_joint` — so a body with NO joint is not mocap, it is frozen geometry
+            # compiled at its build pose. And mocap transforms are refreshed from
+            # `joint_X_p * inv(joint_X_c)`, never from `body_q`.
+            #
+            # Measured in newton_probes/probe_kinematic_motion.py: writing body_q on a jointless
+            # body left the mirrored object at its build pose for the whole run while the write was
+            # silently discarded. In-sim that presented as "the robot reacts to the ball but the
+            # sand ignores it" — the robot was colliding with a frozen ball at the sidecar origin,
+            # and the sand never saw it because the ball was never near the bed.
+            #
+            # ⚠ body_q IS NOT A VALID OBSERVABLE HERE either: MuJoCo drives a mocap body through
+            # its own state and need not write the pose back, so "body_q did not change" does not
+            # mean "the body did not move". The probe measures WHERE THE SAND IS DISTURBED instead.
+            # ⚠ BUILD IT WHERE IT ACTUALLY IS. Building at the identity and relying on the
+            # per-tick pose to move it there is what put a stationary cone at the sidecar's ORIGIN
+            # — an invisible solid body a metre in front of the robot's spawn, while the overlay
+            # correctly drew the cone 9 m away because the overlay draws where UNREAL says it is.
+            # The robot propped against nothing and every diagnosis of it was wrong for an hour.
+            #
+            # ⚠ This also means a mirrored object is in the right place even if the per-tick pose
+            # path fails entirely: a static one is simply correct, and a moving one is at least
+            # correct at t=0 rather than at the origin.
+            #
+            # ⚠ add_link, NOT add_body — add_body IS "link + FREE joint + articulation". Using it
+            # and then adding the fixed joint gave every mirrored actor TWO joints to the world,
+            # and Newton said so on every build: "A FREE joint parallel to another joint is
+            # inconsistent." MuJoCo then dropped one of them as an unmappable loop closure and
+            # picked the OTHER as the body's root, so which joint the per-tick pose had to be
+            # written to was decided by conversion-order rather than by this code. It also put
+            # seven junk coordinates per mirrored actor into joint_q. It happened to work; it was
+            # never the thing this comment claimed was being built.
+            kpos = np.array(wk.position.as_tuple(), dtype=float)
+            kquat = wk.orientation.as_xyzw()
+            kxform = wp.transform(wp.vec3(*kpos), wp.quat(*kquat))
+            body = builder.add_link(xform=kxform, mass=0.0, is_kinematic=True,
                                     label=f"mirror/{wk.label()}")
+            # ⚠ parent_xform IS WHAT PLACES IT, NOT the link's own xform. `add_link` records the
+            # body's world pose, but a FIXED joint's pose comes entirely from `joint_X_p`, which
+            # defaults to the IDENTITY — so add_link(xform=...) + add_joint_fixed() puts the body
+            # at the sidecar ORIGIN and eval_fk agrees. That is precisely the invisible-solid-body
+            # bug of 2026-08-27 ("see how it is colliding with the air?"), and switching from
+            # add_body to add_link reintroduced it, because add_body's auto FREE joint had been
+            # carrying the pose all along. Measured before and after rather than reasoned about:
+            # body_q read (0, 0, 0) without this argument and (3, -2, 1.5) with it.
+            joint = builder.add_joint_fixed(parent=-1, child=body, parent_xform=kxform)
+            builder.add_articulation([joint], label=f"mirror/{wk.label()}")
             cfg = newton.ModelBuilder.ShapeConfig(mu=float(wk.friction),
                                                   restitution=float(wk.restitution))
             n_added = 0
@@ -1743,8 +2046,24 @@ class Sidecar:
                 if self._add_wire_shape(builder, body, ws, verts, idx, cfg,
                                         wp.transform_identity()):
                     n_added += 1
+                    # ⚠ SOLID TO WHAT, decided per actor. Clearing COLLIDE_PARTICLES removes it
+                    # from the MPM contact solve; clearing COLLIDE_SHAPES removes it from the rigid
+                    # one. Both default on, so an actor whose author said nothing behaves exactly
+                    # as it did before these flags existed.
+                    sh = builder.shape_count - 1
+                    flags = int(builder.shape_flags[sh])
+                    if not int(wk.interact_with_mpm):
+                        flags &= ~int(newton.ShapeFlags.COLLIDE_PARTICLES)
+                    if not int(wk.collide_with_robots):
+                        flags &= ~int(newton.ShapeFlags.COLLIDE_SHAPES)
+                    builder.shape_flags[sh] = flags
             if n_added:
                 self._kinematic_bodies.append(body)
+                self._kinematic_joints.append(joint)
+                if not int(wk.interact_with_mpm) or not int(wk.collide_with_robots):
+                    print(f"  mirrored '{wk.label()}': "
+                          f"sand={'yes' if int(wk.interact_with_mpm) else 'NO'}, "
+                          f"robots={'yes' if int(wk.collide_with_robots) else 'NO'}")
                 added += n_added
             else:
                 skipped_kinds["kinematic (no usable shape)"] = \
@@ -1766,6 +2085,40 @@ class Sidecar:
         seg.close()
         return added
 
+    def _report_contacts(self) -> None:
+        """Print which non-vehicle bodies the vehicle is currently in contact with.
+
+        ⚠ THE ONE ANSWER THAT CANNOT BE ARGUED WITH. "What is the robot colliding with" was
+        answered four times on 2026-08-27 by reasoning from where it stopped, and three of those
+        answers were wrong. Newton knows; ask it.
+        """
+        try:
+            c = self.contacts
+            n = int(c.rigid_contact_count.numpy()[0])
+            if n <= 0:
+                return
+            s0 = c.rigid_contact_shape0.numpy()[:n]
+            s1 = c.rigid_contact_shape1.numpy()[:n]
+            shape_body = self.model.shape_body.numpy()
+        except Exception as error:
+            print(f"  (contacts unavailable: {error}) — reporting disabled", flush=True)
+            self.args.own_vehicle_report_contacts = 0
+            return
+
+        vehicle = set(self.vehicle.bodies)
+        seen = {}
+        for i in range(n):
+            b0 = int(shape_body[s0[i]]) if s0[i] >= 0 else -1
+            b1 = int(shape_body[s1[i]]) if s1[i] >= 0 else -1
+            for mine, other in ((b0, b1), (b1, b0)):
+                if mine in vehicle and other not in vehicle:
+                    label = ("STATIC LEVEL (body -1)" if other < 0
+                             else str(self.model.body_label[other]))
+                    seen[label] = seen.get(label, 0) + 1
+        if seen:
+            print(f"  contacts t={self.sidecar_time:7.2f}s: "
+                  + ", ".join(f"{k} x{v}" for k, v in sorted(seen.items())), flush=True)
+
     def _apply_kinematic_poses(self, block) -> None:
         """Push the simulator's moving actors to where it says they are.
 
@@ -1773,23 +2126,318 @@ class Sidecar:
         block published against a registration we have not built would put pose[i] on the wrong
         body — a crate that moves when a lift does, which looks like a physics result.
         """
-        if not self._kinematic_bodies:
+        if not self._kinematic_joints:
             return
         if int(block.kinematic_revision) != int(self._built_static_revision):
+            # ⚠ SAY IT ONCE. A silent revision mismatch leaves every mirrored actor frozen at its
+            # BUILD pose. ⚠ That used to mean the sidecar ORIGIN — an invisible solid body a metre
+            # in front of the robot's spawn, reported on 2026-08-27 as "it is colliding with the
+            # air" — and it no longer does: mirrored bodies are now built where the registration
+            # says they are. A frozen actor is therefore in a PLAUSIBLE place, which is worse to
+            # diagnose, not better: it is exactly where it was when the level was mirrored, so a
+            # STATIONARY one is simply correct and a MOVING one leaves a ghost of itself behind at
+            # its old pose while the visible actor drives away. Hence the warning.
+            if not self._kin_revision_warned:
+                self._kin_revision_warned = True
+                print(f"⚠ mirrored actor poses IGNORED: the simulator is sending registration "
+                      f"revision {int(block.kinematic_revision)} but this model was built against "
+                      f"{int(self._built_static_revision)}. Every mirrored actor is frozen at the "
+                      f"sidecar origin until the two agree.", flush=True)
             return
+        if self._kin_revision_warned:
+            self._kin_revision_warned = False
+            print("mirrored actor poses are being applied again "
+                  f"(revision {int(block.kinematic_revision)}).", flush=True)
         import numpy as np
 
-        n = min(int(block.kinematic_count), len(self._kinematic_bodies))
+        import newton
+
+        n = min(int(block.kinematic_count), len(self._kinematic_joints))
         if n <= 0:
             return
-        q = self.state_0.body_q.numpy()
+
+        # ⚠ WRITE THE JOINT, THEN TELL THE SOLVER. joint_X_p is what the mocap refresh reads, and
+        # writing it is not enough on its own: MuJoCo holds its own copy of the model, and
+        # `update_mocap_transforms_kernel` only runs from notify_model_changed(JOINT_PROPERTIES).
+        # Without the notify the value sits in the Newton model unread and the object never moves.
+        jx = self.model.joint_X_p.numpy()
+        changed = False
         for i in range(n):
-            wp_pose = block.kinematic_poses[i]
-            b = self._kinematic_bodies[i]
-            q[b][0:3] = wp_pose.position.as_tuple()
-            q[b][3:7] = wp_pose.orientation.as_xyzw()
-        self.state_0.body_q.assign(q)
-        _ = np
+            pose = block.kinematic_poses[i]
+            p = pose.position.as_tuple()
+            o = pose.orientation.as_xyzw()
+            row = self._kinematic_joints[i]
+            new_row = (p[0], p[1], p[2], o[0], o[1], o[2], o[3])
+            if not np.allclose(jx[row], new_row, rtol=0.0, atol=1e-7):
+                jx[row] = new_row
+                changed = True
+        # ⚠ ONLY WHEN SOMETHING ACTUALLY MOVED. notify_model_changed rebuilds every joint property
+        # in the MuJoCo model; doing that every solve for a level whose crates are sitting still is
+        # a per-frame cost for no change at all.
+        if not changed:
+            return
+        self.model.joint_X_p.assign(jx)
+        # ⚠ SAY IT ONCE, WITH NUMBERS. "The pose is being applied" has been asserted three times
+        # today without evidence. This prints the first pose actually written, so it can be checked
+        # against where the actor really is instead of assumed.
+        if not self._kin_applied_logged:
+            self._kin_applied_logged = True
+            p0 = block.kinematic_poses[0].position
+            print(f"mirrored actor pose APPLIED: joint row {self._kinematic_joints[0]} <- "
+                  f"({p0.x:+.3f} {p0.y:+.3f} {p0.z:+.3f}) sidecar-frame", flush=True)
+        try:
+            self.solver.solver("mjc").notify_model_changed(newton.ModelFlags.JOINT_PROPERTIES)
+        except Exception as error:
+            if not self._mocap_warned:
+                self._mocap_warned = True
+                print(f"⚠ could not refresh mirrored actor poses ({error}) — they will stay at "
+                      f"their build pose and the sand will not see them move.", file=sys.stderr)
+
+    def _prepare_mirror_eviction(self) -> None:
+        """Collect the PRIMITIVE shapes of mirrored actors, once, for the per-solve eviction.
+
+        ⚠ PRIMITIVES ONLY, and the exclusion is not laziness. A mesh or hull would have to be
+        evicted by its bounding sphere, and the mirrored cone in this level has a 2.5 m hull reach:
+        carving a 2.5 m ball out of a bed to account for a shape occupying a fraction of it is a
+        worse artefact than the one being fixed. Meshes are reported by the host-side pass instead.
+        """
+        import numpy as np
+        import warp as wp
+
+        self._mirror_shape_index = None
+        self._mirror_shape_joint = None
+        self._mirror_body_index = None
+        self._mirror_body_joint = None
+        self._mirror_evict_counter = None
+        if self.model is None or not self._kinematic_bodies:
+            return
+        mine = set(int(b) for b in self._kinematic_bodies)
+        shape_body = self.model.shape_body.numpy()
+        shape_type = self.model.shape_type.numpy()
+
+        # ⚠ EVERY MIRRORED BODY, hulls included. A hull collider is invisible to the sand eviction
+        # below, but it must still be SOLID IN THE RIGHT PLACE for the robot — and that is what
+        # this pair of arrays is for. Keeping the two lists separate is deliberate: the day they
+        # are merged, a level whose only moving actor is a mesh silently stops being collidable.
+        self._mirror_body_index = wp.array(
+            np.array([int(b) for b in self._kinematic_bodies], dtype=np.int32),
+            dtype=wp.int32, device=self.model.device)
+        self._mirror_body_joint = wp.array(
+            np.array([int(j) for j in self._kinematic_joints], dtype=np.int32),
+            dtype=wp.int32, device=self.model.device)
+        print(f"mirrored actor collision poses synced to body_q for "
+              f"{len(self._kinematic_bodies)} actor(s)")
+        # Each mirrored body's world pose lives on ITS joint — see the kernel's note on body_q.
+        joint_of = {int(b): int(j) for b, j in zip(self._kinematic_bodies,
+                                                   self._kinematic_joints)}
+        idx, jnt = [], []
+        for si in range(len(shape_body)):
+            b = int(shape_body[si])
+            if b in mine and int(shape_type[si]) in (_GEO_SPHERE, _GEO_BOX, _GEO_CAPSULE,
+                                                     _GEO_CYLINDER):
+                idx.append(si)
+                jnt.append(joint_of[b])
+        if not idx:
+            return
+        self._mirror_shape_index = wp.array(np.array(idx, dtype=np.int32), dtype=wp.int32,
+                                            device=self.model.device)
+        self._mirror_shape_joint = wp.array(np.array(jnt, dtype=np.int32), dtype=wp.int32,
+                                            device=self.model.device)
+        self._mirror_evict_counter = wp.zeros(1, dtype=wp.int32, device=self.model.device)
+        print(f"per-solve sand eviction armed for {len(idx)} primitive collider(s) on "
+              f"{len(mine)} mirrored actor(s)")
+
+    def _sync_mirror_body_q(self) -> None:
+        """Put every mirrored actor's CURRENT pose into state.body_q, before collision detection.
+
+        ⚠ EVERY STEP, AND BEFORE `pipeline.collide`. `CollisionPipeline` transforms each shape by
+        `body_q`; a mocap body's `body_q` is written once at build and never again. See the note on
+        `_sync_bodyq_kernel` for the measurement.
+        """
+        import warp as wp
+
+        if getattr(self, "_mirror_body_index", None) is None:
+            return
+        wp.launch(_sync_bodyq_kernel(),
+                  dim=len(self._kinematic_bodies),
+                  inputs=[self._mirror_body_index, self._mirror_body_joint,
+                          self.model.joint_X_p, self.model.joint_X_c, self.state_0.body_q],
+                  device=self.model.device)
+
+    def _evict_sand_gpu(self) -> None:
+        """Push grains out of every mirrored primitive. Runs after each solve, on the GPU.
+
+        ⚠ WHY EVERY SOLVE AND NOT JUST AT BUILD. Measured on 2026-08-27: a 0.5 m sphere dropped
+        from 2.4 m above the bed crossed it in ONE step — sphere z went 2.262 -> 1.556 between
+        consecutive samples, over ten voxels — and came to rest holding 1963 grains against a
+        control volume's 1982, i.e. sand at 99 % of ambient density inside a solid ball. The bed's
+        surface height did not move by a millimetre through the whole impact. A collider that
+        teleports past the grid cannot sweep it, and MPM never evicts what began inside.
+        """
+        import warp as wp
+
+        if self._mirror_shape_index is None or not self.particle_count:
+            return
+        self._mirror_evict_counter.zero_()
+        wp.launch(
+            _evict_kernel(),
+            dim=self.particle_count,
+            inputs=[self.state_0.particle_q, self.state_0.particle_qd,
+                    self.model.joint_X_p, self.model.joint_X_c,
+                    self._mirror_shape_index, self._mirror_shape_joint, self.model.shape_transform,
+                    self.model.shape_type, self.model.shape_scale,
+                    float(self._particle_radius or 0.0),
+                    # ⚠ ONE FLOOR, SHARED WITH THE FALLING-THROUGH CHECK. If the eviction and the
+                    # "sand is falling through" warning disagreed about where the floor is, the
+                    # eviction would create the very grains the warning then complains about.
+                    float(self.ground_z), self._mirror_evict_counter],
+            device=self.model.device)
+        # ⚠ REPORTED, NOT SILENT, and rate-limited so it cannot drown the log. A steady trickle of
+        # evictions every solve means a mirrored actor is parked inside the bed and the sand is
+        # being held out of it by force rather than by physics — worth knowing, and invisible
+        # otherwise.
+        if self.args.own_vehicle_report_contacts > 0 and self.sidecar_step % 250 == 0:
+            n = int(self._mirror_evict_counter.numpy()[0])
+            if n:
+                print(f"  sand eviction: {n} grain(s) pushed out of mirrored colliders this solve",
+                      flush=True)
+
+    def _mirror_collider_volumes(self):
+        """World-space collider shapes of every MIRRORED actor, READ BACK from the built model.
+
+        ⚠ READ BACK, NOT RECONSTRUCTED. The obvious alternative is to remember the shapes as they
+        were added from the wire, and it is wrong for the same reason the overlay distinguishes
+        Realised from Submitted: what matters is what the solver HAS, and the path from a wire
+        shape to a solver shape has three transforms in it. Reading `shape_transform` and
+        `shape_scale` off the finalised model cannot disagree with the thing being probed.
+        """
+        import numpy as np
+
+        import newton
+
+        out = []
+        if self.model is None or not self._kinematic_bodies:
+            return out
+        mine = set(int(b) for b in self._kinematic_bodies)
+        shape_body = self.model.shape_body.numpy()
+        shape_tf = self.model.shape_transform.numpy()
+        shape_type = self.model.shape_type.numpy()
+        shape_scale = self.model.shape_scale.numpy()
+        body_q = self.state_0.body_q.numpy()
+        for si in range(len(shape_body)):
+            b = int(shape_body[si])
+            if b not in mine:
+                continue
+            bq = body_q[b]
+            bp, bqt = np.array(bq[0:3], dtype=float), np.array(bq[3:7], dtype=float)
+            lp = np.array(shape_tf[si][0:3], dtype=float)
+            lq = np.array(shape_tf[si][3:7], dtype=float)
+            out.append(dict(body=b, kind=int(shape_type[si]),
+                            pos=bp + _rotate_xyzw(bqt, lp),
+                            quat=_quat_mul_xyzw(bqt, lq),
+                            scale=np.array(shape_scale[si], dtype=float)))
+        return out
+
+    def _evict_sand_from_mirrors(self, where: str) -> None:
+        """Push grains that are INSIDE a mirrored actor out to its surface.
+
+        ⚠ THIS IS THE DIFFERENCE BETWEEN "IT IS A COLLIDER" AND "THE SAND AVOIDS IT", and the two
+        were confused for two days. MPM collision stops a particle CROSSING a boundary; it never
+        evicts one that began inside. So a mirrored sphere that appears where sand already is —
+        registered, proxied, counted among the MPM colliders, pose applied every tick — sits full
+        of grains at ambient density and displaces nothing. Measured live on 2026-08-27:
+        2761 grains inside the operator's 0.5 m sphere against 2562 in an equal volume of
+        undisturbed bed. Every counter read healthy.
+
+        ⚠ MOVED, NOT DELETED. The vehicle's own cull deletes, because it runs before the bed
+        exists and the count is nobody's business yet. Here the bed is live and its particle count
+        is load-bearing: it is what lets a rebuild carry the deformation across. Projection keeps
+        the count and keeps the mass.
+
+        ⚠ PRIMITIVES ONLY. A mesh or hull is COUNTED AND REPORTED, never evicted by its bounding
+        sphere: the mirrored cone in this level has a 2.5 m hull reach, and carving a 2.5 m ball
+        out of a bed to avoid a shape that occupies a fraction of it would be a worse artefact than
+        the one being fixed. An honest "N grains are inside this mesh and I cannot evict them"
+        beats a confident wrong answer.
+        """
+        import numpy as np
+
+        if self.state_0 is None or not self.particle_count:
+            return
+        vols = self._mirror_collider_volumes()
+        if not vols:
+            return
+        pts = self.state_0.particle_q.numpy()
+        vel = self.state_0.particle_qd.numpy()
+        skin = float(self._particle_radius or 0.0)
+        moved_total = 0
+        stuck = {}
+        for v in vols:
+            kind, sc = v["kind"], v["scale"]
+            d = pts - v["pos"]
+            if kind == _GEO_SPHERE:
+                r = float(sc[0]) + skin
+                dist = np.linalg.norm(d, axis=1)
+                m = dist < r
+                if not m.any():
+                    continue
+                # ⚠ Radially outward. A grain exactly at the centre has no direction to leave in;
+                # give it one rather than dividing by zero and producing a NaN the solver spreads.
+                dirs = np.where(dist[:, None] > 1e-9, d / np.maximum(dist, 1e-9)[:, None],
+                                np.array([0.0, 0.0, 1.0]))
+                pts[m] = v["pos"] + dirs[m] * r
+            elif kind == _GEO_BOX:
+                h = np.abs(sc) + skin
+                local = d @ _rot_matrix_xyzw(v["quat"])
+                m = np.all(np.abs(local) < h, axis=1)
+                if not m.any():
+                    continue
+                # Shortest way out: the face this grain is closest to.
+                slack = h - np.abs(local[m])
+                axis = np.argmin(slack, axis=1)
+                sign = np.sign(local[m][np.arange(len(axis)), axis])
+                sign[sign == 0] = 1.0
+                lm = local[m]
+                lm[np.arange(len(axis)), axis] = sign * h[axis]
+                pts[m] = v["pos"] + lm @ _rot_matrix_xyzw(v["quat"]).T
+            elif kind in (_GEO_CAPSULE, _GEO_CYLINDER):
+                r = float(sc[0]) + skin
+                hl = float(sc[1]) + skin
+                R = _rot_matrix_xyzw(v["quat"])
+                local = d @ R
+                radial = np.linalg.norm(local[:, :2], axis=1)
+                m = (radial < r) & (np.abs(local[:, 2]) < hl)
+                if not m.any():
+                    continue
+                lm = local[m]
+                rr = np.maximum(radial[m], 1e-9)
+                # Out through the barrel, which is the shorter exit for a bed lying against it.
+                lm[:, 0] *= r / rr
+                lm[:, 1] *= r / rr
+                pts[m] = v["pos"] + lm @ R.T
+            else:
+                bound = float(np.max(np.abs(sc))) if np.any(sc) else 0.0
+                if bound <= 0.0:
+                    continue
+                n = int((np.linalg.norm(d, axis=1) < bound).sum())
+                if n:
+                    stuck[int(v["body"])] = stuck.get(int(v["body"]), 0) + n
+                continue
+            n = int(m.sum())
+            moved_total += n
+            vel[m] = 0.0     # they were in an invalid state; do not launch them out of it
+
+        if moved_total:
+            self.state_0.particle_q.assign(pts)
+            self.state_0.particle_qd.assign(vel)
+            print(f"sand eviction ({where}): {moved_total} grain(s) pushed out of mirrored "
+                  f"actors that appeared inside the bed", flush=True)
+        if stuck:
+            for b, n in sorted(stuck.items()):
+                label = self.model.body_label[b] if self.model is not None else f"body {b}"
+                print(f"⚠ sand eviction ({where}): about {n} grain(s) are inside the MESH/HULL "
+                      f"collider of '{label}' and CANNOT be evicted — it will displace less sand "
+                      f"than its shape suggests, or none at all.", flush=True)
 
     def _add_wire_shape(self, builder, body, ws, verts, idx, cfg, xform, skipped=None):
         """Build one wire shape onto `body` (-1 for static). Returns True if it was added.
@@ -1881,16 +2529,112 @@ class Sidecar:
             return 0
         return int(b.revision)
 
-    def rebuild_model(self, reason: str) -> None:
-        """Tear the Newton model down and build it again. The one path both triggers share.
+    def _capture_live_state(self):
+        """Everything a rebuild is about to destroy that we may want back.
 
-        ⚠ EXPENSIVE AND UNAVOIDABLE FOR BOTH OF THEM. Newton has no "put the sand back" — the bed's
-        deformation IS its state, spread across a few hundred thousand particles — so returning to
-        the initial condition means building it again. The first rebuild of a session also compiles
-        the mesh-contact CUDA kernels (~11 s); later ones hit Warp's cache and are much faster.
+        ⚠ ONLY THE VEHICLE'S PREFIX OF THE JOINT ARRAYS. A rebuild triggered by a newly mirrored
+        actor has one more fixed joint than the model being torn down, so joint_q is a DIFFERENT
+        LENGTH on the other side. Copying the whole array would silently truncate; copying it into
+        the wrong offsets would put a base coordinate into a mirrored actor's joint.
         """
-        print(f"\n{reason} — rebuilding the model. The sand is respawned; anything driven so far "
-              f"is discarded.", flush=True)
+        import numpy as np
+
+        if self.state_0 is None or self.model is None:
+            return None
+        snap = {"particles": int(self.particle_count)}
+        if self.particle_count:
+            snap["particle_q"] = self.state_0.particle_q.numpy().copy()
+            snap["particle_qd"] = self.state_0.particle_qd.numpy().copy()
+            mpm_state = getattr(self.state_0, "mpm", None)
+            history = {}
+            for name in MPM_STATE_FIELDS:
+                arr = getattr(mpm_state, name, None)
+                if arr is not None:
+                    history[name] = arr.numpy().copy()
+            snap["mpm"] = history
+        if self.vehicle is not None and getattr(self.vehicle, "coord_count", 0):
+            snap["coord_count"] = int(self.vehicle.coord_count)
+            snap["dof_count"] = int(self.vehicle.dof_count)
+            snap["joint_q"] = self.state_0.joint_q.numpy()[:snap["coord_count"]].copy()
+            snap["joint_qd"] = self.state_0.joint_qd.numpy()[:snap["dof_count"]].copy()
+        return snap
+
+    def _restore_live_state(self, snap) -> None:
+        """Put the captured bed and robot pose back into the freshly built model.
+
+        ⚠ REFUSED RATHER THAN TRUNCATED when the shapes disagree. A partial restore is a bed with a
+        seam in it and a robot whose base pose came from a different model — both look like physics
+        and neither is. Saying so and keeping the fresh state is the honest failure.
+        """
+        import numpy as np
+
+        import newton
+
+        if not snap:
+            return
+        why = None
+        if int(snap["particles"]) != int(self.particle_count):
+            why = (f"the rebuilt bed has {self.particle_count} particles, the old one had "
+                   f"{snap['particles']}")
+        elif "coord_count" in snap and self.vehicle is not None and (
+                int(snap["coord_count"]) != int(self.vehicle.coord_count)
+                or int(snap["dof_count"]) != int(self.vehicle.dof_count)):
+            why = (f"the vehicle's coordinate layout changed "
+                   f"({snap['coord_count']}/{snap['dof_count']} -> "
+                   f"{self.vehicle.coord_count}/{self.vehicle.dof_count})")
+        if why is not None:
+            print(f"⚠ the bed and robot were NOT carried across the rebuild: {why}. The sand is "
+                  f"respawned and the robot is back at its spawn pose.", flush=True)
+            return
+
+        if self.particle_count:
+            self.state_0.particle_q.assign(snap["particle_q"])
+            self.state_0.particle_qd.assign(snap["particle_qd"])
+            mpm_state = getattr(self.state_0, "mpm", None)
+            for name, values in snap.get("mpm", {}).items():
+                arr = getattr(mpm_state, name, None)
+                if arr is not None:
+                    arr.assign(values)
+
+        if "joint_q" in snap:
+            # ⚠ AFTER _spawn_position HAS BEEN CAPTURED, never before. The simulator anchors its
+            # whole frame on the spawn the sidecar declares; moving the robot first would make the
+            # declared spawn follow the robot, which is exactly the reset-drift that WireVehiclePose
+            # documents. The build pose stays the anchor; only the live state moves.
+            q = self.state_0.joint_q.numpy()
+            qd = self.state_0.joint_qd.numpy()
+            q[:len(snap["joint_q"])] = snap["joint_q"]
+            qd[:len(snap["joint_qd"])] = snap["joint_qd"]
+            self.state_0.joint_q.assign(q)
+            self.state_0.joint_qd.assign(qd)
+            newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+
+        # ⚠ AND AGAIN AFTER THE CARRY. The build-time eviction ran against the freshly spawned bed
+        # that this restore has just overwritten, so its work was undone one line ago. The carried
+        # bed is exactly the one that has grains where the NEW actor now is — that is the whole
+        # reason this rebuild happened.
+        self._evict_sand_from_mirrors("carried bed")
+
+        print(f"carried across the rebuild: {self.particle_count} sand particles with their "
+              f"deformation, and the robot's live pose.", flush=True)
+
+    def rebuild_model(self, reason: str, preserve: bool = False) -> None:
+        """Tear the Newton model down and build it again. The one path every trigger shares.
+
+        ⚠ EXPENSIVE AND UNAVOIDABLE. A Newton model is immutable once finalised — a body cannot be
+        added to a built one — so every newly mirrored actor costs a rebuild. The first rebuild of a
+        session also compiles the mesh-contact CUDA kernels (~11 s); later ones hit Warp's cache.
+
+        ⚠ `preserve` DECIDES WHETHER THE BED SURVIVES, and the two callers want opposite answers.
+        A reset must respawn it; an actor dropped into the level halfway through a run must not,
+        because wiping every rut the robot has driven is a far larger physical change than the crate
+        that caused it, and from the operator's seat it reads as the sim having crashed.
+        """
+        snap = self._capture_live_state() if preserve else None
+        print(f"\n{reason} — rebuilding the model."
+              + (" The bed and the robot's pose are carried across."
+                 if snap else " The sand is respawned; anything driven so far is discarded."),
+              flush=True)
         # Drop the old model so its GPU memory is released before the new one is built.
         self.solver = None
         self.mpm = None
@@ -1905,6 +2649,7 @@ class Sidecar:
         import gc
         gc.collect()
         self.build_own_vehicle()
+        self._restore_live_state(snap)
         self._last_pose_time = -1.0e9
 
     def rebuild_for_reset(self) -> bool:
@@ -1940,15 +2685,24 @@ class Sidecar:
         refuse to start until a simulator appears, which would break every standalone probe run.
         Rebuilding once, loudly, is the honest resolution.
 
-        ⚠ THE SAND IS RESPAWNED, and that is correct rather than regrettable: a bed settled against
-        a flat plane at the wrong height is not valid initial state for a bed resting on the real
-        floor. Any ruts driven in the meantime are discarded with it.
+        ⚠ THE FIRST MIRROR RESPAWNS THE SAND, AND EVERY LATER ONE MUST NOT. On the first arrival
+        the bed is genuinely invalid — it settled against a flat plane at a guessed height, which is
+        not initial state for a bed resting on the real floor — so respawning it is correct. Every
+        revision after that is a mirrored actor appearing or its flags changing, and the level under
+        the bed has not moved; wiping the ruts then is a far bigger physical change than the crate
+        that triggered it. Dropping a cube beside a driving robot used to reset the bed AND teleport
+        the robot back to spawn, which read as the simulation having crashed.
         """
         revision = self._static_world_revision()
         if revision == 0 or revision == self._built_static_revision:
             return False
-        self.rebuild_model(f"level mirror revision {revision} arrived — building on the real "
-                           f"level geometry")
+        first = int(self._built_static_revision) == 0
+        self.rebuild_model(
+            (f"level mirror revision {revision} arrived — building on the real level geometry"
+             if first else
+             f"the level mirror changed (revision {self._built_static_revision} -> {revision}): "
+             f"an actor was added, removed or re-flagged"),
+            preserve=not first)
         self._built_static_revision = revision
         return True
 
@@ -2064,11 +2818,24 @@ class Sidecar:
                 else:
                     self.vehicle.drive(self.control, self._own_vehicle_wheel_speed(t))
                 self.state_0.clear_forces()
+                # ⚠ BEFORE collide, not after: this is what makes a mirrored actor solid where it
+                # IS rather than where it was built.
+                self._sync_mirror_body_q()
                 self.pipeline.collide(self.state_0, self.contacts)
                 self.solver.step(self.state_0, self.state_0, self.control, self.contacts, frame_dt)
+                # ⚠ AFTER THE SOLVE, so the grains are pushed out of where the collider ENDED UP.
+                self._evict_sand_gpu()
                 self.sidecar_step += 1
                 self.sidecar_time += frame_dt
 
+                # ⚠ ASK THE SOLVER WHAT IT IS TOUCHING, rather than inferring it from where the
+                # robot stops. Four separate diagnoses on 2026-08-27 were reasoned from symptoms
+                # ("it must be frozen", "MuJoCo must be overwriting body_q") and three were wrong.
+                # The contact list is the one answer that cannot be argued with, and a robot that
+                # stops against something invisible is exactly when it is needed.
+                if (self.args.own_vehicle_report_contacts > 0
+                        and self.sidecar_step % self.args.own_vehicle_report_contacts == 0):
+                    self._report_contacts()
                 self.publish_vehicle_poses()
                 # ⚠ NO SAND UNTIL THE LEVEL QUESTION IS SETTLED, and this ordering is the whole
                 # point. The rebuild onto the real level blocks this process for ~11 s while Warp
@@ -2446,6 +3213,10 @@ def main() -> int:
                      help="how long (in SIMULATED seconds) to withhold the sand while waiting for "
                           "the simulator to publish the level. Past this the sand is published "
                           "against the flat --ground-z fallback and the run says so.")
+    own.add_argument("--own-vehicle-report-contacts", type=int, default=0, metavar="EVERY_N",
+                     help="print which non-vehicle bodies the robot is touching, every N solves. "
+                          "0 = off. ⚠ The answer to 'what is it colliding with' that does not "
+                          "require inferring it from where the robot stopped.")
     own.add_argument("--own-vehicle-wire", action="store_true",
                      help="attach the D15 vehicle segments: read joint targets from Unreal and "
                           "publish link poses back. Without this the vehicle is driven by the "
