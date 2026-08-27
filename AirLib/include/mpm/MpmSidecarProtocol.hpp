@@ -98,6 +98,11 @@ constexpr uint32_t kMaxStaticVertices = 1000000;
 constexpr uint32_t kMaxStaticIndices = 3000000;
 constexpr uint32_t kMaxStaticNameChars = 64;
 
+/// ⚠ MIRRORED DYNAMIC ACTORS - level objects that MOVE. Few by nature (a level has hundreds of
+/// static bodies and a handful of things that move), so 64 is generous. Their SHAPES ride the
+/// static world block's pools; their POSES ride the command block, already written every tick.
+constexpr uint32_t kMaxKinematicBodies = 64;
+
 /// Mirrors urdf::CollisionShape::Kind. Duplicated deliberately: this is a wire enum whose numeric
 /// values are frozen by `kProtocolVersion`, and inheriting them from a header that is free to be
 /// reordered would make an internal refactor silently reinterpret the wire.
@@ -369,6 +374,33 @@ enum class WireJointTargetMode : uint32_t {
     Torque = 3,
 };
 
+/// A level object whose pose is pushed in every tick rather than frozen at load.
+///
+/// ⚠ ONE-DIRECTIONAL BY CONSTRUCTION, and this is the honest limit rather than an oversight. The
+/// simulator dictates the pose, so the robot and the sand are pushed BY these bodies and never push
+/// back. A crate dropped into the bed will plough it and displace it, and will fall through it as
+/// though the sand were not there, because the thing deciding where the crate goes is Unreal's own
+/// physics and it has never heard of the sand. Making the crate float needs the crate solved in
+/// Newton - the same argument as D15 itself, one object further out.
+///
+/// ⚠ NEVER a mesh: urdf::KinematicBody's shapes are primitives only.
+struct WireKinematicBody {
+    char name[kMaxStaticNameChars] = {};
+    uint32_t shape_start = 0;
+    uint32_t shape_count = 0;
+    double friction = 0.7;
+    double restitution = 0;
+};
+
+/// ⚠ POSITIONALLY MATCHED to the kinematic array in the static world block, not keyed by name. A
+/// name lookup per body per tick is wasted work on a hot path, and the registration is revisioned -
+/// so the contract is that pose[i] belongs to kinematic[i] of the SAME revision, and a consumer
+/// must ignore poses whose revision it has not built.
+struct WireKinematicPose {
+    WireVec3 position;
+    WireQuat orientation;
+};
+
 struct WireJointCommand {
     char joint_name[kMaxLinkNameChars] = {};
     uint32_t target_mode = 0;   ///< WireJointTargetMode
@@ -403,6 +435,12 @@ struct MpmVehicleCommandBlock {
     /// vehicle where it drove to and the sand keeps every rut. Bumping this is what tells the
     /// sidecar to rebuild - fresh bed, vehicle back at its spawn.
     uint64_t reset_epoch = 0;
+    /// ⚠ THE MOVING HALF OF THE LEVEL MIRROR, on the block already written every tick.
+    /// `kinematic_revision` says which registration these poses belong to; a consumer that has
+    /// built a different revision must ignore them rather than apply pose[i] to the wrong body.
+    uint32_t kinematic_revision = 0;
+    uint32_t kinematic_count = 0;
+    WireKinematicPose kinematic_poses[kMaxKinematicBodies];
     WireVehicleCommand vehicles[kMaxVehicles];
 };
 
@@ -442,6 +480,12 @@ struct WireVehiclePose {
     uint32_t joint_count = 0;
     uint32_t effort_reported = 0;   ///< 0 = every WireJointState::effort below is a placeholder
     uint32_t _pad = 0;
+    /// ⚠ WHERE THE ROOT LINK WAS BUILT, constant for the life of a model. Anchor on THIS, never on
+    /// a sampled pose. The sidecar free-runs, so between this side building and reading its first
+    /// pose the robot has settled or rolled a little, and an offset derived from that sample
+    /// silently absorbs it — the symptom being a vehicle that reappears a few centimetres away
+    /// every reset, for no reason the operator can see.
+    WireVec3 spawn_position;
     WireLinkPose links[kMaxLinksPerVehicle];
     WireJointState joints[kMaxJointsPerVehicle];
 };
@@ -532,6 +576,9 @@ struct MpmStaticWorldBlock {
     uint32_t truncated = 0;
     uint32_t _pad = 0;
     WireVec3 frame_offset;
+    uint32_t kinematic_count = 0;
+    uint32_t _pad2 = 0;
+    WireKinematicBody kinematic[kMaxKinematicBodies];
     WireStaticBody bodies[kMaxStaticBodies];
     WireStaticShape shapes[kMaxStaticShapes];
     float vertices[kMaxStaticVertices * 3];
@@ -551,14 +598,14 @@ static_assert(sizeof(WireVec3) == 24, "WireVec3 must be 3 packed doubles");
 static_assert(sizeof(WireQuat) == 32, "WireQuat must be 4 packed doubles");
 static_assert(sizeof(WireStaticShape) == 80, "WireStaticShape layout changed");
 static_assert(sizeof(WireStaticBody) == 144, "WireStaticBody layout changed");
-static_assert(sizeof(MpmStaticWorldBlock) == 24237632, "MpmStaticWorldBlock layout changed");
+static_assert(sizeof(MpmStaticWorldBlock) == 24243272, "MpmStaticWorldBlock layout changed");
 static_assert(sizeof(WireJointCommand) == 80, "WireJointCommand layout changed");
 static_assert(sizeof(WireVehicleCommand) == 5192, "WireVehicleCommand layout changed");
-static_assert(sizeof(MpmVehicleCommandBlock) == 20840, "MpmVehicleCommandBlock layout changed");
+static_assert(sizeof(MpmVehicleCommandBlock) == 24432, "MpmVehicleCommandBlock layout changed");
 static_assert(sizeof(WireLinkPose) == 168, "WireLinkPose layout changed");
 static_assert(sizeof(WireJointState) == 88, "WireJointState layout changed");
-static_assert(sizeof(WireVehiclePose) == 16464, "WireVehiclePose layout changed");
-static_assert(sizeof(MpmVehiclePoseBlock) == 65936, "MpmVehiclePoseBlock layout changed");
+static_assert(sizeof(WireVehiclePose) == 16488, "WireVehiclePose layout changed");
+static_assert(sizeof(MpmVehiclePoseBlock) == 66032, "MpmVehiclePoseBlock layout changed");
 
 
 } // namespace mpm

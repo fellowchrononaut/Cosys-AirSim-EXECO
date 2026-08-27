@@ -156,6 +156,8 @@ class Sidecar:
         self._built_static_revision = 0
         # ⚠ False until we know whether a level mirror is coming. Gates the SAND only.
         self._static_settled = False
+        self._spawn_position = (0.0, 0.0, 0.0)
+        self._kinematic_bodies = []
         self.requested_reset_epoch = 0
         self._applied_reset_epoch = 0
         self.control = None
@@ -1377,6 +1379,7 @@ class Sidecar:
         commands = [(entry.joints[j].name(), int(entry.joints[j].target_mode),
                      float(entry.joints[j].target))
                     for j in range(min(entry.joint_count, P.MAX_JOINTS_PER_VEHICLE))]
+        self._apply_kinematic_poses(block)
         self.vehicle.apply_wire_commands(self.control, commands)
         self.last_command_step = int(block.step)
         # ⚠ RECORDED, NOT ACTED ON HERE. Rebuilding from inside the command read would destroy the
@@ -1440,6 +1443,8 @@ class Sidecar:
         entry = block.vehicles[0]
         entry.vehicle_name = self.vehicle.spec.name.encode("utf-8")[:P.MAX_VEHICLE_NAME_CHARS - 1]
         entry.link_count = len(poses)
+        (entry.spawn_position.x, entry.spawn_position.y,
+         entry.spawn_position.z) = self._spawn_position
         joints = self.vehicle.joint_states(self.state_0)[:P.MAX_JOINTS_PER_VEHICLE]
         entry.joint_count = len(joints)
         # ⚠ 0 = "the efforts below are placeholders", and it stays 0 until the solver can actually
@@ -1595,7 +1600,12 @@ class Sidecar:
         config.air_drag = 1.0
         config.collider_velocity_mode = "forward"
 
-        bodies = list(self.vehicle.bodies)
+        # ⚠ THE MIRRORED ACTORS MUST BE ENTRY MEMBERS, measured not assumed. See
+        # newton_probes/probe_kinematic_contact.py: a kinematic body outside the MuJoCo entry gets
+        # contacts from CollisionPipeline that the rigid solver then ignores — a box dropped on it
+        # fell straight through. They also go on the MPM proxy, which is what lets the SAND feel
+        # them: the proxy is how a rigid body becomes a collider the sand can be pushed by.
+        bodies = list(self.vehicle.bodies) + list(self._kinematic_bodies)
         self.solver = SolverCoupledProxy(
             model=self.model,
             entries=[
@@ -1628,6 +1638,16 @@ class Sidecar:
         self.pipeline = newton.CollisionPipeline(self.model, soft_contact_max=0)
         self.contacts = self.pipeline.contacts()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        # ⚠ CAPTURED AT BUILD, PUBLISHED FOREVER, and taken AFTER eval_fk so it is the pose the
+        # solver will actually start from. This is what the simulator anchors its frame on, and it
+        # must be a declared constant rather than a sampled pose — see WireVehiclePose.spawn_position
+        # for the reset drift that anchoring on a sample produces.
+        import numpy as _np
+        self._spawn_position = tuple(float(v) for v in _np.asarray(
+            self.state_0.body_q.numpy()[self.vehicle.body_start][0:3], dtype=float))
+        print(f"  spawn position (anchor reference): "
+              f"({self._spawn_position[0]:+.3f} {self._spawn_position[1]:+.3f} "
+              f"{self._spawn_position[2]:+.3f})")
 
         print(f"built: vehicle '{spec.name}' + {self.particle_count} sand particles, "
               f"voxel {config.voxel_size} m, {self.args.own_vehicle_proxy_iterations} "
@@ -1694,63 +1714,45 @@ class Sidecar:
             # numerical accident; -1 is geometry the solver treats as immovable by construction.
             cfg = newton.ModelBuilder.ShapeConfig(mu=float(wb.friction),
                                                   restitution=float(wb.restitution))
-            for s in range(wb.shape_start, min(wb.shape_start + wb.shape_count,
-                                               P.MAX_STATIC_SHAPES)):
-                ws = block.shapes[s]
-                kind = int(ws.kind)
-                if kind == P.STATIC_SHAPE_SPHERE:
-                    c = np.array(ws.center_a.as_tuple(), dtype=float)
-                    builder.add_shape_sphere(-1, xform=wp.transform_multiply(
-                        xform, wp.transform(wp.vec3(*c), wp.quat_identity())),
-                        radius=float(ws.radius), cfg=cfg)
+            for si in range(wb.shape_start, min(wb.shape_start + wb.shape_count,
+                                                P.MAX_STATIC_SHAPES)):
+                if self._add_wire_shape(builder, -1, block.shapes[si], verts, idx, cfg, xform,
+                                        skipped_kinds):
                     added += 1
-                elif kind == P.STATIC_SHAPE_CAPSULE:
-                    a = np.array(ws.center_a.as_tuple(), dtype=float)
-                    bb = np.array(ws.center_b.as_tuple(), dtype=float)
-                    mid = 0.5 * (a + bb)
-                    axis = bb - a
-                    half = float(np.linalg.norm(axis)) * 0.5
-                    # Newton's capsule runs along local Z; rotate Z onto the segment.
-                    rot = _quat_from_z_to(axis)
-                    builder.add_shape_capsule(-1, xform=wp.transform_multiply(
-                        xform, wp.transform(wp.vec3(*mid), wp.quat(*rot))),
-                        radius=float(ws.radius), half_height=half, cfg=cfg)
-                    added += 1
-                elif kind in (P.STATIC_SHAPE_MESH, P.STATIC_SHAPE_HULL):
-                    v = verts[ws.vertex_start: ws.vertex_start + ws.vertex_count]
-                    if len(v) < 4:
-                        continue
-                    if ws.index_count >= 3:
-                        # ⚠ ALREADY LOCAL TO THIS SHAPE'S OWN POINTS. An earlier version subtracted
-                        # `vertex_start` here on the assumption that indices were global offsets
-                        # into the shared vertex pool; they are not — urdf::StaticShape::indices
-                        # index `ss.points`, and the serialiser copies them unchanged. Subtracting
-                        # drove them negative and Newton refused the mesh
-                        # ("indices contains negative index -110"), taking the whole rebuild — and
-                        # the sidecar — down with it.
-                        tri = idx[ws.index_start: ws.index_start + ws.index_count]
-                        if tri.size and (tri.min() < 0 or tri.max() >= ws.vertex_count):
-                            # ⚠ COUNTED, NOT TRUSTED. A shape whose indices do not address its own
-                            # points is corrupt on the wire; building it would either throw or
-                            # produce a surface made of the wrong triangles.
-                            skipped_kinds["mesh (indices out of range)"] = \
-                                skipped_kinds.get("mesh (indices out of range)", 0) + 1
-                            continue
-                    else:
-                        # ⚠ A HULL ARRIVES AS A POINT CLOUD with no triangles. Triangulating it is
-                        # the only way it becomes a surface; skipping it silently would leave a
-                        # hole the robot drives through.
-                        tri = self._hull_indices(v)
-                        if tri is None:
-                            skipped_kinds["hull (no scipy)"] = \
-                                skipped_kinds.get("hull (no scipy)", 0) + 1
-                            continue
-                    mesh = newton.Mesh(np.ascontiguousarray(v, dtype=np.float32),
-                                       np.ascontiguousarray(tri, dtype=np.int32).flatten())
-                    builder.add_shape_mesh(-1, xform=xform, mesh=mesh, cfg=cfg)
-                    added += 1
-                else:
-                    skipped_kinds[str(kind)] = skipped_kinds.get(str(kind), 0) + 1
+
+        # ⚠ MOVING ACTORS ARE REAL BODIES, AND THEY MUST BE IN THE MuJoCo ENTRY. Measured with
+        # newton_probes/probe_kinematic_contact.py: a kinematic body that belongs to no entry gets
+        # contacts from CollisionPipeline and the rigid solver ignores them — a free box dropped on
+        # it fell straight through (z=0.100) instead of resting (z=0.400). Outside the entry the
+        # robot would drive through every mirrored crate while every counter reported healthy.
+        self._kinematic_bodies = []
+        for k in range(min(block.kinematic_count, P.MAX_KINEMATIC_BODIES)):
+            wk = block.kinematic[k]
+            # ⚠ mass=0 + is_kinematic: the simulator dictates this body's motion and Newton must
+            # never integrate it. To the sand that reads as infinitely heavy, which is correct for
+            # something whose position is decided elsewhere — and is exactly why the coupling is
+            # one-way: the crate pushes the sand, the sand cannot push the crate.
+            body = builder.add_body(xform=wp.transform_identity(), mass=0.0, is_kinematic=True,
+                                    label=f"mirror/{wk.label()}")
+            cfg = newton.ModelBuilder.ShapeConfig(mu=float(wk.friction),
+                                                  restitution=float(wk.restitution))
+            n_added = 0
+            for si in range(wk.shape_start, min(wk.shape_start + wk.shape_count,
+                                                P.MAX_STATIC_SHAPES)):
+                ws = block.shapes[si]
+                if self._add_wire_shape(builder, body, ws, verts, idx, cfg,
+                                        wp.transform_identity()):
+                    n_added += 1
+            if n_added:
+                self._kinematic_bodies.append(body)
+                added += n_added
+            else:
+                skipped_kinds["kinematic (no usable shape)"] = \
+                    skipped_kinds.get("kinematic (no usable shape)", 0) + 1
+        if self._kinematic_bodies:
+            print(f"level mirror: {len(self._kinematic_bodies)} MOVING actor(s) — they push the "
+                  f"robot and the sand; ⚠ neither can push them back (their pose is dictated by "
+                  f"the simulator).")
 
         if block.truncated:
             # ⚠ LOUD. The simulator could not fit the level, so what was just built has holes in it
@@ -1763,6 +1765,86 @@ class Sidecar:
             print(f"⚠ level mirror skipped shapes: {skipped_kinds}", file=sys.stderr)
         seg.close()
         return added
+
+    def _apply_kinematic_poses(self, block) -> None:
+        """Push the simulator's moving actors to where it says they are.
+
+        ⚠ REVISION-GATED. The poses are matched to the registration POSITIONALLY, so applying a
+        block published against a registration we have not built would put pose[i] on the wrong
+        body — a crate that moves when a lift does, which looks like a physics result.
+        """
+        if not self._kinematic_bodies:
+            return
+        if int(block.kinematic_revision) != int(self._built_static_revision):
+            return
+        import numpy as np
+
+        n = min(int(block.kinematic_count), len(self._kinematic_bodies))
+        if n <= 0:
+            return
+        q = self.state_0.body_q.numpy()
+        for i in range(n):
+            wp_pose = block.kinematic_poses[i]
+            b = self._kinematic_bodies[i]
+            q[b][0:3] = wp_pose.position.as_tuple()
+            q[b][3:7] = wp_pose.orientation.as_xyzw()
+        self.state_0.body_q.assign(q)
+        _ = np
+
+    def _add_wire_shape(self, builder, body, ws, verts, idx, cfg, xform, skipped=None):
+        """Build one wire shape onto `body` (-1 for static). Returns True if it was added.
+
+        ⚠ ONE IMPLEMENTATION FOR STATIC AND MOVING GEOMETRY. They arrive in the same pools and
+        differ only in which body owns them; two copies would drift, and the half that drifted
+        would be the half nobody was looking at.
+        """
+        import numpy as np
+        import warp as wp
+
+        import newton
+
+        kind = int(ws.kind)
+        if kind == P.STATIC_SHAPE_SPHERE:
+            c = np.array(ws.center_a.as_tuple(), dtype=float)
+            builder.add_shape_sphere(body, xform=wp.transform_multiply(
+                xform, wp.transform(wp.vec3(*c), wp.quat_identity())),
+                radius=float(ws.radius), cfg=cfg)
+            return True
+        if kind == P.STATIC_SHAPE_CAPSULE:
+            a = np.array(ws.center_a.as_tuple(), dtype=float)
+            bb = np.array(ws.center_b.as_tuple(), dtype=float)
+            mid = 0.5 * (a + bb)
+            axis = bb - a
+            half = float(np.linalg.norm(axis)) * 0.5
+            builder.add_shape_capsule(body, xform=wp.transform_multiply(
+                xform, wp.transform(wp.vec3(*mid), wp.quat(*_quat_from_z_to(axis)))),
+                radius=float(ws.radius), half_height=half, cfg=cfg)
+            return True
+        if kind in (P.STATIC_SHAPE_MESH, P.STATIC_SHAPE_HULL):
+            v = verts[ws.vertex_start: ws.vertex_start + ws.vertex_count]
+            if len(v) < 4:
+                return False
+            if ws.index_count >= 3:
+                # ⚠ ALREADY LOCAL TO THIS SHAPE'S OWN POINTS — see the note in _add_static_world.
+                tri = idx[ws.index_start: ws.index_start + ws.index_count]
+                if tri.size and (tri.min() < 0 or tri.max() >= ws.vertex_count):
+                    if skipped is not None:
+                        skipped["mesh (indices out of range)"] = \
+                            skipped.get("mesh (indices out of range)", 0) + 1
+                    return False
+            else:
+                tri = self._hull_indices(v)
+                if tri is None:
+                    if skipped is not None:
+                        skipped["hull (no scipy)"] = skipped.get("hull (no scipy)", 0) + 1
+                    return False
+            mesh = newton.Mesh(np.ascontiguousarray(v, dtype=np.float32),
+                               np.ascontiguousarray(tri, dtype=np.int32).flatten())
+            builder.add_shape_mesh(body, xform=xform, mesh=mesh, cfg=cfg)
+            return True
+        if skipped is not None:
+            skipped[str(kind)] = skipped.get(str(kind), 0) + 1
+        return False
 
     @staticmethod
     def _hull_indices(points):
@@ -1837,9 +1919,14 @@ class Sidecar:
         epoch = self.requested_reset_epoch
         self.rebuild_model(f"reset requested by the simulator (epoch {epoch})")
         self._applied_reset_epoch = epoch
-        # ⚠ The sand is legitimately absent for a moment while it rebuilds; withholding it stops
-        # the renderer seeing the stream die and clearing a bed that is about to come back.
-        self._static_settled = False
+        # ⚠ DO NOT WITHHOLD THE SAND AFTERWARDS. An earlier version cleared _static_settled here,
+        # on the theory that the bed should stay hidden until the level question was resettled. But
+        # rebuild_model is SYNCHRONOUS — by the time it returns the new bed exists and is standing
+        # on the mirror we already built — so the only thing withholding achieved was eight more
+        # seconds of no sand, ended by a message reading "no level mirror after 8 s" that was
+        # simply false. The blocked period during the rebuild is unavoidable and needs no help.
+        #
+        # The gate exists for FIRST build only, where the mirror genuinely has not arrived yet.
         self.sidecar_time = 0.0
         self.sidecar_step = 0
         return True
@@ -2028,11 +2115,21 @@ class Sidecar:
                         if (not self._static_settled and
                                 self.sidecar_time > float(self.args.own_vehicle_mirror_wait)):
                             self._static_settled = True
-                            print(f"no level mirror after "
-                                  f"{self.args.own_vehicle_mirror_wait:.0f} s of simulated time — "
-                                  f"publishing sand against the flat fallback ground at "
-                                  f"z={self.ground_z:.3f}. The robot will not collide with the "
-                                  f"level.", flush=True)
+                            # ⚠ SAY WHICH IT ACTUALLY IS. This branch fires on a timeout, and a
+                            # timeout is not evidence that no mirror exists — after a reset the
+                            # model is already standing on one. Claiming "the robot will not
+                            # collide with the level" when it demonstrably does is worse than
+                            # saying nothing.
+                            if self._built_static_revision:
+                                print(f"sand published; the level mirror (revision "
+                                      f"{self._built_static_revision}) is already built.",
+                                      flush=True)
+                            else:
+                                print(f"no level mirror after "
+                                      f"{self.args.own_vehicle_mirror_wait:.0f} s of simulated "
+                                      f"time — publishing sand against the flat fallback ground "
+                                      f"at z={self.ground_z:.3f}. The robot will not collide with "
+                                      f"the level.", flush=True)
                     except Exception as error:
                         self._built_static_revision = self._static_world_revision()
                         print(f"⚠ rebuilding on the level mirror FAILED ({error}); continuing on "

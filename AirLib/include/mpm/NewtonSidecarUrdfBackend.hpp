@@ -90,7 +90,9 @@ public:
     /// True: we DO consume it. Returning false made the plugin log "ignores the static world
     /// mirror" and skip work this backend now depends on.
     bool mirrorsStaticWorld() const override { return true; }
-    bool mirrorsKinematicBodies() const override { return false; }
+    /// True: mirrored dynamic actors are forwarded to the sidecar, so the robot and the sand can
+    /// both be pushed by things that move in the level. ⚠ One-directional — see WireKinematicBody.
+    bool mirrorsKinematicBodies() const override { return true; }
     /// The sidecar has its own ground. Asking the plugin for scaffolding would put the robot on two
     /// floors at slightly different heights, which reads as jitter.
     bool needsScaffoldingGroundPlane() const override { return false; }

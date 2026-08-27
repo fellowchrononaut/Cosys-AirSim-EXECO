@@ -71,6 +71,12 @@ MAX_STATIC_VERTICES = 1000000
 MAX_STATIC_INDICES = 3000000
 MAX_STATIC_NAME_CHARS = 64
 
+# ⚠ MIRRORED DYNAMIC ACTORS — level objects that MOVE. Few by nature (a level has hundreds of
+# static bodies and a handful of things that move), so 64 is generous. Their SHAPES ride the static
+# world block's pools, because both are known at registration; their POSES ride the command block,
+# which is already written every tick.
+MAX_KINEMATIC_BODIES = 64
+
 # WireStaticShapeKind — mirrors urdf::StaticShapeKind, values frozen by PROTOCOL_VERSION.
 STATIC_SHAPE_HULL = 0
 STATIC_SHAPE_MESH = 1
@@ -317,6 +323,43 @@ class MpmParticleBlock(ctypes.Structure):
 # ---------------------------------------------------------------------------------------------
 
 
+class WireKinematicBody(ctypes.Structure):
+    """A level object whose pose is pushed in every tick rather than frozen at load.
+
+    ⚠ ONE-DIRECTIONAL BY CONSTRUCTION, and this is the honest limit rather than an oversight. The
+    simulator dictates the pose, so the robot and the sand are pushed BY these bodies and never push
+    back. A crate dropped into the bed will plough it and displace it, and will fall through it as
+    though the sand were not there, because the thing deciding where the crate goes is Unreal's own
+    physics and it has never heard of the sand. Making the crate float needs the crate solved in
+    Newton — which is the same argument as D15 itself, one object further out.
+
+    ⚠ NEVER a mesh: urdf::KinematicBody's shapes are primitives only.
+    """
+
+    _fields_ = [
+        ("name", ctypes.c_char * MAX_STATIC_NAME_CHARS),
+        ("shape_start", ctypes.c_uint32),
+        ("shape_count", ctypes.c_uint32),
+        ("friction", ctypes.c_double),
+        ("restitution", ctypes.c_double),
+    ]
+
+    def label(self) -> str:
+        return self.name.decode("utf-8", "replace")
+
+
+class WireKinematicPose(ctypes.Structure):
+    """⚠ POSITIONALLY MATCHED to the kinematic array in the static world block, not keyed by name.
+    A name lookup per body per tick would be wasted work on a hot path, and the registration is
+    revisioned — so the contract is that pose[i] belongs to kinematic[i] of the SAME revision, and
+    the consumer must ignore poses whose revision it has not built."""
+
+    _fields_ = [
+        ("position", WireVec3),
+        ("orientation", WireQuat),
+    ]
+
+
 class WireJointCommand(ctypes.Structure):
     """One actuated joint's target for one tick."""
 
@@ -366,6 +409,12 @@ class MpmVehicleCommandBlock(ctypes.Structure):
         # the vehicle where it drove to and the sand keeps every rut. Bumping this is what tells
         # the sidecar to rebuild — fresh bed, vehicle back at its spawn.
         ("reset_epoch", ctypes.c_uint64),
+        # ⚠ THE MOVING HALF OF THE LEVEL MIRROR, on the block that is already written every tick.
+        # `kinematic_revision` says which registration these poses belong to; a consumer that has
+        # built a different revision must ignore them rather than apply pose[i] to the wrong body.
+        ("kinematic_revision", ctypes.c_uint32),
+        ("kinematic_count", ctypes.c_uint32),
+        ("kinematic_poses", WireKinematicPose * MAX_KINEMATIC_BODIES),
         ("vehicles", WireVehicleCommand * MAX_VEHICLES),
     ]
 
@@ -420,6 +469,13 @@ class WireVehiclePose(ctypes.Structure):
         ("joint_count", ctypes.c_uint32),
         ("effort_reported", ctypes.c_uint32),
         ("_pad", ctypes.c_uint32),
+        # ⚠ WHERE THE ROOT LINK WAS BUILT, constant for the life of a model. The consumer anchors
+        # its frame on THIS, never on a sampled pose. Anchoring on the first sample that happens to
+        # arrive is a race: this process free-runs, so between the consumer building and reading its
+        # first pose the robot has settled or rolled a little, and the offset silently absorbs that.
+        # The symptom is a vehicle that reappears a few centimetres from where it was last time,
+        # every reset, for no reason the operator can see.
+        ("spawn_position", WireVec3),
         ("links", WireLinkPose * MAX_LINKS_PER_VEHICLE),
         ("joints", WireJointState * MAX_JOINTS_PER_VEHICLE),
     ]
@@ -529,6 +585,9 @@ class MpmStaticWorldBlock(ctypes.Structure):
         ("truncated", ctypes.c_uint32),
         ("_pad", ctypes.c_uint32),
         ("frame_offset", WireVec3),
+        ("kinematic_count", ctypes.c_uint32),
+        ("_pad2", ctypes.c_uint32),
+        ("kinematic", WireKinematicBody * MAX_KINEMATIC_BODIES),
         ("bodies", WireStaticBody * MAX_STATIC_BODIES),
         ("shapes", WireStaticShape * MAX_STATIC_SHAPES),
         ("vertices", ctypes.c_float * (MAX_STATIC_VERTICES * 3)),

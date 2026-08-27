@@ -4,6 +4,7 @@
 #include "common/common_utils/Utils.hpp"
 
 #include <algorithm>
+#include <vector>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -170,6 +171,12 @@ struct NewtonSidecarUrdfBackend::Impl
 #endif
     bool static_published = false;
     uint32_t static_revision = 0;
+
+    /// Mirrored dynamic actors: shapes registered once, poses refreshed every tick.
+    std::vector<urdf::KinematicBody> kinematic;
+    struct KinPose { urdf::Vec3 position; urdf::Quat orientation; };
+    std::vector<KinPose> kinematic_poses;
+    bool kinematic_warned = false;
 };
 
 NewtonSidecarUrdfBackend::NewtonSidecarUrdfBackend(Options options)
@@ -316,6 +323,55 @@ void NewtonSidecarUrdfBackend::publishStaticWorld()
         ++bodies;
     }
 
+    // ⚠ THE MOVING ACTORS SHARE THE POOLS AND THE REVISION. Publishing them in a second message
+    // would let a consumer hold shapes from one registration and poses meant for another; keeping
+    // them here makes that impossible by construction.
+    uint32_t kin = 0;
+    for (const urdf::KinematicBody& kb : impl_->kinematic) {
+        if (kin >= kMaxKinematicBodies) { truncated = true; break; }
+        uint32_t need_shapes = 0, need_verts = 0, need_indices = 0;
+        for (const urdf::StaticShape& ss : kb.shapes) {
+            ++need_shapes;
+            need_verts += static_cast<uint32_t>(ss.points.size());
+            need_indices += static_cast<uint32_t>(ss.indices.size());
+        }
+        if (shapes + need_shapes > kMaxStaticShapes ||
+            verts + need_verts > kMaxStaticVertices ||
+            indices + need_indices > kMaxStaticIndices) {
+            truncated = true;
+            break;
+        }
+        WireKinematicBody& wk = b->kinematic[kin];
+        std::snprintf(wk.name, kMaxStaticNameChars, "%s", kb.name.c_str());
+        wk.friction = kb.friction;
+        wk.restitution = kb.restitution;
+        wk.shape_start = shapes;
+        wk.shape_count = need_shapes;
+        for (const urdf::StaticShape& ss : kb.shapes) {
+            WireStaticShape& ws = b->shapes[shapes++];
+            ws.kind = static_cast<uint32_t>(ss.kind);
+            ws.radius = ss.radius;
+            ws.center_a.x = ss.center_a.x; ws.center_a.y = ss.center_a.y;
+            ws.center_a.z = ss.center_a.z;
+            ws.center_b.x = ss.center_b.x; ws.center_b.y = ss.center_b.y;
+            ws.center_b.z = ss.center_b.z;
+            ws.vertex_start = verts;
+            ws.vertex_count = static_cast<uint32_t>(ss.points.size());
+            for (const urdf::Vec3& p : ss.points) {
+                b->vertices[verts * 3 + 0] = static_cast<float>(p.x);
+                b->vertices[verts * 3 + 1] = static_cast<float>(p.y);
+                b->vertices[verts * 3 + 2] = static_cast<float>(p.z);
+                ++verts;
+            }
+            ws.index_start = indices;
+            ws.index_count = static_cast<uint32_t>(ss.indices.size());
+            for (int idx : ss.indices)
+                b->indices[indices++] = idx;
+        }
+        ++kin;
+    }
+    b->kinematic_count = kin;
+
     b->body_count = bodies;
     b->shape_count = shapes;
     b->vertex_count = verts;
@@ -328,9 +384,10 @@ void NewtonSidecarUrdfBackend::publishStaticWorld()
 
     common_utils::Utils::log(
         common_utils::Utils::stringf(
-            "NewtonSidecar '%s': mirrored the level to the sidecar — %u bodies, %u shapes, "
-            "%u vertices, %u triangles, offset (%+.3f %+.3f %+.3f), revision %u.",
-            impl_->options.vehicle_name.c_str(), bodies, shapes, verts, indices / 3,
+            "NewtonSidecar '%s': mirrored the level to the sidecar — %u static bodies, %u moving "
+            "actors, %u shapes, %u vertices, %u triangles, offset (%+.3f %+.3f %+.3f), "
+            "revision %u.",
+            impl_->options.vehicle_name.c_str(), bodies, kin, shapes, verts, indices / 3,
             impl_->frame_offset.x, impl_->frame_offset.y, impl_->frame_offset.z,
             b->revision),
         common_utils::Utils::kLogLevelInfo);
@@ -358,16 +415,39 @@ bool NewtonSidecarUrdfBackend::staticWorldPublished() const
     return impl_->static_published;
 }
 
-int NewtonSidecarUrdfBackend::addKinematicBody(const urdf::KinematicBody&)
+int NewtonSidecarUrdfBackend::addKinematicBody(const urdf::KinematicBody& body)
 {
-    // ⚠ REFUSED BY RETURNING -1 RATHER THAN PRETENDING. `mirrorsKinematicBodies()` already says
-    // false, so a correct caller never gets here; returning a plausible handle would let one that
-    // ignores the query believe it had placed a body the sidecar will never know about.
-    return -1;
+    // ⚠ REGISTERED HERE, PUBLISHED WITH THE STATIC WORLD. Both halves of the level mirror are known
+    // at load and share one revision, so a consumer can never be holding shapes from one
+    // registration and poses meant for another.
+    if (impl_->kinematic.size() >= kMaxKinematicBodies) {
+        if (!impl_->kinematic_warned) {
+            impl_->kinematic_warned = true;
+            common_utils::Utils::log(
+                common_utils::Utils::stringf(
+                    "NewtonSidecar '%s': more than %u moving actors in this level; the rest are "
+                    "NOT mirrored and the robot will pass through them.",
+                    impl_->options.vehicle_name.c_str(), kMaxKinematicBodies),
+                common_utils::Utils::kLogLevelError);
+        }
+        return -1;
+    }
+    impl_->kinematic.push_back(body);
+    impl_->kinematic_poses.push_back({body.position, body.orientation});
+    // ⚠ The registration changed, so anything already published is stale.
+    impl_->static_published = false;
+    return static_cast<int>(impl_->kinematic.size()) - 1;
 }
 
-void NewtonSidecarUrdfBackend::setKinematicPose(int, const urdf::Vec3&, const urdf::Quat&)
+void NewtonSidecarUrdfBackend::setKinematicPose(int handle, const urdf::Vec3& position,
+                                                const urdf::Quat& orientation)
 {
+    // ⚠ STORED, NOT SENT HERE. This is called once per mirrored body per tick, from the game
+    // thread; writing the shared block per call would take the seqlock N times a frame and let a
+    // reader see half the actors moved. step() publishes them all inside one update.
+    if (handle < 0 || handle >= static_cast<int>(impl_->kinematic_poses.size()))
+        return;
+    impl_->kinematic_poses[handle] = {position, orientation};
 }
 
 void NewtonSidecarUrdfBackend::buildFromUrdf(const urdf::Robot& model,
@@ -474,6 +554,11 @@ void NewtonSidecarUrdfBackend::reset()
     // ⚠ THIS IS WHAT ACTUALLY RESETS ANYTHING. The vehicle is solved in another process, so the
     // simulator resetting its own world reaches none of it. Bumping the epoch is the request; the
     // sidecar rebuilds its model — fresh bed, vehicle at spawn — and the next poses reflect it.
+    // ⚠ Safe to re-resolve NOW that the anchor is a declared constant rather than a sampled pose:
+    // the sidecar rebuilds to the same spawn, so this recomputes the same offset. It exists so a
+    // sidecar restarted with a different --own-vehicle-x is picked up instead of silently using a
+    // stale offset.
+    impl_->offset_resolved = false;
     ++impl_->reset_epoch;
     common_utils::Utils::log(
         common_utils::Utils::stringf(
@@ -534,6 +619,28 @@ int NewtonSidecarUrdfBackend::step(double dt)
         // latest-wins and may miss any individual write; carrying the current value means it
         // notices the edge whenever it next looks, rather than depending on catching one frame.
         b->reset_epoch = impl_->reset_epoch;
+
+        // ⚠ ALL OF THEM INSIDE ONE UPDATE. setKinematicPose is called once per body per tick from
+        // the game thread; taking the seqlock there would let a reader see half the actors moved,
+        // which on a level with a moving platform is a solid that has torn in two.
+        //
+        // ⚠ The revision is stamped so the sidecar can refuse poses belonging to a registration it
+        // has not built. Applying pose[i] to the wrong body is a silent, plausible-looking error.
+        b->kinematic_revision = impl_->static_revision;
+        const uint32_t kin_n = static_cast<uint32_t>(
+            std::min<size_t>(impl_->kinematic_poses.size(), kMaxKinematicBodies));
+        b->kinematic_count = kin_n;
+        for (uint32_t i = 0; i < kin_n; ++i) {
+            const auto& kp = impl_->kinematic_poses[i];
+            // Shifted into the sidecar's frame by the same offset its poses come back through.
+            b->kinematic_poses[i].position.x = kp.position.x - impl_->frame_offset.x;
+            b->kinematic_poses[i].position.y = kp.position.y - impl_->frame_offset.y;
+            b->kinematic_poses[i].position.z = kp.position.z - impl_->frame_offset.z;
+            b->kinematic_poses[i].orientation.x = kp.orientation.x;
+            b->kinematic_poses[i].orientation.y = kp.orientation.y;
+            b->kinematic_poses[i].orientation.z = kp.orientation.z;
+            b->kinematic_poses[i].orientation.w = kp.orientation.w;
+        }
 
         WireVehicleCommand& v = b->vehicles[0];
         std::snprintf(v.vehicle_name, kMaxVehicleNameChars, "%s",
@@ -634,7 +741,14 @@ int NewtonSidecarUrdfBackend::step(double dt)
                 // order this backend publishes), so whatever the sidecar says it is at now becomes
                 // the solver-frame root_position the plugin asked for.
                 if (!impl_->offset_resolved && impl_->wire_link_index[0] >= 0) {
-                    const WireLinkPose& r = v.links[impl_->wire_link_index[0]];
+                    // ⚠ ANCHOR ON THE DECLARED SPAWN, NEVER ON THIS SAMPLE. The sidecar free-runs,
+                    // so by the time we read our first pose its robot has settled or rolled a
+                    // little from where it was built — and an offset derived from that sample
+                    // absorbs the difference. Every Play and every reset then anchors to a
+                    // different instant, and the vehicle reappears a few centimetres from where it
+                    // was last time with nothing to explain it. `spawn_position` is a constant the
+                    // sidecar states once per model, so the offset is the same every time.
+                    const WireVec3& r = v.spawn_position;
                     // ⚠ X AND Y ONLY. Z IS NOT ARBITRARY AND MUST NOT BE ANCHORED.
                     //
                     // Where in the level a robot stands is a free choice, so x/y are shifted to
@@ -649,20 +763,20 @@ int NewtonSidecarUrdfBackend::step(double dt)
                     // vehicle the settings' Z does NOT place the robot. The sidecar's own spawn
                     // height and ground plane do. Set them with --own-vehicle-z and --ground-z.
                     impl_->frame_offset = urdf::Vec3{
-                        impl_->requested_root.x - r.position.x,
-                        impl_->requested_root.y - r.position.y,
+                        impl_->requested_root.x - r.x,
+                        impl_->requested_root.y - r.y,
                         0.0};
                     impl_->offset_resolved = true;
                     common_utils::Utils::log(
                         common_utils::Utils::stringf(
-                            "NewtonSidecar '%s': anchoring the sidecar frame in X/Y only. It "
-                            "reports the root at (%.3f %.3f %.3f); settings ask for "
-                            "(%.3f %.3f %.3f); applying offset (%+.3f %+.3f %+.3f). Z is NOT "
-                            "anchored - the sidecar's own ground plane and spawn height decide "
-                            "height, so this robot rests where --own-vehicle-z and --ground-z put "
-                            "it, not where the settings' Z says.",
+                            "NewtonSidecar '%s': anchoring the sidecar frame in X/Y only, on the "
+                            "sidecar's DECLARED SPAWN (%.3f %.3f %.3f) rather than on a sampled "
+                            "pose; settings ask for (%.3f %.3f %.3f); applying offset "
+                            "(%+.3f %+.3f %+.3f). Z is NOT anchored - the sidecar's own ground "
+                            "plane and spawn height decide height, so this robot rests where "
+                            "--own-vehicle-z and --ground-z put it, not where the settings' Z says.",
                             impl_->options.vehicle_name.c_str(),
-                            r.position.x, r.position.y, r.position.z,
+                            r.x, r.y, r.z,
                             impl_->requested_root.x, impl_->requested_root.y,
                             impl_->requested_root.z,
                             impl_->frame_offset.x, impl_->frame_offset.y, impl_->frame_offset.z),
