@@ -9,9 +9,19 @@
 #include "Vehicles/Car/SimModeCar.h"
 #include "Vehicles/SkidSteer/SimModeSkidVehicle.h"
 #include "Vehicles/ComputerVision/SimModeComputerVision.h"
+#include "StartupCVarOverrides.h"
+#include "StartupLauncher.h"
 
 #include "common/AirSimSettings.hpp"
 #include <stdexcept>
+
+namespace
+{
+    // Map loads can destroy and recreate the HUD. Keep the approved raw document at process
+    // lifetime so the recreated HUD does not ask the user to choose the same settings twice.
+    std::string GApprovedSettingsText;
+    bool GApprovedSettingsTextValid = false;
+}
 
 ASimHUD::ASimHUD()
 {
@@ -26,6 +36,8 @@ void ASimHUD::BeginPlay()
     try {
         UAirBlueprintLib::OnBeginPlay();
         initializeSettings();
+        if (startup_cancelled_)
+            return;
         loadLevel();
 
         // Prevent a MavLink connection being established if changing levels
@@ -67,6 +79,12 @@ void ASimHUD::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
 
     UAirBlueprintLib::OnEndPlay();
+
+    if (EndPlayReason != EEndPlayReason::LevelTransition) {
+        airsim_startup::RestoreStartupCVars();
+        GApprovedSettingsText.clear();
+        GApprovedSettingsTextValid = false;
+    }
 
     Super::EndPlay(EndPlayReason);
 }
@@ -243,10 +261,27 @@ void ASimHUD::initializeSettings()
     std::string settingsText;
     if (getSettingsText(settingsText))
         AirSimSettings::initializeSettings(settingsText);
-    else
+    else if (!startup_cancelled_)
         AirSimSettings::createDefaultSettingsFile();
+    else
+        return;
 
     AirSimSettings::singleton().load(std::bind(&ASimHUD::getSimModeFromUser, this));
+    // Apply only after AirSimSettings::load has accepted the full document, but before
+    // loadLevel/createSimMode. Some CVars (for example StreamCaptureInFlight) are read once during
+    // SimMode BeginPlay; applying them later would make a seemingly valid launch ineffective.
+    const auto applied_cvars = airsim_startup::ApplyStartupCVars();
+    for (const auto& cvar : applied_cvars) {
+        UAirBlueprintLib::LogMessageString(
+            "StartupCVars override: " + cvar.name + "=" + cvar.value + " (" + cvar.type + ")",
+            "", LogDebugLevel::Informational);
+    }
+    // Cache only after the complete AirSim parser accepts the document. This allows the user to
+    // correct a malformed profile instead of getting stuck with a rejected handoff after an error.
+    if (!settingsText.empty()) {
+        GApprovedSettingsText = settingsText;
+        GApprovedSettingsTextValid = true;
+    }
     for (const auto& warning : AirSimSettings::singleton().warning_messages) {
         UAirBlueprintLib::LogMessageString(warning, "", LogDebugLevel::Failure);
     }
@@ -380,45 +415,30 @@ bool ASimHUD::getSettingsText(std::string& settingsText)
     if (getSettingsTextFromCommandLine(settingsText))
         return true;
 
-    return (getSettingsTextFromFileDialog(settingsText) ||
-            readSettingsTextFromFile(FString(msr::airlib::Settings::getExecutableFullPath("settings.json").c_str()), settingsText) ||
-            readSettingsTextFromFile(getLaunchPath("settings.json"), settingsText) ||
-            readSettingsTextFromFile(FString(msr::airlib::Settings::Settings::getUserDirectoryFullPath("settings.json").c_str()), settingsText));
+    if (GApprovedSettingsTextValid) {
+        settingsText = GApprovedSettingsText;
+        UAirBlueprintLib::LogMessageString("Reusing approved startup settings after map load", "", LogDebugLevel::Informational);
+        return true;
+    }
+
+    const bool found = (getSettingsTextFromFileDialog(settingsText) ||
+                        readSettingsTextFromFile(FString(msr::airlib::Settings::getExecutableFullPath("settings.json").c_str()), settingsText) ||
+                        readSettingsTextFromFile(getLaunchPath("settings.json"), settingsText) ||
+                        readSettingsTextFromFile(FString(msr::airlib::Settings::Settings::getUserDirectoryFullPath("settings.json").c_str()), settingsText));
+    return found;
 }
 
 bool ASimHUD::getSettingsTextFromFileDialog(std::string& settingsText)
 {
-    if (EAppReturnType::No == UAirBlueprintLib::ShowMessage(EAppMsgType::YesNo,
-        "Would you like to specify a custom settings.json file?\n\nChoose 'No' to use the default search paths.",
-        "Load Settings"))
-    {
+    // Preserve headless/automation launches: those modes must continue to use the conventional
+    // executable/launch/user search paths without opening a modal Slate window.
+    if (FParse::Param(FCommandLine::Get(), TEXT("unattended")) ||
+        FParse::Param(FCommandLine::Get(), TEXT("nullrhi")))
         return false;
-    }
-
-    IDesktopPlatform* desktopPlatform = FDesktopPlatformModule::Get();
-    if (!desktopPlatform)
-    {
-        UAirBlueprintLib::LogMessageString("File dialog unavailable in this build configuration.", "", LogDebugLevel::Failure);
-        return false;
-    }
-
-    TArray<FString> selectedFiles;
-    const FString defaultPath = FString(msr::airlib::Settings::getUserDirectoryFullPath("").c_str());
-
-    const bool bOpened = desktopPlatform->OpenFileDialog(
-        nullptr,
-        TEXT("Select settings.json"),
-        defaultPath,
-        TEXT("settings.json"),
-        TEXT("JSON Files (*.json)|*.json|All Files (*.*)|*.*"),
-        EFileDialogFlags::None,
-        selectedFiles
-    );
-
-    if (bOpened && selectedFiles.Num() > 0)
-        return readSettingsTextFromFile(selectedFiles[0], settingsText);
-
-    return false;
+    bool cancelled = false;
+    const bool launched = airsim_startup::RunStartupLauncher(settingsText, cancelled);
+    startup_cancelled_ = cancelled;
+    return launched;
 }
 
 // Attempts to parse the settings file path or the settings text from the command line

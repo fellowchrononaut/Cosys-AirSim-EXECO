@@ -10,6 +10,8 @@
 #include "cameras/CameraModel.hpp"
 #include "common_utils/Utils.hpp"
 #include "sensors/SensorBase.hpp"
+#include <cctype>
+#include <cmath>
 #include <exception>
 #include <functional>
 #include <initializer_list>
@@ -1374,6 +1376,25 @@ namespace airlib
             bool move_sun = true;
         };
 
+        /** A scalar startup override whose name is resolved against Unreal's console-variable
+         *  registry by the host integration. AirLib owns the JSON contract so every consumer of
+         *  AirSimSettings sees the same shape and build.sh stages that contract into the plugin.
+         *  AirLib deliberately does not know whether a particular Unreal CVar exists. */
+        struct StartupCVarSetting
+        {
+            enum class ValueType
+            {
+                Integer,
+                Number,
+                String
+            };
+
+            ValueType value_type = ValueType::Integer;
+            int integer_value = 0;
+            double number_value = 0.0;
+            std::string string_value;
+        };
+
     private: //fields
         float settings_version_actual;
         float settings_version_minimum = 2.0f;
@@ -1448,6 +1469,7 @@ namespace airlib
         PhysicsCoordinatorSetting physics_coordinator;
         std::map<std::string, PhysicsObjectSetting> physics_objects;
         std::map<std::string, DeformableTerrainSetting> deformable_terrains;
+        std::map<std::string, StartupCVarSetting> startup_cvars;
         float speed_unit_factor = 1.0f;
         std::string speed_unit_label = "m\\s";
         std::map<std::string, std::shared_ptr<SensorSetting>> sensor_defaults;
@@ -1487,6 +1509,7 @@ namespace airlib
 
             const Settings& settings_json = Settings::singleton();
             checkSettingsVersion(settings_json);
+            loadStartupCVarSettings(settings_json);
 
             loadCoreSimModeSettings(settings_json, simmode_getter);
             loadPhysicsCoordinatorSettings(settings_json);
@@ -1574,6 +1597,53 @@ namespace airlib
         }
 
     private:
+        void loadStartupCVarSettings(const Settings& settings_json)
+        {
+            startup_cvars.clear();
+
+            if (!settings_json.hasKey("StartupCVars"))
+                return;
+
+            Settings cvars_json;
+            if (!settings_json.getChild("StartupCVars", cvars_json) || !cvars_json.isObject())
+                throw std::invalid_argument("Settings key 'StartupCVars' must be a JSON object");
+
+            std::vector<std::string> names;
+            cvars_json.getChildNames(names);
+            for (const std::string& name : names) {
+                if (name.empty())
+                    throw std::invalid_argument("StartupCVars contains an empty CVar name");
+                for (const unsigned char character : name) {
+                    if (std::isspace(character) || std::iscntrl(character) || character == ';')
+                        throw std::invalid_argument(
+                            "StartupCVars contains an unsafe CVar name '" + name + "'");
+                }
+
+                StartupCVarSetting setting;
+                if (cvars_json.isInteger(name)) {
+                    setting.value_type = StartupCVarSetting::ValueType::Integer;
+                    setting.integer_value = cvars_json.getInt(name, 0);
+                }
+                else if (cvars_json.isNumber(name)) {
+                    setting.value_type = StartupCVarSetting::ValueType::Number;
+                    setting.number_value = cvars_json.getDouble(name, 0.0);
+                    if (!std::isfinite(setting.number_value))
+                        throw std::invalid_argument(
+                            "StartupCVars entry '" + name + "' must be a finite number");
+                }
+                else if (cvars_json.isString(name)) {
+                    setting.value_type = StartupCVarSetting::ValueType::String;
+                    setting.string_value = cvars_json.getString(name, "");
+                }
+                else {
+                    throw std::invalid_argument(
+                        "StartupCVars entry '" + name +
+                        "' must be an integer, number, or string");
+                }
+                startup_cvars.emplace(name, std::move(setting));
+            }
+        }
+
         static std::vector<std::string> getStrictObjectKeys(const Settings& object,
                                                             const std::string& path)
         {

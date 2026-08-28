@@ -24,6 +24,7 @@ namespace airlib
             testGroundHeightFieldPolicy();
             testCoordinatorSchema();
             testSingletonReloadReset();
+            testStartupCVarSettings();
             testNonObjectSchemaPositions();
             testStrictValidation();
         }
@@ -697,6 +698,61 @@ namespace airlib
             testAssert(reloaded.vehicles.find("ComputerVision") != reloaded.vehicles.end() &&
                            reloaded.vehicles.find("OldBot") == reloaded.vehicles.end(),
                        "Minimal reload retained the previous URDF vehicle");
+        }
+
+        void testStartupCVarSettings()
+        {
+            loadSettings(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "ComputerVision",
+                "StartupCVars": {
+                    "airsim.StreamCaptureInFlight": 2,
+                    "airsim.CaptureSchedulerHz": 10.5,
+                    "airsim.StreamDir": "/tmp/captures"
+                }
+            })json");
+
+            const auto& cvars = AirSimSettings::singleton().startup_cvars;
+            testAssert(cvars.size(), 3.0, "StartupCVars did not load all scalar overrides");
+            const auto& integer = cvars.at("airsim.StreamCaptureInFlight");
+            testAssert(integer.value_type == AirSimSettings::StartupCVarSetting::ValueType::Integer &&
+                           integer.integer_value == 2,
+                       "StartupCVars integer value was not preserved");
+            const auto& number = cvars.at("airsim.CaptureSchedulerHz");
+            testAssert(number.value_type == AirSimSettings::StartupCVarSetting::ValueType::Number,
+                       "StartupCVars number type was not preserved");
+            testAssert(number.number_value, 10.5,
+                       "StartupCVars number value was not preserved");
+            const auto& string = cvars.at("airsim.StreamDir");
+            testAssert(string.value_type == AirSimSettings::StartupCVarSetting::ValueType::String &&
+                           string.string_value == "/tmp/captures",
+                       "StartupCVars string value was not preserved");
+
+            loadSettings(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "ComputerVision"
+            })json");
+            testAssert(AirSimSettings::singleton().startup_cvars.empty(),
+                       "Minimal reload retained StartupCVars from the previous settings document");
+
+            expectInvalid(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "ComputerVision",
+                "StartupCVars": []
+            })json",
+                          "StartupCVars' must be a JSON object");
+            expectInvalid(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "ComputerVision",
+                "StartupCVars": { "airsim.Enabled": true }
+            })json",
+                          "must be an integer, number, or string");
+            expectInvalid(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "ComputerVision",
+                "StartupCVars": { "airsim.Test;quit": 1 }
+            })json",
+                          "unsafe CVar name");
         }
 
         void testNonObjectSchemaPositions()

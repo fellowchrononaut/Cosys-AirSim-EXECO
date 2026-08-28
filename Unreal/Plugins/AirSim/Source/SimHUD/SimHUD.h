@@ -75,4 +75,5 @@ private:
 
     APIPCamera* subwindow_cameras_[AirSimSettings::kSubwindowCount];
     bool map_changed_;
+    bool startup_cancelled_ = false;
 };
