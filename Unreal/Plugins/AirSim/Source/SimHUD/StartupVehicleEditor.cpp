@@ -1,4 +1,5 @@
 #include "StartupVehicleEditor.h"
+#include "StartupSensorEditor.h"
 
 #include "Misc/MessageDialog.h"
 #include "Widgets/Input/SButton.h"
@@ -6,6 +7,7 @@
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -88,6 +90,8 @@ struct SStartupVehicleEditor::FState
     TSharedPtr<SListView<TSharedPtr<FString>>> List; TSharedPtr<SEditableTextBox> AddName, DuplicateName, RenameName;
     TSharedPtr<SComboBox<TSharedPtr<FString>>> AddType, SelectedType; TArray<TSharedPtr<FString>> TypeChoices, SelectedTypeChoices;
     TSharedPtr<SMultiLineEditableTextBox> Advanced; TSharedPtr<SVerticalBox> Fields; TSharedPtr<STextBlock> InfoText;
+    TSharedPtr<SStartupSensorEditor> CamerasEditor; TSharedPtr<SStartupSensorEditor> SensorsEditor;
+    TSharedPtr<SWidgetSwitcher> DetailSwitcher;
     TArray<TSharedPtr<FFieldRow>> Rows; bool Updating = false;
 
     void Report(const FString& message) { if (Status) Status(message); }
@@ -159,6 +163,10 @@ struct SStartupVehicleEditor::FState
         if (Advanced.IsValid()) Advanced->SetText(FText::FromString(vehicle ? UTF8_TO_TCHAR(vehicle->dump(2).c_str()) : TEXT("{}\n")));
         if (InfoText.IsValid()) { int32 cameras = 0, sensors = 0; if (vehicle && vehicle->contains("Cameras") && (*vehicle)["Cameras"].is_object()) cameras = static_cast<int32>((*vehicle)["Cameras"].size()); if (vehicle && vehicle->contains("Sensors") && (*vehicle)["Sensors"].is_object()) sensors = static_cast<int32>((*vehicle)["Sensors"].size()); InfoText->SetText(FText::FromString(Selected.IsValid() ? FString::Printf(TEXT("Selected: %s   Cameras: %d   Sensors: %d"), **Selected, cameras, sensors) : TEXT("No vehicle selected"))); }
         Updating = false;
+        if (CamerasEditor.IsValid())
+            CamerasEditor->RefreshFromDocument();
+        if (SensorsEditor.IsValid())
+            SensorsEditor->RefreshFromDocument();
     }
     void RebuildNames()
     {
@@ -462,6 +470,46 @@ void SStartupVehicleEditor::Construct(const FArguments& args)
         state->Fields->AddSlot().AutoHeight().Padding(2.0f)[row->container.ToSharedRef()];
     }
     TWeakPtr<FState> weak_state = state;
+    auto child_read = [weak_state]()
+    {
+        if (TSharedPtr<FState> pinned_state = weak_state.Pin())
+            return pinned_state->Read ? pinned_state->Read() : FString();
+        return FString();
+    };
+    auto child_write = [weak_state](const FString& text)
+    {
+        if (TSharedPtr<FState> pinned_state = weak_state.Pin())
+        {
+            if (pinned_state->Write)
+                pinned_state->Write(text);
+            pinned_state->RefreshControls();
+        }
+    };
+    auto child_status = [weak_state](const FString& message)
+    {
+        if (TSharedPtr<FState> pinned_state = weak_state.Pin())
+            pinned_state->Report(message);
+    };
+    auto selected_vehicle = [weak_state]()
+    {
+        if (TSharedPtr<FState> pinned_state = weak_state.Pin())
+            return pinned_state->Selected.IsValid() ? *pinned_state->Selected : FString();
+        return FString();
+    };
+    TSharedRef<SStartupSensorEditor> camera_editor = SAssignNew(
+        state->CamerasEditor, SStartupSensorEditor)
+        .ReadDocument(child_read)
+        .WriteDocument(child_write)
+        .Status(child_status)
+        .SelectedVehicle(selected_vehicle)
+        .CollectionName(TEXT("Cameras"));
+    TSharedRef<SStartupSensorEditor> sensor_editor = SAssignNew(
+        state->SensorsEditor, SStartupSensorEditor)
+        .ReadDocument(child_read)
+        .WriteDocument(child_write)
+        .Status(child_status)
+        .SelectedVehicle(selected_vehicle)
+        .CollectionName(TEXT("Sensors"));
     // Keep the callbacks weak: State owns the widgets, so a strong widget callback
     // would create a State -> widget -> callback -> State ownership cycle.
     TSharedRef<SHorizontalBox> add_controls = SNew(SHorizontalBox)
@@ -498,6 +546,66 @@ void SStartupVehicleEditor::Construct(const FArguments& args)
                 }
                 return FReply::Handled();
             })];
+
+    TWeakPtr<SWidgetSwitcher> weak_detail_switcher;
+    TSharedRef<SVerticalBox> type_controls = SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(4.0f)
+        [SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(0.38f).Padding(3.0f)
+            [SNew(STextBlock).Text(FText::FromString(TEXT("VehicleType (recognized replacement)")))]
+            + SHorizontalBox::Slot().FillWidth(0.52f).Padding(3.0f)
+            [SAssignNew(state->SelectedType, SComboBox<TSharedPtr<FString>>)
+                .OptionsSource(&state->SelectedTypeChoices)
+                .OnGenerateWidget_Lambda([](TSharedPtr<FString> item)
+                {
+                    return SNew(STextBlock).Text(FText::FromString(*item));
+                })
+                .OnSelectionChanged_Lambda(
+                    [weak_state](TSharedPtr<FString> item, ESelectInfo::Type)
+                    {
+                        if (TSharedPtr<FState> pinned_state = weak_state.Pin())
+                            pinned_state->MutateType(item);
+                    })
+                [SNew(STextBlock).Text(FText::FromString(TEXT("Select vehicle")))]]];
+    TSharedRef<SVerticalBox> vehicle_details = SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight()[type_controls]
+        + SVerticalBox::Slot().FillHeight(0.5f).Padding(4.0f)
+        [SNew(SScrollBox) + SScrollBox::Slot()[state->Fields.ToSharedRef()]]
+        + SVerticalBox::Slot().FillHeight(0.45f).Padding(4.0f)
+        [SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight()
+            [SNew(STextBlock).Text(FText::FromString(
+                TEXT("Selected vehicle JSON (advanced escape hatch)")))]
+            + SVerticalBox::Slot().FillHeight(1.0f)
+            [SAssignNew(state->Advanced, SMultiLineEditableTextBox)
+                .AutoWrapText(false)]];
+    TSharedRef<SWidgetSwitcher> detail_switcher = SAssignNew(state->DetailSwitcher, SWidgetSwitcher)
+        + SWidgetSwitcher::Slot()[vehicle_details]
+        + SWidgetSwitcher::Slot()[camera_editor]
+        + SWidgetSwitcher::Slot()[sensor_editor];
+    weak_detail_switcher = detail_switcher;
+    TSharedRef<SHorizontalBox> detail_buttons = SNew(SHorizontalBox);
+    detail_buttons->AddSlot().AutoWidth().Padding(3.0f)
+        [SNew(SButton).Text(FText::FromString(TEXT("Vehicle"))).OnClicked_Lambda([weak_detail_switcher]()
+        {
+            if (TSharedPtr<SWidgetSwitcher> pinned_switcher = weak_detail_switcher.Pin())
+                pinned_switcher->SetActiveWidgetIndex(0);
+            return FReply::Handled();
+        })];
+    detail_buttons->AddSlot().AutoWidth().Padding(3.0f)
+        [SNew(SButton).Text(FText::FromString(TEXT("Cameras"))).OnClicked_Lambda([weak_detail_switcher]()
+        {
+            if (TSharedPtr<SWidgetSwitcher> pinned_switcher = weak_detail_switcher.Pin())
+                pinned_switcher->SetActiveWidgetIndex(1);
+            return FReply::Handled();
+        })];
+    detail_buttons->AddSlot().AutoWidth().Padding(3.0f)
+        [SNew(SButton).Text(FText::FromString(TEXT("Sensors"))).OnClicked_Lambda([weak_detail_switcher]()
+        {
+            if (TSharedPtr<SWidgetSwitcher> pinned_switcher = weak_detail_switcher.Pin())
+                pinned_switcher->SetActiveWidgetIndex(2);
+            return FReply::Handled();
+        })];
 
     TSharedRef<SVerticalBox> root = SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight().Padding(6.0f)[SNew(STextBlock).Text(FText::FromString(TEXT("Vehicles preserve unknown keys, Cameras, Sensors, firmware, URDF, and backend options.")))]
@@ -555,59 +663,8 @@ void SStartupVehicleEditor::Construct(const FArguments& args)
                     return FReply::Handled();
                 })]]
         + SVerticalBox::Slot().AutoHeight().Padding(4.0f)[SAssignNew(state->InfoText, STextBlock).Text(FText::FromString(TEXT("No vehicle selected")))]
-        + SVerticalBox::Slot().AutoHeight().Padding(4.0f)
-        [SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().FillWidth(0.38f).Padding(3.0f)
-            [SNew(STextBlock).Text(FText::FromString(TEXT("VehicleType (recognized replacement)")))]
-            + SHorizontalBox::Slot().FillWidth(0.52f).Padding(3.0f)
-            [SAssignNew(state->SelectedType, SComboBox<TSharedPtr<FString>>)
-                .OptionsSource(&state->SelectedTypeChoices)
-                .OnGenerateWidget_Lambda([](TSharedPtr<FString> item)
-                {
-                    return SNew(STextBlock).Text(FText::FromString(*item));
-                })
-                .OnSelectionChanged_Lambda(
-                    [weak_state](TSharedPtr<FString> item, ESelectInfo::Type)
-                    {
-                        if (TSharedPtr<FState> pinned_state = weak_state.Pin())
-                        {
-                            pinned_state->MutateType(item);
-                        }
-                    })
-                [SNew(STextBlock).Text(FText::FromString(TEXT("Select vehicle")))]]]
-        + SVerticalBox::Slot().FillHeight(0.4f).Padding(4.0f)[SNew(SScrollBox) + SScrollBox::Slot()[state->Fields.ToSharedRef()]]
-        + SVerticalBox::Slot().FillHeight(0.3f).Padding(4.0f)
-        [SNew(SVerticalBox)
-            + SVerticalBox::Slot().AutoHeight()
-            [SNew(STextBlock).Text(FText::FromString(
-                TEXT("Selected vehicle JSON (advanced escape hatch)")))]
-            + SVerticalBox::Slot().FillHeight(1.0f)
-            [SAssignNew(state->Advanced, SMultiLineEditableTextBox)
-                .AutoWrapText(false)]]
-        + SVerticalBox::Slot().AutoHeight().Padding(4.0f)
-        [SNew(SHorizontalBox)
-            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton)
-                .Text(FText::FromString(TEXT("Refresh / Revert")))
-                .OnClicked_Lambda([weak_state]()
-                {
-                    if (TSharedPtr<FState> pinned_state = weak_state.Pin())
-                    {
-                        pinned_state->RefreshControls();
-                    }
-                    return FReply::Handled();
-                })]
-            + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)
-            [SNew(SButton)
-                .Text(FText::FromString(TEXT("Apply vehicle JSON")))
-                .OnClicked_Lambda([weak_state]()
-                {
-                    if (TSharedPtr<FState> pinned_state = weak_state.Pin())
-                    {
-                        pinned_state->ApplyAdvanced();
-                    }
-                    return FReply::Handled();
-                })]];
+        + SVerticalBox::Slot().AutoHeight().Padding(4.0f)[detail_buttons]
+        + SVerticalBox::Slot().FillHeight(0.85f).Padding(4.0f)[detail_switcher];
     ChildSlot[root];
 }
 
