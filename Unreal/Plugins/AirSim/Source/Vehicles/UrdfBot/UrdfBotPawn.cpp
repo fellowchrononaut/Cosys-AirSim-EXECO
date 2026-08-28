@@ -1157,7 +1157,7 @@ void AUrdfBotPawn::buildFromModel(const urdf::Robot& model, const std::string& u
     const double build_seconds = FPlatformTime::Seconds() - build_start;
 
     UAirBlueprintLib::LogMessageString(
-        "UrdfBot: built ", Utils::stringf("%d link components for '%s' in %.2f s",
+        "UrdfBot: built ", common_utils::Utils::stringf("%d link components for '%s' in %.2f s",
                                           static_cast<int>(model.links.size()), model.name.c_str(),
                                           build_seconds),
         LogDebugLevel::Informational);

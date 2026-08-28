@@ -21,6 +21,8 @@
 #include "Widgets/Views/STableRow.h"
 #include "StartupCVarOverrides.h"
 #include "StartupVehicleEditor.h"
+#include "StartupProfileState.h"
+#include "Misc/MessageDialog.h"
 #include "Widgets/SWindow.h"
 #include "common/AirSimSettings.hpp"
 #include "common/Settings.hpp"
@@ -278,7 +280,15 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
     cancelled = false;
     if (!FSlateApplication::IsInitialized())
         return false;
+    FStartupProfileState profile_state;
+    FStartupProfilePersistence::Load(profile_state);
     FString initial_text = TEXT("{}\n");
+    FString initial_path;
+    if (!profile_state.LastProfile.IsEmpty() && FPaths::FileExists(profile_state.LastProfile) &&
+        FFileHelper::LoadFileToString(initial_text, *profile_state.LastProfile))
+    {
+        initial_path = profile_state.LastProfile;
+    }
     // Seed the editor with the first conventional file, while still allowing Open to select any
     // profile. DesktopPlatform can be unavailable in packaged builds; the raw editor remains usable.
     const FString candidates[] = {
@@ -287,14 +297,21 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         FString(msr::airlib::Settings::getUserDirectoryFullPath("settings.json").c_str())
     };
     for (const FString& candidate : candidates) {
-        if (FPaths::FileExists(candidate) && FFileHelper::LoadFileToString(initial_text, *candidate))
+        if (initial_path.IsEmpty() && FPaths::FileExists(candidate) && FFileHelper::LoadFileToString(initial_text, *candidate)) {
+            initial_path = candidate;
             break;
+        }
     }
+    profile_state.SetLoaded(initial_path, initial_text);
 
     TSharedPtr<SWindow> window;
     TSharedPtr<SMultiLineEditableTextBox> editor;
     TSharedPtr<STextBlock> feedback;
+    TSharedPtr<STextBlock> profile_label;
     TSharedPtr<SButton> launch_button;
+    TSharedPtr<SComboBox<TSharedPtr<FString>>> recent_combo;
+    TArray<TSharedPtr<FString>> recent_options;
+    bool profile_ui_guard = false;
     bool accepted = false;
     bool validation_passed = false;
 
@@ -337,6 +354,34 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
             feedback->SetText(FText::FromString(validation_error));
         if (launch_button.IsValid())
             launch_button->SetEnabled(validation_passed);
+    };
+
+    auto refresh_profile_ui = [&]() {
+        if (profile_label.IsValid()) {
+            const FString path = profile_state.CurrentPath.IsEmpty()
+                ? TEXT("Unsaved profile") : profile_state.CurrentPath;
+            profile_label->SetText(FText::FromString(
+                profile_state.IsDirty() ? path + TEXT("  * unsaved changes") : path));
+        }
+        recent_options.Reset();
+        for (const FString& path : profile_state.RecentPaths)
+            recent_options.Add(MakeShared<FString>(path));
+        if (recent_combo.IsValid()) {
+            profile_ui_guard = true;
+            recent_combo->RefreshOptions();
+            recent_combo->SetSelectedItem(nullptr);
+            profile_ui_guard = false;
+        }
+    };
+
+    auto replace_editor_text = [&](const FString& text) {
+        if (!editor.IsValid())
+            return;
+        sync_guard = true;
+        editor->SetText(FText::FromString(text));
+        sync_guard = false;
+        profile_state.SetCurrentText(text);
+        refresh_profile_ui();
     };
 
     TArray<TSharedPtr<FCommonSettingRow>> common_rows;
@@ -404,9 +449,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
                 if (has_value)
                     SetJsonPath(document, descriptor.path, value);
             }
-            sync_guard = true;
-            editor->SetText(FText::FromString(UTF8_TO_TCHAR(document.dump(2).c_str())));
-            sync_guard = false;
+            replace_editor_text(UTF8_TO_TCHAR(document.dump(2).c_str()));
             if (refresh_common)
                 refresh_common();
             validation_passed = false;
@@ -467,7 +510,8 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         }
     };
 
-    auto validate = [&]() {
+    std::function<bool()> validate;
+    validate = [&]() {
         validation_error.Empty();
         const bool valid = ValidateText(editor->GetText().ToString(), validation_error);
         validation_passed = valid;
@@ -477,6 +521,32 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
             refresh_vehicles();
         set_feedback();
         return valid;
+    };
+
+    auto confirm_discard = [&]() {
+        if (!profile_state.IsDirty())
+            return true;
+        return FMessageDialog::Open(
+            EAppMsgType::YesNo,
+            FText::FromString(TEXT("Discard unsaved profile changes?"))) == EAppReturnType::Yes;
+    };
+
+    auto load_profile_file = [&](const FString& requested_path, const TCHAR* operation) {
+        const FString path = FStartupProfileState::NormalizePath(requested_path);
+        FString loaded;
+        if (path.IsEmpty() || !FPaths::FileExists(path) || !FFileHelper::LoadFileToString(loaded, *path)) {
+            validation_error = FString::Printf(TEXT("Could not load %s: %s"), operation, *path);
+            set_feedback();
+            return false;
+        }
+        profile_state.SetLoaded(path, loaded);
+        replace_editor_text(loaded);
+        FStartupProfilePersistence::Save(profile_state);
+        const bool valid = validate();
+        if (valid)
+            validation_error = FString::Printf(TEXT("Loaded %s."), *path);
+        set_feedback();
+        return true;
     };
 
     auto open_file = [&]() {
@@ -489,14 +559,61 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         TArray<FString> files;
         if (desktop->OpenFileDialog(nullptr, TEXT("Open AirSim settings JSON"), FPaths::LaunchDir(), TEXT("settings.json"),
                                     TEXT("JSON Files (*.json)|*.json|All Files (*.*)|*.*"), EFileDialogFlags::None, files) && files.Num() > 0) {
-            FString loaded;
-            if (FFileHelper::LoadFileToString(loaded, *files[0])) {
-                sync_guard = true;
-                editor->SetText(FText::FromString(loaded));
-                sync_guard = false;
-                validate();
-            }
+            if (confirm_discard())
+                load_profile_file(files[0], TEXT("profile"));
         }
+    };
+
+    auto load_recent = [&]() {
+        if (!recent_combo.IsValid() || profile_ui_guard)
+            return;
+        const TSharedPtr<FString> selected = recent_combo->GetSelectedItem();
+        if (!selected.IsValid() || selected->IsEmpty()) {
+            validation_error = TEXT("Select a recent profile, then press Load Recent.");
+            set_feedback();
+            return;
+        }
+        const FString path = *selected;
+        if (!FPaths::FileExists(path)) {
+            profile_state.RemoveRecentPath(path);
+            FStartupProfilePersistence::Save(profile_state);
+            refresh_profile_ui();
+            validation_error = TEXT("That recent profile no longer exists.");
+            set_feedback();
+            return;
+        }
+        if (confirm_discard())
+            load_profile_file(path, TEXT("recent profile"));
+    };
+
+    auto save_current = [&]() {
+        if (profile_state.CurrentPath.IsEmpty()) {
+            validation_error = TEXT("No current profile path; use Save As.");
+            set_feedback();
+            return;
+        }
+        if (!FFileHelper::SaveStringToFile(editor->GetText().ToString(), *profile_state.CurrentPath)) {
+            validation_error = TEXT("Could not save the current settings file.");
+            set_feedback();
+            return;
+        }
+        profile_state.SetCurrentText(editor->GetText().ToString());
+        profile_state.MarkSaved();
+        profile_state.AddRecentPath(profile_state.CurrentPath);
+        FStartupProfilePersistence::Save(profile_state);
+        refresh_profile_ui();
+        validation_error = TEXT("Saved current settings file.");
+        set_feedback();
+    };
+
+    auto revert_current = [&]() {
+        if (profile_state.CurrentPath.IsEmpty()) {
+            validation_error = TEXT("No current profile to revert.");
+            set_feedback();
+            return;
+        }
+        if (confirm_discard())
+            load_profile_file(profile_state.CurrentPath, TEXT("current profile"));
     };
 
     auto save_as = [&]() {
@@ -509,11 +626,16 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         TArray<FString> files;
         if (desktop->SaveFileDialog(nullptr, TEXT("Save AirSim settings JSON"), FPaths::LaunchDir(), TEXT("settings.json"),
                                     TEXT("JSON Files (*.json)|*.json|All Files (*.*)|*.*"), EFileDialogFlags::None, files) && files.Num() > 0) {
-            if (!FFileHelper::SaveStringToFile(editor->GetText().ToString(), *files[0])) {
+            const FString path = FStartupProfileState::NormalizePath(files[0]);
+            const FString text = editor->GetText().ToString();
+            if (!FFileHelper::SaveStringToFile(text, *path)) {
                 validation_error = TEXT("Could not save the selected settings file.");
                 set_feedback();
             }
             else {
+                profile_state.SetLoaded(path, text);
+                FStartupProfilePersistence::Save(profile_state);
+                refresh_profile_ui();
                 validation_error = TEXT("Saved settings file.");
                 set_feedback();
             }
@@ -571,9 +693,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
                 if (document["StartupCVars"].empty())
                     document.erase("StartupCVars");
                 cvar_hint_inherited = false;
-                sync_guard = true;
-                editor->SetText(FText::FromString(UTF8_TO_TCHAR(document.dump(2).c_str())));
-                sync_guard = false;
+                replace_editor_text(UTF8_TO_TCHAR(document.dump(2).c_str()));
                 validation_passed = false;
                 validation_error = TEXT("CVar override cleared from raw JSON; press Validate.");
                 set_feedback();
@@ -594,9 +714,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
             }
             else
                 document["StartupCVars"][TCHAR_TO_UTF8(*name)] = value;
-            sync_guard = true;
-            editor->SetText(FText::FromString(UTF8_TO_TCHAR(document.dump(2).c_str())));
-            sync_guard = false;
+            replace_editor_text(UTF8_TO_TCHAR(document.dump(2).c_str()));
             validation_passed = false;
             validation_error = TEXT("Override added to raw JSON; press Validate.");
             set_feedback();
@@ -622,9 +740,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
                 document["StartupCVars"].erase(TCHAR_TO_UTF8(*name));
             if (document.contains("StartupCVars") && document["StartupCVars"].is_object() && document["StartupCVars"].empty())
                 document.erase("StartupCVars");
-            sync_guard = true;
-            editor->SetText(FText::FromString(UTF8_TO_TCHAR(document.dump(2).c_str())));
-            sync_guard = false;
+            replace_editor_text(UTF8_TO_TCHAR(document.dump(2).c_str()));
             validation_passed = false;
             validation_error = TEXT("Override removed from raw JSON; press Validate.");
             set_feedback();
@@ -641,9 +757,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         [SAssignNew(vehicle_editor, SStartupVehicleEditor)
             .ReadDocument([&]() { return editor.IsValid() ? editor->GetText().ToString() : initial_text; })
             .WriteDocument([&](const FString& text) {
-                sync_guard = true;
-                editor->SetText(FText::FromString(text));
-                sync_guard = false;
+                replace_editor_text(text);
                 validation_passed = false;
                 validation_error = TEXT("Vehicle changed raw JSON; press Validate.");
                 set_feedback();
@@ -658,8 +772,6 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
             vehicle_editor->RefreshFromDocument();
     };
 
-    // Build the common form before the switcher so each row has a stable widget and can be
-    // refreshed from the one raw document after Validate/Open JSON.
     common_form = SNew(SVerticalBox);
     FString current_group;
     for (const TSharedPtr<FCommonSettingRow>& row : common_rows) {
@@ -703,8 +815,10 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         [SNew(STextBlock).Text(FText::FromString(TEXT("Complete settings document. Unknown and dynamic keys are preserved.")))]
         + SVerticalBox::Slot().FillHeight(1.0f).Padding(12.0f)
         [SAssignNew(editor, SMultiLineEditableTextBox).Text(FText::FromString(initial_text)).AutoWrapText(false)
-            .OnTextChanged_Lambda([&](const FText&) {
+            .OnTextChanged_Lambda([&](const FText& changed_text) {
                 if (!sync_guard) {
+                    profile_state.SetCurrentText(changed_text.ToString());
+                    refresh_profile_ui();
                     validation_passed = false;
                     validation_error = TEXT("Text changed; press Validate again.");
                     set_feedback();
@@ -812,6 +926,29 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
             [SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(0.36f).Padding(3.0f)
+                    [SAssignNew(profile_label, STextBlock).Text(FText::FromString(TEXT("Unsaved profile")))]
+                + SHorizontalBox::Slot().FillWidth(0.34f).Padding(3.0f)
+                    [SAssignNew(recent_combo, SComboBox<TSharedPtr<FString>>)
+                        .OptionsSource(&recent_options)
+                        .OnGenerateWidget_Lambda([](TSharedPtr<FString> path) {
+                            return SNew(STextBlock).Text(FText::FromString(*path));
+                        })
+                        [SNew(STextBlock).Text_Lambda([&]() {
+                            const TSharedPtr<FString> selected = recent_combo.IsValid()
+                                ? recent_combo->GetSelectedItem() : nullptr;
+                            return selected.IsValid() && !selected->IsEmpty()
+                                ? FText::FromString(*selected)
+                                : FText::FromString(TEXT("Select recent profile"));
+                        })]]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Load Recent"))).OnClicked_Lambda([&]() { load_recent(); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Save"))).OnClicked_Lambda([&]() { save_current(); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Revert"))).OnClicked_Lambda([&]() { revert_current(); return FReply::Handled(); })]]
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
+            [SNew(SHorizontalBox)
                 + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
                     [SNew(SButton).Text(FText::FromString(TEXT("Common Settings"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(0); return FReply::Handled(); })]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
@@ -855,6 +992,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
 
     refresh_common();
     refresh_vehicles();
+    refresh_profile_ui();
 
     window->SetOnWindowClosed(FOnWindowClosed::CreateLambda([&](const TSharedRef<SWindow>&) {
         // Alt-F4/window-manager close is cancellation, never an implicit default-settings launch.
