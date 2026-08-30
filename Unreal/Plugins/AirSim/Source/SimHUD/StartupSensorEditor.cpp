@@ -1,11 +1,13 @@
 #include "StartupSensorEditor.h"
+#include "StartupCameraSettingsEditor.h"
 
 #include "Misc/MessageDialog.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
-#include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SListView.h"
@@ -150,7 +152,9 @@ struct SStartupSensorEditor::FState
     TSharedPtr<SMultiLineEditableTextBox> Advanced;
     TSharedPtr<SVerticalBox> Fields;
     TSharedPtr<STextBlock> InfoText;
-        TArray<TSharedPtr<FNestedFieldRow>> Rows;
+    TArray<TSharedPtr<FNestedFieldRow>> Rows;
+    TSharedPtr<SStartupCameraSettingsEditor> CameraSettings;
+    TSharedPtr<SWidgetSwitcher> CameraSubview;
 
     void Report(const FString& message) const
     {
@@ -269,6 +273,8 @@ struct SStartupSensorEditor::FState
                 }
                 Updating = false;
                 RefreshControls();
+                if (IsCamera && CameraSettings.IsValid())
+                    CameraSettings->RefreshFromDocument();
                 Report(CollectionName + TEXT(" must be a JSON object."));
                 return;
             }
@@ -284,6 +290,8 @@ struct SStartupSensorEditor::FState
         if (List.IsValid()) { List->RequestListRefresh(); List->SetSelection(Selected); }
         Updating = false;
         RefreshControls();
+        if (IsCamera && CameraSettings.IsValid())
+            CameraSettings->RefreshFromDocument();
     }
 
     void RefreshControls()
@@ -415,7 +423,19 @@ struct SStartupSensorEditor::FState
         const std::string key = TCHAR_TO_UTF8(*name);
         if (collection.contains(key)) { Report(TEXT("Nested name already exists.")); return; }
         Json object = Json::object();
-        if (!IsCamera)
+        if (IsCamera)
+        {
+            // CameraSetting uses NaN to mean "use the component default".  A newly
+            // authored camera has no component default yet, so make its pose explicit;
+            // otherwise dynamic spawning hands Unreal a NaN transform and can crash.
+            object["X"] = 0.0;
+            object["Y"] = 0.0;
+            object["Z"] = 0.0;
+            object["Pitch"] = 0.0;
+            object["Roll"] = 0.0;
+            object["Yaw"] = 0.0;
+        }
+        else
         {
             object["SensorType"] = SensorTypeValues[type_index];
             object["Enabled"] = enabled_index == 1;
@@ -456,7 +476,14 @@ struct SStartupSensorEditor::FState
         if (!ReadJson(document, error)) { Report(TEXT("Nested delete refused: ") + error); return; }
         Json* vehicle = FindVehicle(document, VehicleName()); Json* collection = FindCollection(document, VehicleName(), CollectionName);
         if (!vehicle || !collection) { Report(CollectionName + TEXT(" must be a JSON object.")); return; }
-        collection->erase(TCHAR_TO_UTF8(**Selected)); if (collection->empty()) vehicle->erase(TCHAR_TO_UTF8(*CollectionName));
+        collection->erase(TCHAR_TO_UTF8(**Selected));
+        // For sensors, an explicitly empty object is meaningful: it suppresses AirSim's
+        // sim-mode default IMU/GPS/etc. population. Keep the empty Sensors object after deleting
+        // its last entry so the structured editor can express a true zero-sensor vehicle. Camera
+        // collections retain the historical omission semantics because absent Cameras already
+        // means no authored cameras.
+        if (collection->empty() && IsCamera)
+            vehicle->erase(TCHAR_TO_UTF8(*CollectionName));
         Selected.Reset(); Publish(document, TEXT("Nested object deleted; press Validate."));
     }
 
@@ -530,26 +557,46 @@ void SStartupSensorEditor::Construct(const FArguments& args)
     }
     TWeakPtr<FState> weak_state = state;
     TSharedRef<SVerticalBox> root = SNew(SVerticalBox)
-        + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SNew(STextBlock).Text(FText::FromString(state->IsCamera ? TEXT("Named vehicle Cameras; CaptureSettings and NoiseSettings remain in the raw object editor.") : TEXT("Named vehicle Sensors; type-specific settings remain in the raw object editor.")))]
+        + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SNew(STextBlock).Text(FText::FromString(state->IsCamera ? TEXT("Camera object controls; use Capture, Noise & Model for camera settings.") : TEXT("Named vehicle Sensors; type-specific settings remain in the raw object editor.")))]
         + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SNew(SHorizontalBox)
             + SHorizontalBox::Slot().FillWidth(0.28f)[SAssignNew(state->AddName, SEditableTextBox).HintText(FText::FromString(TEXT("New name")))]
             + SHorizontalBox::Slot().FillWidth(0.22f)[SAssignNew(state->AddSensorType, SComboBox<TSharedPtr<FString>>).OptionsSource(&state->SensorTypeChoices).OnGenerateWidget_Lambda([](TSharedPtr<FString> item) { return SNew(STextBlock).Text(FText::FromString(*item)); })[SNew(STextBlock).Text(FText::FromString(TEXT("Select SensorType")))]]
             + SHorizontalBox::Slot().FillWidth(0.18f)[SAssignNew(state->AddEnabled, SComboBox<TSharedPtr<FString>>).OptionsSource(&state->AddEnabledChoices).OnGenerateWidget_Lambda([](TSharedPtr<FString> item) { return SNew(STextBlock).Text(FText::FromString(*item)); })[SNew(STextBlock).Text(FText::FromString(TEXT("Select Enabled")))]]
             + SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Add"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) pinned_state->AddObject(); return FReply::Handled(); })]
             + SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Delete"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) pinned_state->DeleteObject(); return FReply::Handled(); })]]
-        + SVerticalBox::Slot().FillHeight(0.18f).Padding(3.0f)[SAssignNew(state->List, SListView<TSharedPtr<FString>>).ListItemsSource(&state->Names).OnSelectionChanged_Lambda([weak_state](TSharedPtr<FString> name, ESelectInfo::Type) { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) { if (pinned_state->Updating) return; pinned_state->Selected = name; pinned_state->RefreshControls(); } }).OnGenerateRow_Lambda([](TSharedPtr<FString> name, const TSharedRef<STableViewBase>& owner) { return SNew(STableRow<TSharedPtr<FString>>, owner)[SNew(STextBlock).Text(FText::FromString(*name))]; })]
+        + SVerticalBox::Slot().FillHeight(0.18f).Padding(3.0f)[SNew(SBox).MinDesiredHeight(120.0f)[SAssignNew(state->List, SListView<TSharedPtr<FString>>).ListItemsSource(&state->Names).OnSelectionChanged_Lambda([weak_state](TSharedPtr<FString> name, ESelectInfo::Type) { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) { if (pinned_state->Updating) return; pinned_state->Selected = name; pinned_state->RefreshControls(); if (pinned_state->IsCamera && pinned_state->CameraSettings.IsValid()) pinned_state->CameraSettings->RefreshFromDocument(); } }).OnGenerateRow_Lambda([](TSharedPtr<FString> name, const TSharedRef<STableViewBase>& owner) { return SNew(STableRow<TSharedPtr<FString>>, owner)[SNew(STextBlock).Text(FText::FromString(*name))]; })]]
         + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SNew(SHorizontalBox)
             + SHorizontalBox::Slot().FillWidth(0.28f)[SAssignNew(state->DuplicateName, SEditableTextBox).HintText(FText::FromString(TEXT("Duplicate as...")))]
             + SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Duplicate"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) pinned_state->DuplicateObject(); return FReply::Handled(); })]
             + SHorizontalBox::Slot().FillWidth(0.28f)[SAssignNew(state->RenameName, SEditableTextBox).HintText(FText::FromString(TEXT("Rename as...")))]
             + SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Rename"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) pinned_state->RenameObject(); return FReply::Handled(); })]]
         + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SAssignNew(state->InfoText, STextBlock).Text(FText::FromString(TEXT("No nested object selected")))]
-        + SVerticalBox::Slot().FillHeight(0.34f).Padding(3.0f)[SNew(SScrollBox) + SScrollBox::Slot()[state->Fields.ToSharedRef()]]
-        + SVerticalBox::Slot().FillHeight(0.28f).Padding(3.0f)[SNew(SVerticalBox) + SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(TEXT("Selected object JSON")))] + SVerticalBox::Slot().FillHeight(1.0f)[SAssignNew(state->Advanced, SMultiLineEditableTextBox).AutoWrapText(false)]]
+        // The parent launcher provides the single main vertical scrollbar. Do not constrain the
+        // long camera/sensor form to a small nested scroll viewport.
+        + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[state->Fields.ToSharedRef()]
+        + SVerticalBox::Slot().FillHeight(0.28f).Padding(3.0f)[SNew(SVerticalBox) + SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).Text(FText::FromString(TEXT("Selected object JSON")))] + SVerticalBox::Slot().FillHeight(1.0f)[SNew(SBox).MinDesiredHeight(180.0f)[SAssignNew(state->Advanced, SMultiLineEditableTextBox).AutoWrapText(false)]]]
         + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SNew(SHorizontalBox)
             + SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Refresh / Revert"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) pinned_state->RefreshControls(); return FReply::Handled(); })]
             + SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Apply object JSON"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) pinned_state->ApplyAdvanced(); return FReply::Handled(); })]];
-    ChildSlot[root];
+    if (state->IsCamera)
+    {
+        state->CameraSettings = SAssignNew(state->CameraSettings, SStartupCameraSettingsEditor)
+            .ReadDocument(state->Read)
+            .WriteDocument(state->Write)
+            .Status(state->Status)
+            .SelectedVehicle(state->SelectedVehicle)
+            .SelectedCamera([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) return pinned_state->Selected.IsValid() ? *pinned_state->Selected : FString(); return FString(); });
+        state->CameraSubview = SNew(SWidgetSwitcher)
+            + SWidgetSwitcher::Slot()[root]
+            + SWidgetSwitcher::Slot()[state->CameraSettings.ToSharedRef()];
+        ChildSlot[SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight().Padding(3.0f)[SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[SNew(SButton).Text(FText::FromString(TEXT("Camera object"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) if (pinned_state->CameraSubview.IsValid()) pinned_state->CameraSubview->SetActiveWidgetIndex(0); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(2.0f)[SNew(SButton).Text(FText::FromString(TEXT("Capture, Noise & Model"))).OnClicked_Lambda([weak_state]() { if (TSharedPtr<FState> pinned_state = weak_state.Pin()) if (pinned_state->CameraSubview.IsValid()) pinned_state->CameraSubview->SetActiveWidgetIndex(1); return FReply::Handled(); })]]
+            + SVerticalBox::Slot().FillHeight(1.0f)[state->CameraSubview.ToSharedRef()]];
+    }
+    else
+        ChildSlot[root];
     if (state->AddSensorType.IsValid() && state->IsCamera)
         state->AddSensorType->SetVisibility(EVisibility::Collapsed);
     if (state->AddEnabled.IsValid() && state->IsCamera)

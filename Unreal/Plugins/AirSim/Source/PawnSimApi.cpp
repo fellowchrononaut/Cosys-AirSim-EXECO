@@ -14,6 +14,8 @@
 #include "Materials/MaterialParameterCollectionInstance.h"
 #include "DrawDebugHelpers.h"
 
+#include <cmath>
+
 PawnSimApi::PawnSimApi(const Params& params)
     : params_(params), ned_transform_(params.pawn, *params.global_transform)
 {
@@ -164,8 +166,24 @@ void PawnSimApi::setupLightsFromSettings(const common_utils::UniqueValueMap<std:
 
 void PawnSimApi::createCamerasFromSettings()
 {
+    if (params_.pawn == nullptr) {
+        UE_LOG(LogTemp, Error, TEXT("Cannot create configured cameras for '%s': pawn is null."), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+        return;
+    }
+    UWorld* world = params_.pawn->GetWorld();
+    if (world == nullptr) {
+        UE_LOG(LogTemp, Error, TEXT("Cannot create configured cameras for '%s': pawn has no world."), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+        return;
+    }
+    if (params_.pip_camera_class == nullptr) {
+        UE_LOG(LogTemp, Error, TEXT("Cannot create configured cameras for '%s': PIP camera class is null."), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+        return;
+    }
     //UStaticMeshComponent* bodyMesh = UAirBlueprintLib::GetActorComponent<UStaticMeshComponent>(this, TEXT("BodyMesh"));
     USceneComponent* bodyMesh = params_.pawn->GetRootComponent();
+    if (bodyMesh == nullptr) {
+        UE_LOG(LogTemp, Warning, TEXT("Configured cameras for '%s' will not be attached: pawn root component is null."), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+    }
     FActorSpawnParameters camera_spawn_params;
     camera_spawn_params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
     const auto& transform = getNedTransform();
@@ -174,17 +192,49 @@ void PawnSimApi::createCamerasFromSettings()
     for (const auto& camera_setting_pair : getVehicleSetting()->cameras) {
         const auto& setting = camera_setting_pair.second;
 
+        // Only settings-created cameras are normalized here.  Existing pawn cameras
+        // retain CameraSetting's NaN-as-default semantics in setupCamerasFromSettings.
+        const bool finite_pose = std::isfinite(setting.position.x()) &&
+                                  std::isfinite(setting.position.y()) &&
+                                  std::isfinite(setting.position.z()) &&
+                                  std::isfinite(setting.rotation.pitch) &&
+                                  std::isfinite(setting.rotation.roll) &&
+                                  std::isfinite(setting.rotation.yaw);
+        if (!finite_pose) {
+            UE_LOG(LogTemp, Warning, TEXT("Configured camera '%s' on '%s' has an invalid position/rotation component; replacing invalid components with zero."),
+                   UTF8_TO_TCHAR(camera_setting_pair.first.c_str()), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+        }
+
+        const auto finite_or_zero = [](double value) { return std::isfinite(value) ? value : 0.0; };
+        const Vector3r safe_position(finite_or_zero(setting.position.x()),
+                                     finite_or_zero(setting.position.y()),
+                                     finite_or_zero(setting.position.z()));
+        const double safe_pitch = finite_or_zero(setting.rotation.pitch);
+        const double safe_roll = finite_or_zero(setting.rotation.roll);
+        const double safe_yaw = finite_or_zero(setting.rotation.yaw);
+
         //get pose
-        FVector position = transform.fromLocalNed(setting.position) - transform.fromLocalNed(Vector3r::Zero());
-        FTransform camera_transform(FRotator(setting.rotation.pitch, setting.rotation.yaw, setting.rotation.roll),
+        FVector position = transform.fromLocalNed(safe_position) - transform.fromLocalNed(Vector3r::Zero());
+        FTransform camera_transform(FRotator(safe_pitch, safe_yaw, safe_roll),
                                     position,
                                     FVector(1., 1., 1.));
 
         //spawn and attach camera to pawn
 
-        APIPCamera* camera = params_.pawn->GetWorld()->SpawnActor<APIPCamera>(params_.pip_camera_class, camera_transform, camera_spawn_params);
-        if (!setting.external){
-            camera->AttachToComponent(bodyMesh, FAttachmentTransformRules::KeepRelativeTransform);
+        APIPCamera* camera = world->SpawnActor<APIPCamera>(params_.pip_camera_class, camera_transform, camera_spawn_params);
+        if (camera == nullptr) {
+            UE_LOG(LogTemp, Error, TEXT("Failed to spawn configured camera '%s' on '%s'; camera was not registered."),
+                   UTF8_TO_TCHAR(camera_setting_pair.first.c_str()), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+            continue;
+        }
+        if (!setting.external) {
+            if (bodyMesh == nullptr) {
+                UE_LOG(LogTemp, Warning, TEXT("Configured camera '%s' on '%s' spawned but was not attached: pawn root component is null."),
+                       UTF8_TO_TCHAR(camera_setting_pair.first.c_str()), UTF8_TO_TCHAR(params_.vehicle_name.c_str()));
+            }
+            else {
+                camera->AttachToComponent(bodyMesh, FAttachmentTransformRules::KeepRelativeTransform);
+            }
         }
         //add on to our collection
         cameras_.insert_or_assign(camera_setting_pair.first, camera);

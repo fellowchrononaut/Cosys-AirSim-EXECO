@@ -24,6 +24,7 @@ namespace airlib
             testGroundHeightFieldPolicy();
             testCoordinatorSchema();
             testSingletonReloadReset();
+            testVehicleSensorCollectionSemantics();
             testStartupCVarSettings();
             testNonObjectSchemaPositions();
             testStrictValidation();
@@ -698,6 +699,64 @@ namespace airlib
             testAssert(reloaded.vehicles.find("ComputerVision") != reloaded.vehicles.end() &&
                            reloaded.vehicles.find("OldBot") == reloaded.vehicles.end(),
                        "Minimal reload retained the previous URDF vehicle");
+        }
+
+        void testVehicleSensorCollectionSemantics()
+        {
+            // MultiAgent supplies the conventional IMU, magnetometer, GPS and barometer
+            // defaults. An absent per-vehicle Sensors object keeps that historical behaviour.
+            loadSettings(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "MultiAgent",
+                "Vehicles": {
+                    "Drone": { "VehicleType": "simpleflight" }
+                }
+            })json");
+            const AirSimSettings::VehicleSetting* absent =
+                AirSimSettings::singleton().getVehicleSetting("Drone");
+            testAssert(absent != nullptr && absent->sensors.size() == 4,
+                       "Absent vehicle Sensors must retain MultiAgent sensor defaults");
+
+            // An explicit empty object is the opt-out used by the startup editor when the user
+            // wants a vehicle with no sensors at all.
+            loadSettings(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "MultiAgent",
+                "Vehicles": {
+                    "Drone": {
+                        "VehicleType": "simpleflight",
+                        "Sensors": {}
+                    }
+                }
+            })json");
+            const AirSimSettings::VehicleSetting* empty =
+                AirSimSettings::singleton().getVehicleSetting("Drone");
+            testAssert(empty != nullptr && empty->sensors.empty(),
+                       "Explicit empty vehicle Sensors must suppress defaults");
+
+            // Non-empty collections retain the legacy partial-override rule: authored sensor
+            // types win, while the remaining default types are still filled in.
+            loadSettings(R"json({
+                "SettingsVersion": 2.0,
+                "SimMode": "MultiAgent",
+                "Vehicles": {
+                    "Drone": {
+                        "VehicleType": "simpleflight",
+                        "Sensors": {
+                            "imu": { "SensorType": 2, "Enabled": false }
+                        }
+                    }
+                }
+            })json");
+            const AirSimSettings::VehicleSetting* partial =
+                AirSimSettings::singleton().getVehicleSetting("Drone");
+            testAssert(partial != nullptr && partial->sensors.size() == 4 &&
+                           partial->sensors.count("imu") == 1 &&
+                           partial->sensors.at("imu")->enabled == false &&
+                           partial->sensors.count("gps") == 1 &&
+                           partial->sensors.count("magnetometer") == 1 &&
+                           partial->sensors.count("barometer") == 1,
+                       "Non-empty vehicle Sensors must preserve partial default fill");
         }
 
         void testStartupCVarSettings()

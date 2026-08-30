@@ -6,7 +6,6 @@
 #include "Widgets/Input/SComboBox.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
-#include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SBoxPanel.h"
@@ -569,8 +568,10 @@ void SStartupVehicleEditor::Construct(const FArguments& args)
                 [SNew(STextBlock).Text(FText::FromString(TEXT("Select vehicle")))]]];
     TSharedRef<SVerticalBox> vehicle_details = SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight()[type_controls]
-        + SVerticalBox::Slot().FillHeight(0.5f).Padding(4.0f)
-        [SNew(SScrollBox) + SScrollBox::Slot()[state->Fields.ToSharedRef()]]
+        // The launcher owns the single vertical scroll area. Keeping this form unwrapped avoids
+        // a nested, half-height scrollbar when a vehicle has URDF/backend fields.
+        + SVerticalBox::Slot().AutoHeight().Padding(4.0f)
+        [state->Fields.ToSharedRef()]
         + SVerticalBox::Slot().FillHeight(0.45f).Padding(4.0f)
         [SNew(SVerticalBox)
             + SVerticalBox::Slot().AutoHeight()
@@ -611,6 +612,7 @@ void SStartupVehicleEditor::Construct(const FArguments& args)
         + SVerticalBox::Slot().AutoHeight().Padding(6.0f)[SNew(STextBlock).Text(FText::FromString(TEXT("Vehicles preserve unknown keys, Cameras, Sensors, firmware, URDF, and backend options.")))]
         + SVerticalBox::Slot().AutoHeight().Padding(4.0f)[add_controls]
         + SVerticalBox::Slot().FillHeight(0.22f).Padding(4.0f)
+        [SNew(SBox).MinDesiredHeight(120.0f)
         [SAssignNew(state->List, SListView<TSharedPtr<FString>>)
             .ListItemsSource(&state->Names)
             .OnSelectionChanged_Lambda(
@@ -631,7 +633,7 @@ void SStartupVehicleEditor::Construct(const FArguments& args)
                 {
                     return SNew(STableRow<TSharedPtr<FString>>, owner)
                         [SNew(STextBlock).Text(FText::FromString(*name))];
-                })]
+                })]]
         + SVerticalBox::Slot().AutoHeight().Padding(4.0f)
         [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().FillWidth(0.32f).Padding(2.0f)

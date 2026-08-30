@@ -11,6 +11,7 @@
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
 #include "Widgets/Layout/SSpacer.h"
+#include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/SBoxPanel.h"
@@ -27,6 +28,10 @@
 #include "common/AirSimSettings.hpp"
 #include "common/Settings.hpp"
 #include "common/common_utils/json.hpp"
+
+#if WITH_EDITOR
+#include "Editor.h"
+#endif
 
 #include <cctype>
 #include <cerrno>
@@ -273,6 +278,18 @@ namespace
             return false;
         }
     }
+
+    void RequestEndPlayAfterStartupCancel()
+    {
+#if WITH_EDITOR
+        // The launcher is opened during BeginPlay, so merely destroying its modal window leaves
+        // the current PIE world running with ASimHUD intentionally uninitialised. Queue the normal
+        // editor teardown; it runs after the current Slate/game-thread callback returns and lets
+        // ASimHUD::EndPlay restore CVars and release any partially-created state.
+        if (GEditor != nullptr && GEditor->PlayWorld != nullptr)
+            GEditor->RequestEndPlayMap();
+#endif
+    }
 }
 
 bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
@@ -345,7 +362,9 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
 
     window = SNew(SWindow)
         .Title(FText::FromString(TEXT("AirSim Startup Launcher")))
-        .ClientSize(FVector2D(980.0f, 720.0f))
+        // Give the structured editors enough room for their long forms. The window remains
+        // resizable/maximizable, but this is a much more useful starting size on a desktop.
+        .ClientSize(FVector2D(1200.0f, 850.0f))
         .SupportsMaximize(true)
         .SupportsMinimize(false);
 
@@ -814,16 +833,17 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
         + SVerticalBox::Slot().AutoHeight().Padding(12.0f)
         [SNew(STextBlock).Text(FText::FromString(TEXT("Complete settings document. Unknown and dynamic keys are preserved.")))]
         + SVerticalBox::Slot().FillHeight(1.0f).Padding(12.0f)
-        [SAssignNew(editor, SMultiLineEditableTextBox).Text(FText::FromString(initial_text)).AutoWrapText(false)
-            .OnTextChanged_Lambda([&](const FText& changed_text) {
-                if (!sync_guard) {
-                    profile_state.SetCurrentText(changed_text.ToString());
-                    refresh_profile_ui();
-                    validation_passed = false;
-                    validation_error = TEXT("Text changed; press Validate again.");
-                    set_feedback();
-                }
-            })];
+        [SNew(SBox).MinDesiredHeight(500.0f)
+            [SAssignNew(editor, SMultiLineEditableTextBox).Text(FText::FromString(initial_text)).AutoWrapText(false)
+                .OnTextChanged_Lambda([&](const FText& changed_text) {
+                    if (!sync_guard) {
+                        profile_state.SetCurrentText(changed_text.ToString());
+                        refresh_profile_ui();
+                        validation_passed = false;
+                        validation_error = TEXT("Text changed; press Validate again.");
+                        set_feedback();
+                    }
+                })]];
 
     TSharedRef<SVerticalBox> cvar_view = SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight().Padding(12.0f)
@@ -837,7 +857,8 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
             if (cvar_list.IsValid()) cvar_list->RequestListRefresh();
         })]
         + SVerticalBox::Slot().FillHeight(1.0f).Padding(12.0f)
-        [SAssignNew(cvar_list, SListView<TSharedPtr<FCVarRow>>)
+        [SNew(SBox).MinDesiredHeight(300.0f)
+            [SAssignNew(cvar_list, SListView<TSharedPtr<FCVarRow>>)
             .ListItemsSource(&filtered_cvars)
             .OnSelectionChanged_Lambda([&](TSharedPtr<FCVarRow> row, ESelectInfo::Type) {
                 if (!row.IsValid()) return;
@@ -892,7 +913,7 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
             .OnGenerateRow_Lambda([](TSharedPtr<FCVarRow> row, const TSharedRef<STableViewBase>& owner) {
                 return SNew(STableRow<TSharedPtr<FCVarRow>>, owner)
                     [SNew(STextBlock).Text(FText::FromString(FString::Printf(TEXT("%s  [%s]  effective=%s  default=%s%s"), *row->name, *row->type, *row->effective, *row->defaults, row->hint != nullptr ? TEXT("  [hinted]") : TEXT(""))))];
-            })]
+            })]]
         + SVerticalBox::Slot().AutoHeight().Padding(12.0f)
         [SNew(SHorizontalBox)
             + SHorizontalBox::Slot().FillWidth(0.28f).Padding(3.0f)
@@ -947,25 +968,9 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
                     [SNew(SButton).Text(FText::FromString(TEXT("Save"))).OnClicked_Lambda([&]() { save_current(); return FReply::Handled(); })]
                 + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
                     [SNew(SButton).Text(FText::FromString(TEXT("Revert"))).OnClicked_Lambda([&]() { revert_current(); return FReply::Handled(); })]]
-        + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
-            [SNew(SHorizontalBox)
-                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
-                    [SNew(SButton).Text(FText::FromString(TEXT("Common Settings"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(0); return FReply::Handled(); })]
-                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
-                    [SNew(SButton).Text(FText::FromString(TEXT("Vehicles"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(1); return FReply::Handled(); })]
-                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
-                    [SNew(SButton).Text(FText::FromString(TEXT("Project CVars"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(2); return FReply::Handled(); })]
-                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
-                    [SNew(SButton).Text(FText::FromString(TEXT("Raw JSON"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(3); return FReply::Handled(); })]]
-        + SVerticalBox::Slot().FillHeight(1.0f).Padding(4.0f)
-            [SAssignNew(view_switcher, SWidgetSwitcher)
-                + SWidgetSwitcher::Slot()[SNew(SScrollBox) + SScrollBox::Slot()[common_form.ToSharedRef()]]
-                + SWidgetSwitcher::Slot()[vehicle_view]
-                + SWidgetSwitcher::Slot()[cvar_view]
-                + SWidgetSwitcher::Slot()[raw_view]]
-        + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
-            [SAssignNew(feedback, STextBlock).Text(FText::FromString(TEXT("Press Validate before Launch.")))]
-        + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
+        // Keep every primary file/lifecycle action visible without requiring a trip to the
+        // bottom of a long editor.
+        + SVerticalBox::Slot().AutoHeight().Padding(4.0f, 0.0f, 4.0f, 4.0f)
             [SNew(SHorizontalBox)
                 + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
                     [SNew(SButton).Text(FText::FromString(TEXT("Open JSON"))).OnClicked_Lambda([&]() { open_file(); return FReply::Handled(); })]
@@ -987,8 +992,37 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
                     [SNew(SButton).Text(FText::FromString(TEXT("Cancel"))).OnClicked_Lambda([&]() {
                         cancelled = true;
                         FSlateApplication::Get().RequestDestroyWindow(window.ToSharedRef());
+                        RequestEndPlayAfterStartupCancel();
                         return FReply::Handled();
-                    })]]);
+                    })]]
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f, 2.0f)
+            [SAssignNew(feedback, STextBlock).Text(FText::FromString(TEXT("Press Validate before Launch.")))]
+        + SVerticalBox::Slot().AutoHeight().Padding(8.0f)
+            [SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Common Settings"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(0); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Vehicles"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(1); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Project CVars"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(2); return FReply::Handled(); })]
+                + SHorizontalBox::Slot().AutoWidth().Padding(3.0f)
+                    [SNew(SButton).Text(FText::FromString(TEXT("Raw JSON"))).OnClicked_Lambda([&]() { view_switcher->SetActiveWidgetIndex(3); return FReply::Handled(); })]]
+        + SVerticalBox::Slot().FillHeight(1.0f).Padding(4.0f)
+        [
+            SNew(SScrollBox)
+                + SScrollBox::Slot()
+                [
+                    SNew(SBox)
+                    .MinDesiredHeight(640.0f)
+                    [
+                        SAssignNew(view_switcher, SWidgetSwitcher)
+                        + SWidgetSwitcher::Slot()[common_form.ToSharedRef()]
+                        + SWidgetSwitcher::Slot()[vehicle_view]
+                        + SWidgetSwitcher::Slot()[cvar_view]
+                        + SWidgetSwitcher::Slot()[raw_view]
+                    ]
+                ]
+        ]);
 
     refresh_common();
     refresh_vehicles();
@@ -996,8 +1030,10 @@ bool RunStartupLauncher(std::string& settings_text, bool& cancelled)
 
     window->SetOnWindowClosed(FOnWindowClosed::CreateLambda([&](const TSharedRef<SWindow>&) {
         // Alt-F4/window-manager close is cancellation, never an implicit default-settings launch.
-        if (!accepted)
+        if (!accepted) {
             cancelled = true;
+            RequestEndPlayAfterStartupCancel();
+        }
     }));
     FSlateApplication::Get().AddModalWindow(window.ToSharedRef(), nullptr);
     return accepted;

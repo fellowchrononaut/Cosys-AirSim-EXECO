@@ -3968,9 +3968,12 @@ namespace airlib
             uint8_t present_sensors_bitmask = 0;
 
             msr::airlib::Settings sensors_child;
-            if (settings_json.getChild(collectionName, sensors_child)) {
+            bool has_authored_entries = false;
+            const bool has_authored_collection = settings_json.getChild(collectionName, sensors_child);
+            if (has_authored_collection) {
                 std::vector<std::string> keys;
                 sensors_child.getChildNames(keys);
+                has_authored_entries = !keys.empty();
 
                 for (const auto& key : keys) {
                     msr::airlib::Settings child;
@@ -3991,12 +3994,15 @@ namespace airlib
                 }
             }
 
-            // Only add default sensors which are not present
-            for (const auto& p : sensor_defaults) {
-                auto type = Utils::toNumeric(p.second->sensor_type);
+            // Keep the historical partial-override behaviour for a non-empty authored
+            // collection, but let an explicit empty Sensors object mean exactly zero sensors.
+            if (!has_authored_collection || has_authored_entries) {
+                for (const auto& p : sensor_defaults) {
+                    auto type = Utils::toNumeric(p.second->sensor_type);
 
-                if ((present_sensors_bitmask & (1U << type)) == 0)
-                    sensors[p.first] = p.second;
+                    if ((present_sensors_bitmask & (1U << type)) == 0)
+                        sensors[p.first] = p.second;
+                }
             }
         }
 
